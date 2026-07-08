@@ -92,6 +92,19 @@ def scan_music_folder(config: Config) -> list[LocalAudioFile]:
     return files
 
 
+def _existing_asset_for_local_file(con, item: LocalAudioFile):
+    existing = con.execute(
+        "SELECT * FROM youtube_assets WHERE file_path = ? ORDER BY file_exists DESC, id LIMIT 1",
+        (str(item.path),),
+    ).fetchone()
+    if existing or not item.youtube_video_id:
+        return existing
+    return con.execute(
+        "SELECT * FROM youtube_assets WHERE youtube_video_id = ? ORDER BY file_exists DESC, id LIMIT 1",
+        (item.youtube_video_id,),
+    ).fetchone()
+
+
 def import_local_files(config: Config, *, apply: bool, establish_baseline: bool) -> LocalSummary:
     summary = LocalSummary()
     scanned = scan_music_folder(config)
@@ -104,11 +117,16 @@ def import_local_files(config: Config, *, apply: bool, establish_baseline: bool)
     with connect(config) as con:
         with transaction(con):
             for item in scanned:
-                track = ensure_track(con, artist=item.artist, title=item.title, status="wanted")
+                existing_asset = _existing_asset_for_local_file(con, item)
+                if existing_asset:
+                    track_id = existing_asset["track_id"]
+                else:
+                    track = ensure_track(con, artist=item.artist, title=item.title, status="wanted")
+                    track_id = track["id"]
                 summary.tracks_seen += 1
                 upsert_youtube_asset(
                     con,
-                    track_id=track["id"],
+                    track_id=track_id,
                     youtube_video_id=item.youtube_video_id,
                     youtube_url=f"https://www.youtube.com/watch?v={item.youtube_video_id}" if item.youtube_video_id else "",
                     file_path=str(item.path),
@@ -119,11 +137,11 @@ def import_local_files(config: Config, *, apply: bool, establish_baseline: bool)
                 )
                 add_event(
                     con,
-                    track["id"],
+                    track_id,
                     "local_file_seen",
                     "local_scan",
                     {"file_path": str(item.path), "youtube_video_id": item.youtube_video_id},
-                    dedupe_key=f"local_file_seen:{track['id']}:{item.path}",
+                    dedupe_key=f"local_file_seen:{track_id}:{item.path}",
                 )
                 summary.assets_upserted += 1
             set_state(con, "last_local_scan_count", str(len(scanned)))

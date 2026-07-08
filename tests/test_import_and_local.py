@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from hcr_sync.config import DEFAULTS, Config
-from hcr_sync.db import connect, init_db, mark_excluded, transaction
+from hcr_sync.db import connect, init_db, mark_excluded, transaction, upsert_youtube_asset
 from hcr_sync.identity import parse_artist_title
 from hcr_sync.local_files import import_local_files, inspect_audio_file
 from hcr_sync.logger_importer import import_logger
@@ -105,3 +105,35 @@ def test_inspect_audio_file_prefers_en_dash_download_filename_over_bad_tags(tmp_
     assert item.artist == "Drokz"
     assert item.title == "The Mind (Signs Of Life)"
     assert item.youtube_video_id == "JrNBkozgrsY"
+
+
+def test_local_scan_reuses_existing_asset_by_youtube_id_instead_of_tags(tmp_path, monkeypatch):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    path = config.music_dir / "Binary Code [z0cgqlrs7_U].mp3"
+    path.write_bytes(b"not really audio")
+    monkeypatch.setattr("hcr_sync.local_files._tag_values", lambda _path: ("My Ear Bleeds Wine, Dan Marsh", "Binary Code"))
+    with connect(config) as con:
+        with transaction(con):
+            from hcr_sync.db import ensure_track
+
+            track = ensure_track(con, artist="My Ear Bleeds Wine", title="Binary Code", status="wanted")
+            upsert_youtube_asset(
+                con,
+                track_id=track["id"],
+                youtube_video_id="z0cgqlrs7_U",
+                file_path=str(path),
+                file_exists=True,
+                match_confidence=1.0,
+                status="downloaded",
+                downloaded_at="2026-01-01T00:00:00Z",
+            )
+
+    import_local_files(config, apply=True, establish_baseline=False)
+
+    with connect(config) as con:
+        assert con.execute("SELECT COUNT(*) AS count FROM tracks").fetchone()["count"] == 1
+        assert con.execute("SELECT COUNT(*) AS count FROM youtube_assets").fetchone()["count"] == 1
+        asset = con.execute("SELECT * FROM youtube_assets").fetchone()
+        assert asset["track_id"] == 1

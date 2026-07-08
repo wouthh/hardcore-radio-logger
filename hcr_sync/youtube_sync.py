@@ -264,6 +264,8 @@ def _candidate_score(track, candidate: YouTubeCandidate) -> float:
     source_artist_tokens = duplicate_artist_tokens(track["display_artist"])
     if not source_artist_tokens:
         source_title_tokens = duplicate_title_tokens(track["display_title"])
+        if len(source_title_tokens) <= 2:
+            return 0.0
         candidate_title_tokens = duplicate_title_tokens(candidate_title)
         if source_title_tokens and candidate_title_tokens:
             reverse_overlap = len(source_title_tokens & candidate_title_tokens) / max(1, len(candidate_title_tokens))

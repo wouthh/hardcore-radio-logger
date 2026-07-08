@@ -369,6 +369,129 @@ def test_youtube_sync_records_download_failure_and_continues(tmp_path):
         assert event is not None
 
 
+def test_youtube_sync_rejects_download_output_outside_music_dir(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    outside = tmp_path / "outside.mp3"
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Artist", title="Title", status="wanted")
+
+    class OutsidePathYouTube:
+        def search(self, artist, title):
+            return [
+                YouTubeCandidate(
+                    title="Artist - Title",
+                    url="https://www.youtube.com/watch?v=outside123",
+                    video_id="outside123",
+                    channel="Artist",
+                    duration=180,
+                )
+            ]
+
+        def download(self, candidate):
+            outside.write_bytes(b"audio")
+            return outside
+
+    summary = sync_youtube(config, apply=True, client=OutsidePathYouTube())
+
+    assert summary.skipped == 1
+    assert summary.downloaded == 0
+    assert outside.exists()
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM youtube_assets WHERE youtube_video_id = 'outside123'").fetchone()
+        event = con.execute("SELECT * FROM events WHERE event_type = 'youtube_download_failed'").fetchone()
+        assert asset["status"] == "error"
+        assert asset["file_exists"] == 0
+        assert event is not None
+
+
+def test_youtube_sync_rejects_missing_download_output(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    missing = config.music_dir / "Artist - Title [missing123].mp3"
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Artist", title="Title", status="wanted")
+
+    class MissingOutputYouTube:
+        def search(self, artist, title):
+            return [
+                YouTubeCandidate(
+                    title="Artist - Title",
+                    url="https://www.youtube.com/watch?v=missing123",
+                    video_id="missing123",
+                    channel="Artist",
+                    duration=180,
+                )
+            ]
+
+        def download(self, candidate):
+            return missing
+
+    summary = sync_youtube(config, apply=True, client=MissingOutputYouTube())
+
+    assert summary.skipped == 1
+    assert summary.downloaded == 0
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM youtube_assets WHERE youtube_video_id = 'missing123'").fetchone()
+        assert asset["status"] == "error"
+        assert asset["file_exists"] == 0
+
+
+def test_youtube_sync_rejects_download_output_file_linked_to_other_track(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    existing_file = config.music_dir / "Noise Maker - Completely Different [other123].mp3"
+    existing_file.write_bytes(b"audio")
+    with connect(config) as con:
+        with transaction(con):
+            other = ensure_track(con, artist="Noise Maker", title="Completely Different", status="wanted")
+            ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_youtube_asset(
+                con,
+                track_id=other["id"],
+                youtube_video_id="other123",
+                youtube_url="https://www.youtube.com/watch?v=other123",
+                file_path=str(existing_file),
+                file_exists=True,
+                match_confidence=1.0,
+                status="downloaded",
+            )
+
+    class ExistingFileYouTube:
+        def search(self, artist, title):
+            return [
+                YouTubeCandidate(
+                    title="Artist - Title",
+                    url="https://www.youtube.com/watch?v=new123",
+                    video_id="new123",
+                    channel="Artist",
+                    duration=180,
+                )
+            ]
+
+        def download(self, candidate):
+            return existing_file
+
+    summary = sync_youtube(config, apply=True, client=ExistingFileYouTube())
+
+    assert summary.review == 1
+    assert summary.downloaded == 0
+    with connect(config) as con:
+        rows = list(con.execute("SELECT * FROM youtube_assets ORDER BY track_id"))
+        event = con.execute("SELECT * FROM events WHERE event_type = 'youtube_candidate_already_linked'").fetchone()
+        assert len(rows) == 2
+        assert rows[0]["file_path"] == str(existing_file)
+        assert rows[0]["file_exists"] == 1
+        assert rows[1]["status"] == "review"
+        assert rows[1]["file_path"] is None
+        assert event is not None
+
+
 def test_youtube_sync_reviews_candidate_video_id_linked_to_other_track_without_downloading(tmp_path):
     config = make_config(tmp_path)
     init_db(config)

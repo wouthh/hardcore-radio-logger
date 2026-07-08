@@ -114,8 +114,18 @@ def _is_tentative_spotify_asset(config: Config, asset) -> bool:
     return score is not None and float(score) < config.float("HCR_SPOTIFY_MATCH_THRESHOLD")
 
 
+def _path_is_inside(path: Path, directory: Path) -> bool:
+    try:
+        path.resolve().relative_to(directory.resolve())
+    except ValueError:
+        return False
+    return True
+
+
 def _trash_file(config: Config, path: Path) -> Path | None:
     if not path.exists():
+        return None
+    if not _path_is_inside(path, config.music_dir):
         return None
     if not path.is_file() or path.suffix.casefold() not in AUDIO_EXTENSIONS:
         return None

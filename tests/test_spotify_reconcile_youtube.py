@@ -1453,6 +1453,37 @@ def test_manual_exclude_leaves_non_audio_asset_path_untouched(tmp_path):
         assert event is not None
 
 
+def test_manual_exclude_leaves_audio_path_outside_music_dir_untouched(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    outside = tmp_path / "outside.mp3"
+    outside.write_bytes(b"external audio")
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_youtube_asset(
+                con,
+                track_id=track["id"],
+                file_path=str(outside),
+                file_exists=True,
+                match_confidence=1.0,
+                status="downloaded",
+            )
+            track_id = track["id"]
+
+    summary = manual_exclude(config, track_id=track_id, reason="manual", apply=True, spotify_client=FakeSpotify())
+
+    assert summary.local_trashed == 0
+    assert outside.exists()
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM youtube_assets").fetchone()
+        event = con.execute("SELECT * FROM events WHERE event_type = 'local_file_left_unmanaged'").fetchone()
+        assert asset["file_exists"] == 0
+        assert asset["status"] == "deleted"
+        assert event is not None
+
+
 def test_manual_exclude_moves_local_file_to_trash(tmp_path):
     config = make_config(tmp_path)
     init_db(config)

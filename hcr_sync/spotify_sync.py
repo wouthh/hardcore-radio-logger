@@ -237,7 +237,14 @@ def _import_playlist_snapshot(
     with connect(config) as con:
         with transaction(con):
             for item in snapshot.tracks:
-                track = ensure_track(con, artist=item.artist, title=item.title, status="wanted")
+                existing_asset = con.execute(
+                    "SELECT * FROM spotify_assets WHERE playlist_id = ? AND spotify_track_id = ?",
+                    (snapshot.playlist_id, item.track_id),
+                ).fetchone()
+                if existing_asset:
+                    track = con.execute("SELECT * FROM tracks WHERE id = ?", (existing_asset["track_id"],)).fetchone()
+                else:
+                    track = ensure_track(con, artist=item.artist, title=item.title, status="wanted")
                 if track["status"] == "excluded":
                     add_event(
                         con,

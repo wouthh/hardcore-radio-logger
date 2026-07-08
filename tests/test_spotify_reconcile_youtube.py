@@ -144,6 +144,50 @@ def test_spotify_scan_imports_playlist_addition_for_youtube_sync(tmp_path):
         assert youtube is not None
 
 
+def test_spotify_scan_reuses_existing_asset_by_spotify_id(tmp_path):
+    config = make_config(tmp_path, HCR_SPOTIFY_ENABLED="true")
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Drokz", title="Karma", status="wanted")
+            upsert_spotify_asset(
+                con,
+                track_id=track["id"],
+                playlist_id="playlist",
+                spotify_track_uri="spotify:track:karma",
+                spotify_track_id="karma",
+                spotify_artist="Drokz",
+                spotify_title="Karma",
+                in_playlist=True,
+                match_confidence=1.0,
+                status="added",
+            )
+
+    summary = scan_spotify_playlist(
+        config,
+        apply=True,
+        client=FakeSpotify(
+            snapshot_tracks=[
+                SpotifyTrack(
+                    uri="spotify:track:karma",
+                    track_id="karma",
+                    artist="Drokz",
+                    title="Karma - Original Mix",
+                )
+            ]
+        ),
+    )
+
+    assert summary.linked == 1
+    with connect(config) as con:
+        tracks = list(con.execute("SELECT * FROM tracks"))
+        asset = con.execute("SELECT * FROM spotify_assets").fetchone()
+        assert len(tracks) == 1
+        assert tracks[0]["display_title"] == "Karma"
+        assert asset["track_id"] == tracks[0]["id"]
+        assert asset["spotify_title"] == "Karma - Original Mix"
+
+
 def test_spotify_scan_does_not_reactivate_excluded_track(tmp_path):
     config = make_config(tmp_path, HCR_SPOTIFY_ENABLED="true")
     init_db(config)

@@ -99,21 +99,13 @@ class SpotipyClient:
                 playlist_id,
                 offset=offset,
                 limit=100,
-                fields="items(track(id,uri,name,duration_ms,artists(name))),next,total",
+                fields="items(track(id,uri,name,duration_ms,artists(name),type),item(id,uri,name,duration_ms,artists(name),type)),next,total",
             )
             items = page.get("items") or []
             for item in items:
-                track = item.get("track") or {}
-                artists = track.get("artists") or []
-                tracks.append(
-                    SpotifyTrack(
-                        uri=str(track.get("uri") or ""),
-                        track_id=str(track.get("id") or ""),
-                        artist=", ".join(str(artist.get("name") or "") for artist in artists),
-                        title=str(track.get("name") or ""),
-                        duration_ms=track.get("duration_ms"),
-                    )
-                )
+                track = _spotify_track_from_playlist_item(item)
+                if track is not None:
+                    tracks.append(track)
             if not page.get("next"):
                 break
             offset += len(items)
@@ -146,6 +138,25 @@ class SpotipyClient:
     def remove_tracks(self, playlist_id: str, uris: list[str]) -> None:
         if uris:
             self.sp.playlist_remove_all_occurrences_of_items(playlist_id, uris)
+
+
+def _spotify_track_from_playlist_item(item: dict) -> SpotifyTrack | None:
+    track = item.get("track") or item.get("item") or {}
+    if track.get("type") and track.get("type") != "track":
+        return None
+    track_id = str(track.get("id") or "")
+    uri = str(track.get("uri") or "")
+    title = str(track.get("name") or "")
+    if not track_id or not uri or not title:
+        return None
+    artists = track.get("artists") or []
+    return SpotifyTrack(
+        uri=uri,
+        track_id=track_id,
+        artist=", ".join(str(artist.get("name") or "") for artist in artists),
+        title=title,
+        duration_ms=track.get("duration_ms"),
+    )
 
 
 @dataclass

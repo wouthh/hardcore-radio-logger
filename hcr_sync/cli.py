@@ -13,7 +13,7 @@ from .logger_importer import import_logger
 from .poller import poll_radio
 from .reconcile import manual_exclude, reconcile
 from .report import build_report, format_report
-from .spotify_sync import backfill_spotify, spotify_auth, sync_spotify
+from .spotify_sync import backfill_spotify, scan_spotify_playlist, spotify_auth, sync_spotify
 from .system import LegacyDownloaderActive, sync_lock
 from .youtube_sync import sync_youtube
 
@@ -84,6 +84,10 @@ def cmd_spotify(args: argparse.Namespace, config: Config) -> int:
     if args.spotify_command == "backfill":
         summary = backfill_spotify(config, apply=is_apply(args))
         print_kv("spotify_backfill", summary)
+        return 0
+    if args.spotify_command == "scan":
+        summary = scan_spotify_playlist(config, apply=is_apply(args))
+        print_kv("spotify_scan", summary)
         return 0
     if args.spotify_command == "sync":
         summary = sync_spotify(config, apply=is_apply(args))
@@ -163,6 +167,8 @@ def cmd_run_once(args: argparse.Namespace, config: Config) -> int:
         print_kv("import_logger", import_summary)
         local_summary = import_local_files(config, apply=apply, establish_baseline=False)
         print_kv("scan_local", local_summary)
+        spotify_scan_summary = scan_spotify_playlist(config, apply=apply)
+        print_kv("spotify_scan", spotify_scan_summary)
         rec_summary = reconcile(
             config,
             apply=apply,
@@ -214,6 +220,8 @@ def build_parser() -> argparse.ArgumentParser:
     spotify_sub.add_parser("auth")
     spotify_backfill = spotify_sub.add_parser("backfill")
     add_apply_args(spotify_backfill)
+    spotify_scan = spotify_sub.add_parser("scan")
+    add_apply_args(spotify_scan)
     spotify_sync_parser = spotify_sub.add_parser("sync")
     add_apply_args(spotify_sync_parser)
     spotify_parser.set_defaults(func=cmd_spotify)

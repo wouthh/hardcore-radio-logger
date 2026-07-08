@@ -160,7 +160,13 @@ def _local_track_keys(config: Config) -> set[int]:
         return {
             row["track_id"]
             for row in con.execute(
-                "SELECT track_id FROM youtube_assets WHERE file_exists = 1 AND status = 'downloaded'"
+                """
+                SELECT track_id
+                  FROM youtube_assets
+                 WHERE file_exists = 1
+                   AND status = 'downloaded'
+                   AND NULLIF(youtube_video_id, '') IS NOT NULL
+                """
             )
         }
 
@@ -189,6 +195,7 @@ def _existing_local_match(con, *, track, artist: str, title: str):
          WHERE y.file_exists = 1
            AND y.status = 'downloaded'
            AND y.file_path IS NOT NULL
+           AND NULLIF(y.youtube_video_id, '') IS NOT NULL
            AND t.id != ?
         """,
         (track["id"],),

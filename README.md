@@ -90,6 +90,15 @@ python -m hcr_sync spotify backfill --apply
 
 The systemd timer should not be the first thing that triggers OAuth.
 
+For ongoing operation, `run-once` scans the current Spotify playlist before reconciliation and YouTube sync. Tracks that are added directly to the Spotify playlist are imported into the DB as wanted tracks, then YouTube sync can search for and download matching MP3s. Excluded tracks are not reactivated by this scan.
+
+You can run the ongoing playlist scan directly:
+
+```bash
+python -m hcr_sync spotify scan --dry-run
+python -m hcr_sync spotify scan --apply
+```
+
 Spotify sync uses conservative matching and does not auto-add source rows or candidates that look like full mixes, DJ sets, podcasts, radio shows, compilations, full albums, trailers, interviews, or other non-track items. Those are left for review instead.
 
 ## Using The Built-In Poller

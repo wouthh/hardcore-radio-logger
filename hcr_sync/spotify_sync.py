@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
@@ -270,7 +271,7 @@ def _spotify_match_score(track, candidate: SpotifyTrack) -> float:
 def _is_rate_limited(exc: Exception) -> bool:
     status = getattr(exc, "http_status", None)
     headers = getattr(exc, "headers", {}) or {}
-    return status == 429 or "Retry-After" in headers
+    return status == 429 or "Retry-After" in headers or "retry-after" in headers
 
 
 def _parse_utc(value: str) -> datetime | None:
@@ -286,18 +287,32 @@ def _format_utc(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _retry_after_until(config: Config, exc: Exception) -> str:
+def _rate_limit_details(config: Config, exc: Exception) -> dict[str, object]:
     headers = getattr(exc, "headers", {}) or {}
     retry_after = headers.get("Retry-After") or headers.get("retry-after") or ""
+    retry_after_source = "header" if retry_after else ""
     if not retry_after:
         match = re.search(r"Retry(?:\s+will\s+occur)?\s+after:\s*(\d+)", str(exc), re.I)
         if match:
             retry_after = match.group(1)
+            retry_after_source = "error_message"
     try:
         seconds = max(1, int(float(retry_after)))
+        fallback_used = False
     except (TypeError, ValueError):
         seconds = config.int("HCR_SPOTIFY_RATE_LIMIT_FALLBACK_SECONDS")
-    return _format_utc(datetime.now(timezone.utc) + timedelta(seconds=seconds))
+        fallback_used = True
+        retry_after_source = retry_after_source or "fallback"
+    cooldown_until = _format_utc(datetime.now(timezone.utc) + timedelta(seconds=seconds))
+    return {
+        "http_status": getattr(exc, "http_status", None),
+        "retry_after": str(retry_after or ""),
+        "retry_after_source": retry_after_source,
+        "retry_after_seconds": seconds,
+        "fallback_used": fallback_used,
+        "cooldown_until": cooldown_until,
+        "error": str(exc)[:500],
+    }
 
 
 def _spotify_cooldown_active(con) -> bool:
@@ -306,8 +321,23 @@ def _spotify_cooldown_active(con) -> bool:
 
 
 def _remember_spotify_rate_limit(con, config: Config, exc: Exception) -> None:
+    payload = _rate_limit_details(config, exc)
     with transaction(con):
-        set_state(con, "spotify_rate_limited_until", _retry_after_until(config, exc))
+        set_state(con, "spotify_rate_limited_until", str(payload["cooldown_until"]))
+        set_state(con, "spotify_rate_limit_last_response", json.dumps(payload, sort_keys=True))
+        add_event(con, None, "spotify_rate_limited", "spotify_sync", payload)
+
+
+def _log_spotify_cooldown_skip(con) -> None:
+    until = get_state(con, "spotify_rate_limited_until", "")
+    add_event(
+        con,
+        None,
+        "spotify_rate_limit_cooldown_active",
+        "spotify_sync",
+        {"cooldown_until": until},
+        dedupe_key=f"spotify_rate_limit_cooldown_active:{until}",
+    )
 
 
 def _is_terminal_review_asset(asset, tentative_threshold: float) -> bool:
@@ -440,6 +470,8 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
     client = client or SpotipyClient(config)
     with connect(config) as con:
         if _spotify_cooldown_active(con):
+            with transaction(con):
+                _log_spotify_cooldown_skip(con)
             summary.rate_limited = True
             summary.skipped += 1
             return summary
@@ -505,7 +537,10 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                             track["id"],
                             "ambiguous_spotify_match",
                             "spotify_sync",
-                            {"reason": "source row looks like a mix, set, compilation, or non-track item"},
+                            {
+                                "reason": "source row looks like a mix, set, compilation, or non-track item",
+                                "match_status": "review",
+                            },
                             dedupe_key=f"spotify_non_track_source:{track['id']}",
                         )
                 continue
@@ -552,7 +587,17 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                             track["id"],
                             "ambiguous_spotify_match",
                             "spotify_sync",
-                            {"score": best_score, "spotify_track_id": best.track_id if best else ""},
+                            {
+                                "reason": "below tentative threshold or not found",
+                                "score": best_score,
+                                "spotify_track_id": best.track_id if best else "",
+                                "spotify_artist": best.artist if best else "",
+                                "spotify_title": best.title if best else "",
+                                "match_threshold": threshold,
+                                "tentative_threshold": tentative_threshold,
+                                "add_review_matches": add_review_matches,
+                                "match_status": "review",
+                            },
                             dedupe_key=f"ambiguous_spotify_match:{track['id']}:{best.track_id if best else 'none'}:{best_score:.3f}",
                         )
                 continue
@@ -600,7 +645,15 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                     track["id"],
                     event_type,
                     "spotify_sync",
-                    {"spotify_track_id": best.track_id, "score": best_score},
+                    {
+                        "spotify_track_id": best.track_id,
+                        "spotify_artist": best.artist,
+                        "spotify_title": best.title,
+                        "score": best_score,
+                        "match_threshold": threshold,
+                        "tentative_threshold": tentative_threshold,
+                        "match_status": "added" if confident_match else "tentative_review",
+                    },
                     dedupe_key=f"{event_type}:{track['id']}:{best.track_id}",
                 )
                 summary.added += 1

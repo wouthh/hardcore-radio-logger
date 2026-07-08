@@ -111,7 +111,7 @@ def _iter_played_tsv(path: Path):
             }
 
 
-def _import_entry(con, entry: dict[str, object], summary: ImportSummary, apply: bool) -> None:
+def _import_entry(con, config: Config, entry: dict[str, object], summary: ImportSummary, apply: bool) -> None:
     raw_track = str(entry["raw_track"])
     raw_artist, raw_title = parse_artist_title(raw_track)
     if not apply:
@@ -129,7 +129,7 @@ def _import_entry(con, entry: dict[str, object], summary: ImportSummary, apply: 
             {"raw_line": str(entry["raw_line"]), "observed_at": str(entry["observed_at"])},
             dedupe_key=f"skipped_excluded:{entry['source']}:{entry['observed_at']}:{entry['raw_line']}",
         )
-    if add_observation(
+    observation_added = add_observation(
         con,
         track_id=track["id"],
         observed_at=str(entry["observed_at"]),
@@ -137,8 +137,27 @@ def _import_entry(con, entry: dict[str, object], summary: ImportSummary, apply: 
         raw_artist=raw_artist,
         raw_title=raw_title,
         raw_line=str(entry["raw_line"]),
-    ):
+    )
+    if observation_added:
         summary.observations_added += 1
+    if config.bool("HCR_AUDIT_VERBOSE"):
+        add_event(
+            con,
+            track["id"],
+            "logger_entry_imported",
+            str(entry["source"]),
+            {
+                "source": str(entry["source"]),
+                "line_number": entry.get("line_number"),
+                "observed_at": str(entry["observed_at"]),
+                "raw_track": raw_track,
+                "raw_line": str(entry["raw_line"]),
+                "track_status": track["status"],
+                "observation_added": observation_added,
+                "duplicate": not observation_added,
+                "skipped_excluded": track["status"] == "excluded",
+            },
+        )
     summary.rows_seen += 1
 
 
@@ -154,7 +173,7 @@ def import_logger(config: Config, *, apply: bool) -> ImportSummary:
                 if path.exists():
                     summary.files_read += 1
                 for entry in iterator(path) or []:
-                    _import_entry(con, entry, summary, apply)
+                    _import_entry(con, config, entry, summary, apply)
                 if apply:
                     _remember_file_state(con, prefix, path)
     return summary

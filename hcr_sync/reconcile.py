@@ -151,7 +151,12 @@ def _cascade_local(con, config: Config, track_id: int, summary: ReconcileSummary
             track_id,
             "local_file_moved_to_trash" if moved_to else ("local_file_deleted" if touched_file else "local_file_left_unmanaged"),
             "reconcile",
-            {"old_path": row["file_path"], "new_path": str(moved_to) if moved_to else ""},
+            {
+                "old_path": row["file_path"],
+                "new_path": str(moved_to) if moved_to else "",
+                "delete_mode": config.get("HCR_DELETE_MODE"),
+                "reason": "local cascade after exclusion",
+            },
         )
         if touched_file:
             summary.local_trashed += 1
@@ -178,7 +183,13 @@ def _cascade_spotify(con, config: Config, track_id: int, summary: ReconcileSumma
             """,
             (now_utc(), row["id"]),
         )
-        add_event(con, track_id, "removed_from_spotify_due_to_exclusion", "reconcile", {"playlist_id": playlist_id})
+        add_event(
+            con,
+            track_id,
+            "removed_from_spotify_due_to_exclusion",
+            "reconcile",
+            {"playlist_id": playlist_id, "spotify_track_id": row["spotify_track_id"], "reason": "local/global exclusion cascade"},
+        )
 
 
 def _confirm_or_suspect(
@@ -251,7 +262,10 @@ def reconcile(
                         asset["track_id"],
                         "local_file_deleted_by_user",
                         "local_deleted",
-                        {"file_path": asset["file_path"]},
+                        {
+                            "file_path": asset["file_path"],
+                            "reason": "recorded downloaded file missing from healthy local scan",
+                        },
                         dedupe_key=f"local_file_deleted_by_user:{asset['track_id']}:{asset['id']}",
                     )
                     mark_excluded(con, track_id=asset["track_id"], source="local_deleted", reason="local file missing")
@@ -334,6 +348,7 @@ def reconcile(
                                 {
                                     "spotify_track_id": asset["spotify_track_id"],
                                     "match_confidence": asset["match_confidence"],
+                                    "reason": "tentative Spotify match removed; track remains wanted",
                                 },
                                 dedupe_key=f"spotify_tentative_removed_by_user:{asset['track_id']}:{asset['id']}",
                             )
@@ -352,7 +367,11 @@ def reconcile(
                             asset["track_id"],
                             "spotify_removed_by_user",
                             "spotify_removed",
-                            {"spotify_track_id": asset["spotify_track_id"]},
+                            {
+                                "spotify_track_id": asset["spotify_track_id"],
+                                "match_confidence": asset["match_confidence"],
+                                "reason": "confirmed Spotify playlist removal; global exclusion cascade",
+                            },
                             dedupe_key=f"spotify_removed_by_user:{asset['track_id']}:{asset['id']}",
                         )
                         mark_excluded(con, track_id=asset["track_id"], source="spotify_removed", reason="spotify playlist removal")

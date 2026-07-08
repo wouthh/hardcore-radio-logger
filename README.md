@@ -40,6 +40,8 @@ python -m hcr_sync doctor
 
 `doctor` is non-destructive. It prints the loaded config file and checks the DB path, music folder, logger producer, Spotify token cache, safety settings, and Git ignore coverage where available.
 
+Set `HCR_AUDIT_VERBOSE=true` temporarily when you want extra DB audit events for every radio poll and logger import row, including whether a radio poll was a duplicate and whether a logger import row added a new observation or was an idempotent duplicate. Leave it off for quieter long-term operation.
+
 ## Importing Existing Logger Files
 
 Configured logger files are imported idempotently:

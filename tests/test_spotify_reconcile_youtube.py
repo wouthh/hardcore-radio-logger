@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -95,6 +96,11 @@ def test_spotify_backfill_and_sync_with_fake_client(tmp_path):
 
     assert sync_summary.added == 1
     assert sync_client.added == ["spotify:track:2"]
+    with connect(config) as con:
+        payload = json.loads(con.execute("SELECT payload_json FROM events WHERE event_type = 'spotify_added'").fetchone()["payload_json"])
+        assert payload["spotify_track_id"] == "2"
+        assert payload["match_status"] == "added"
+        assert payload["match_threshold"] == 0.9
 
 
 def test_spotify_scan_imports_playlist_addition_for_youtube_sync(tmp_path):
@@ -336,6 +342,10 @@ def test_spotify_sync_tentatively_adds_review_match_below_confident_threshold(tm
         assert asset["in_playlist"] == 1
         assert asset["status"] == "review"
         assert asset["spotify_track_id"] == "1"
+        payload = json.loads(con.execute("SELECT payload_json FROM events WHERE event_type = 'spotify_tentatively_added'").fetchone()["payload_json"])
+        assert payload["match_status"] == "tentative_review"
+        assert payload["match_threshold"] == 1.01
+        assert payload["tentative_threshold"] == 0.9
 
 
 def test_spotify_sync_does_not_readd_removed_tentative_match(tmp_path):
@@ -399,6 +409,10 @@ def test_spotify_sync_retries_old_review_once_then_keeps_terminal_review(tmp_pat
         assert asset["in_playlist"] == 0
         assert asset["match_confidence"] == 0.55
         assert asset["spotify_track_id"] == "low"
+        payload = json.loads(con.execute("SELECT payload_json FROM events WHERE event_type = 'ambiguous_spotify_match'").fetchone()["payload_json"])
+        assert payload["reason"] == "below tentative threshold or not found"
+        assert payload["match_status"] == "review"
+        assert payload["score"] == 0.55
 
 
 def test_spotify_sync_respects_per_run_limit(tmp_path):
@@ -439,6 +453,12 @@ def test_spotify_sync_stops_cleanly_on_rate_limit(tmp_path):
     assert summary.skipped == 1
     with connect(config) as con:
         assert con.execute("SELECT value FROM sync_state WHERE key = 'spotify_rate_limited_until'").fetchone() is not None
+        last_response = json.loads(con.execute("SELECT value FROM sync_state WHERE key = 'spotify_rate_limit_last_response'").fetchone()["value"])
+        event_payload = json.loads(con.execute("SELECT payload_json FROM events WHERE event_type = 'spotify_rate_limited'").fetchone()["payload_json"])
+        assert last_response["retry_after_seconds"] == 3600
+        assert last_response["retry_after_source"] == "header"
+        assert last_response["fallback_used"] is False
+        assert event_payload["retry_after_seconds"] == 3600
 
     next_client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")])
     second = sync_spotify(config, apply=True, client=next_client)
@@ -447,6 +467,11 @@ def test_spotify_sync_stops_cleanly_on_rate_limit(tmp_path):
     assert second.skipped == 1
     assert next_client.search_calls == []
     assert next_client.added == []
+    third = sync_spotify(config, apply=True, client=next_client)
+    assert third.rate_limited is True
+    with connect(config) as con:
+        cooldown_events = con.execute("SELECT COUNT(*) AS count FROM events WHERE event_type = 'spotify_rate_limit_cooldown_active'").fetchone()["count"]
+        assert cooldown_events == 1
 
 
 def test_spotify_rate_limit_cooldown_parses_retry_text(tmp_path):
@@ -470,9 +495,13 @@ def test_spotify_rate_limit_cooldown_parses_retry_text(tmp_path):
     assert summary.rate_limited is True
     with connect(config) as con:
         value = con.execute("SELECT value FROM sync_state WHERE key = 'spotify_rate_limited_until'").fetchone()["value"]
+        payload = json.loads(con.execute("SELECT payload_json FROM events WHERE event_type = 'spotify_rate_limited'").fetchone()["payload_json"])
     until = datetime.fromisoformat(value.replace("Z", "+00:00"))
     delta_seconds = (until - datetime.now(timezone.utc)).total_seconds()
     assert 60 <= delta_seconds <= 180
+    assert payload["retry_after_seconds"] == 120
+    assert payload["retry_after_source"] == "error_message"
+    assert payload["fallback_used"] is False
 
 
 def test_spotify_sync_adds_even_when_youtube_is_review(tmp_path):
@@ -854,6 +883,8 @@ def test_reconcile_two_pass_spotify_remove_then_cascade_clears_suspicion(tmp_pat
         spotify = con.execute("SELECT * FROM spotify_assets WHERE spotify_track_id = '1'").fetchone()
         keep_spotify = con.execute("SELECT * FROM spotify_assets WHERE spotify_track_id = '2'").fetchone()
         youtube = con.execute("SELECT * FROM youtube_assets").fetchone()
+        spotify_removed_payload = json.loads(con.execute("SELECT payload_json FROM events WHERE event_type = 'spotify_removed_by_user'").fetchone()["payload_json"])
+        trash_payload = json.loads(con.execute("SELECT payload_json FROM events WHERE event_type = 'local_file_moved_to_trash'").fetchone()["payload_json"])
         assert track["status"] == "excluded"
         assert keep_track["status"] == "wanted"
         assert spotify["status"] == "removed"
@@ -861,6 +892,9 @@ def test_reconcile_two_pass_spotify_remove_then_cascade_clears_suspicion(tmp_pat
         assert spotify["suspected_missing_at"] is None
         assert keep_spotify["in_playlist"] == 1
         assert youtube["status"] == "deleted"
+        assert spotify_removed_payload["reason"] == "confirmed Spotify playlist removal; global exclusion cascade"
+        assert trash_payload["reason"] == "local cascade after exclusion"
+        assert trash_payload["delete_mode"] == "trash"
 
 
 def test_reconcile_tentative_spotify_remove_does_not_exclude_or_trash_local(tmp_path):
@@ -923,6 +957,7 @@ def test_reconcile_tentative_spotify_remove_does_not_exclude_or_trash_local(tmp_
         track = con.execute("SELECT * FROM tracks WHERE display_artist = 'Artist'").fetchone()
         spotify = con.execute("SELECT * FROM spotify_assets WHERE spotify_track_id = 'tentative'").fetchone()
         youtube = con.execute("SELECT * FROM youtube_assets").fetchone()
+        event_payload = json.loads(con.execute("SELECT payload_json FROM events WHERE event_type = 'spotify_tentative_removed_by_user'").fetchone()["payload_json"])
         assert track["status"] == "wanted"
         assert spotify["status"] == "removed"
         assert spotify["in_playlist"] == 0
@@ -930,6 +965,7 @@ def test_reconcile_tentative_spotify_remove_does_not_exclude_or_trash_local(tmp_
         assert youtube["status"] == "downloaded"
         assert youtube["file_exists"] == 1
         assert con.execute("SELECT COUNT(*) AS count FROM exclusions").fetchone()["count"] == 0
+        assert event_payload["reason"] == "tentative Spotify match removed; track remains wanted"
 
 
 def test_manual_exclude_leaves_non_audio_asset_path_untouched(tmp_path):

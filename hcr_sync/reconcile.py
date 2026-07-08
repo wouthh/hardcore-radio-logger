@@ -17,7 +17,7 @@ from .db import (
     transaction,
     upsert_youtube_asset,
 )
-from .local_files import audio_paths
+from .local_files import AUDIO_EXTENSIONS, audio_paths
 from .spotify_sync import SpotifyClientProtocol, SpotipyClient, spotify_enabled
 
 
@@ -47,8 +47,8 @@ def _local_scan_guard(config: Config, con, current_count: int, known_count: int,
         return "music dir does not exist"
     if not config.music_dir.is_dir():
         return "music dir is not a directory"
-    if not any(config.music_dir.iterdir()) and known_count > 0:
-        return "music dir scan is empty while DB has known local assets"
+    if current_count == 0 and known_count > 0:
+        return "local audio scan is empty while DB has known local assets"
     previous = int(get_state(con, "last_local_scan_count", "0") or "0")
     min_ratio = config.float("HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO")
     if previous and current_count < previous * min_ratio:
@@ -91,6 +91,8 @@ def _spotify_guard(config: Config, con, snapshot, *, force_mass_delete: bool) ->
 def _trash_file(config: Config, path: Path) -> Path | None:
     if not path.exists():
         return None
+    if not path.is_file() or path.suffix.casefold() not in AUDIO_EXTENSIONS:
+        return None
     if config.get("HCR_DELETE_MODE") == "delete":
         path.unlink()
         return None
@@ -112,7 +114,9 @@ def _cascade_local(con, config: Config, track_id: int, summary: ReconcileSummary
         )
     )
     for row in rows:
-        moved_to = _trash_file(config, Path(row["file_path"]))
+        old_path = Path(row["file_path"])
+        moved_to = _trash_file(config, old_path)
+        touched_file = moved_to is not None or (old_path.suffix.casefold() in AUDIO_EXTENSIONS and not old_path.exists())
         con.execute(
             """
             UPDATE youtube_assets
@@ -124,11 +128,12 @@ def _cascade_local(con, config: Config, track_id: int, summary: ReconcileSummary
         add_event(
             con,
             track_id,
-            "local_file_moved_to_trash" if moved_to else "local_file_deleted",
+            "local_file_moved_to_trash" if moved_to else ("local_file_deleted" if touched_file else "local_file_left_unmanaged"),
             "reconcile",
             {"old_path": row["file_path"], "new_path": str(moved_to) if moved_to else ""},
         )
-        summary.local_trashed += 1
+        if touched_file:
+            summary.local_trashed += 1
 
 
 def _cascade_spotify(con, config: Config, track_id: int, summary: ReconcileSummary, client: SpotifyClientProtocol | None) -> None:

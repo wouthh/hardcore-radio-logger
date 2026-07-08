@@ -7,6 +7,7 @@ from hcr_sync.db import connect, ensure_track, init_db, set_state, transaction, 
 from hcr_sync.reconcile import manual_exclude, reconcile
 from hcr_sync.spotify_sync import PlaylistSnapshot, SpotifyTrack, backfill_spotify, sync_spotify
 from hcr_sync.system import LegacyDownloaderActive, assert_legacy_downloader_safe
+from hcr_sync.youtube_sync import YouTubeCandidate, sync_youtube
 
 
 def make_config(tmp_path: Path, **overrides: str) -> Config:
@@ -94,6 +95,82 @@ def test_spotify_sync_reviews_non_track_sources_without_searching(tmp_path):
         assert con.execute("SELECT status FROM spotify_assets").fetchone()["status"] == "review"
 
 
+def test_spotify_sync_adds_even_when_youtube_is_review(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")])
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_youtube_asset(
+                con,
+                track_id=track["id"],
+                file_exists=False,
+                match_confidence=None,
+                status="review",
+            )
+
+    summary = sync_spotify(config, apply=True, client=client)
+
+    assert summary.added == 1
+    assert client.added == ["spotify:track:1"]
+    with connect(config) as con:
+        spotify = con.execute("SELECT * FROM spotify_assets WHERE in_playlist = 1").fetchone()
+        youtube = con.execute("SELECT * FROM youtube_assets WHERE status = 'review'").fetchone()
+    assert spotify is not None
+    assert youtube is not None
+
+
+def test_youtube_sync_downloads_even_when_spotify_is_review(tmp_path):
+    config = make_config(tmp_path, HCR_SPOTIFY_ENABLED="false")
+    init_db(config)
+    config.music_dir.mkdir()
+
+    class DownloadingYouTube:
+        def __init__(self):
+            self.downloads = []
+
+        def search(self, artist, title):
+            return [
+                YouTubeCandidate(
+                    title="Artist - Title",
+                    url="https://www.youtube.com/watch?v=abc123xyz",
+                    video_id="abc123xyz",
+                    channel="Artist",
+                    duration=180,
+                )
+            ]
+
+        def download(self, candidate):
+            self.downloads.append(candidate)
+            path = config.music_dir / "Artist - Title [abc123xyz].mp3"
+            path.write_bytes(b"audio")
+            return path
+
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_spotify_asset(
+                con,
+                track_id=track["id"],
+                playlist_id="playlist",
+                in_playlist=False,
+                match_confidence=None,
+                status="review",
+            )
+
+    client = DownloadingYouTube()
+    summary = sync_youtube(config, apply=True, client=client)
+
+    assert summary.downloaded == 1
+    assert len(client.downloads) == 1
+    with connect(config) as con:
+        youtube = con.execute("SELECT * FROM youtube_assets WHERE file_exists = 1").fetchone()
+        spotify = con.execute("SELECT * FROM spotify_assets WHERE status = 'review'").fetchone()
+    assert youtube is not None
+    assert spotify is not None
+
+
 def test_reconcile_refuses_missing_music_dir_before_destructive_detection(tmp_path):
     config = make_config(tmp_path)
     init_db(config)
@@ -114,6 +191,58 @@ def test_reconcile_refuses_missing_music_dir_before_destructive_detection(tmp_pa
     summary = reconcile(config, apply=True)
 
     assert any(item.startswith("local:") for item in summary.refused)
+    with connect(config) as con:
+        assert con.execute("SELECT status FROM tracks").fetchone()["status"] == "wanted"
+
+
+def test_reconcile_does_not_exclude_tracks_missing_never_created_assets(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Artist", title="Title", status="wanted")
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "spotify_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "0")
+            set_state(con, "last_spotify_playlist_count", "0")
+
+    summary = reconcile(config, apply=True, spotify_client=FakeSpotify())
+
+    assert summary.excluded_local == 0
+    assert summary.excluded_spotify == 0
+    assert summary.refused == []
+    with connect(config) as con:
+        assert con.execute("SELECT status FROM tracks").fetchone()["status"] == "wanted"
+
+
+def test_reconcile_ignores_lingering_non_audio_files_when_audio_scan_empty(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    stfolder = config.music_dir / ".stfolder"
+    stfolder.mkdir()
+    jpg = config.music_dir / "leftover.jpg"
+    jpg.write_bytes(b"image")
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_youtube_asset(
+                con,
+                track_id=track["id"],
+                file_path=str(config.music_dir / "missing.mp3"),
+                file_exists=True,
+                match_confidence=1.0,
+                status="downloaded",
+            )
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "1")
+
+    summary = reconcile(config, apply=True, spotify_client=FakeSpotify())
+
+    assert "local: local audio scan is empty while DB has known local assets" in summary.refused
+    assert stfolder.is_dir()
+    assert jpg.exists()
     with connect(config) as con:
         assert con.execute("SELECT status FROM tracks").fetchone()["status"] == "wanted"
 
@@ -145,6 +274,36 @@ def test_reconcile_two_pass_local_delete_then_cascade(tmp_path):
         statuses = {row["display_artist"]: row["status"] for row in con.execute("SELECT * FROM tracks")}
     assert statuses["Gone"] == "excluded"
     assert statuses["Keep"] == "wanted"
+
+
+def test_manual_exclude_leaves_non_audio_asset_path_untouched(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    jpg = config.music_dir / "leftover.jpg"
+    jpg.write_bytes(b"image")
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_youtube_asset(
+                con,
+                track_id=track["id"],
+                file_path=str(jpg),
+                file_exists=True,
+                match_confidence=1.0,
+                status="downloaded",
+            )
+            track_id = track["id"]
+
+    summary = manual_exclude(config, track_id=track_id, reason="manual", apply=True, spotify_client=FakeSpotify())
+
+    assert summary.local_trashed == 0
+    assert jpg.exists()
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM youtube_assets").fetchone()
+        event = con.execute("SELECT * FROM events WHERE event_type = 'local_file_left_unmanaged'").fetchone()
+        assert asset["file_exists"] == 0
+        assert event is not None
 
 
 def test_manual_exclude_moves_local_file_to_trash(tmp_path):

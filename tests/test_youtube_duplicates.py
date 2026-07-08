@@ -285,3 +285,36 @@ def test_youtube_sync_rejects_blank_artist_title_embedded_in_longer_candidate(tm
         asset = con.execute("SELECT * FROM youtube_assets WHERE status = 'review'").fetchone()
         assert asset is not None
         assert asset["match_confidence"] is None
+
+
+def test_youtube_sync_rejects_short_blank_artist_exact_title_candidate(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="", title="GET HYPE", status="wanted")
+
+    class ShortBlankArtistYouTube:
+        def __init__(self):
+            self.downloads = []
+
+        def search(self, artist, title):
+            return [
+                YouTubeCandidate(
+                    title="Discrepancies - Get Hype (Official Audio)",
+                    url="https://www.youtube.com/watch?v=Wgl2GsUOPD8",
+                    video_id="Wgl2GsUOPD8",
+                    channel="DISCREPANCIES TV",
+                    duration=190,
+                )
+            ]
+
+        def download(self, candidate):
+            self.downloads.append(candidate)
+            return config.music_dir / "bad.mp3"
+
+    client = ShortBlankArtistYouTube()
+    summary = sync_youtube(config, apply=True, client=client)
+
+    assert summary.review == 1
+    assert client.downloads == []

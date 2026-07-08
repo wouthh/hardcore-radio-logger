@@ -12,7 +12,7 @@ from typing import Protocol
 from .config import Config
 from .db import add_event, connect, now_utc, transaction, upsert_youtube_asset, wanted_tracks
 from .identity import compact_text, duplicate_artist_tokens, duplicate_title_tokens, likely_same_recording, match_confidence, normalize_for_match, parse_artist_title
-from .local_files import scan_music_folder, youtube_id_from_path
+from .local_files import AUDIO_EXTENSIONS, youtube_id_from_path
 from .system import assert_legacy_downloader_safe
 
 BAD_VIDEO_RE = re.compile(
@@ -218,6 +218,27 @@ def _youtube_candidate_used_by_other_track(
         """,
         params,
     ).fetchone()
+
+
+def _path_is_inside(path: Path, directory: Path) -> bool:
+    try:
+        path.resolve().relative_to(directory.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_download_output(config: Config, output: Path) -> Path:
+    output = Path(output)
+    if not output.exists():
+        raise RuntimeError(f"download output was not created: {output}")
+    if not output.is_file():
+        raise RuntimeError(f"download output is not a file: {output}")
+    if output.suffix.casefold() not in AUDIO_EXTENSIONS:
+        raise RuntimeError(f"download output is not a supported audio file: {output}")
+    if not _path_is_inside(output, config.music_dir):
+        raise RuntimeError(f"download output is outside HCR_MUSIC_DIR: {output}")
+    return output
 
 
 def _existing_local_match(con, *, track, artist: str, title: str, require_youtube_id: bool):
@@ -530,10 +551,29 @@ def sync_youtube(
                     continue
             try:
                 output = client.download(best)
+                output = _validate_download_output(config, output)
             except Exception as exc:
                 summary.skipped += 1
                 with transaction(con):
                     _mark_youtube_error(con, track["id"], best, score=best_score, error=exc)
+                continue
+            output_video_id = best.video_id or youtube_id_from_path(output)
+            conflicting_output_asset = _youtube_candidate_used_by_other_track(
+                con,
+                track_id=track["id"],
+                youtube_video_id=output_video_id,
+                file_path=str(output),
+            )
+            if conflicting_output_asset:
+                summary.review += 1
+                with transaction(con):
+                    _mark_youtube_candidate_conflict(
+                        con,
+                        track["id"],
+                        best,
+                        score=best_score,
+                        existing_asset=conflicting_output_asset,
+                    )
                 continue
             with transaction(con):
                 current = con.execute("SELECT status FROM tracks WHERE id = ?", (track["id"],)).fetchone()
@@ -547,7 +587,7 @@ def sync_youtube(
                 upsert_youtube_asset(
                     con,
                     track_id=track["id"],
-                    youtube_video_id=best.video_id or youtube_id_from_path(output),
+                    youtube_video_id=output_video_id,
                     youtube_url=best.url,
                     file_path=str(output),
                     file_exists=True,

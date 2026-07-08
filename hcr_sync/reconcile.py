@@ -18,7 +18,7 @@ from .db import (
     upsert_youtube_asset,
 )
 from .local_files import audio_paths
-from .spotify_sync import SpotifyClientProtocol, SpotipyClient
+from .spotify_sync import SpotifyClientProtocol, SpotipyClient, spotify_enabled
 
 
 @dataclass
@@ -240,7 +240,7 @@ def reconcile(
                     set_state(con, "last_local_scan_count", str(len(current_paths)))
                     set_state(con, "last_local_scan_at", now_utc())
 
-        playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID")
+        playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID") if spotify_enabled(config) else ""
         snapshot = None
         if playlist_id:
             try:

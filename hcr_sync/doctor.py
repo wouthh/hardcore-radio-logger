@@ -74,17 +74,27 @@ def run_doctor(config: Config) -> DoctorResult:
         )
     )
 
-    playlist_id = bool(config.get("HCR_SPOTIFY_PLAYLIST_ID"))
-    result.checks.append(Check("Spotify playlist ID", playlist_id, "configured", warning=not playlist_id))
-    token_cache = config.path("HCR_SPOTIFY_TOKEN_CACHE")
+    spotify_enabled = config.bool("HCR_SPOTIFY_ENABLED")
     result.checks.append(
         Check(
-            "Spotify token cache",
-            token_cache.exists(),
-            "OK" if token_cache.exists() else "missing, run `python -m hcr_sync spotify auth`",
-            warning=not token_cache.exists(),
+            "Spotify enabled",
+            spotify_enabled,
+            "enabled" if spotify_enabled else "disabled; YouTube/local sync can run without Spotify",
+            warning=not spotify_enabled,
         )
     )
+    if spotify_enabled:
+        playlist_id = bool(config.get("HCR_SPOTIFY_PLAYLIST_ID"))
+        result.checks.append(Check("Spotify playlist ID", playlist_id, "configured", warning=not playlist_id))
+        token_cache = config.path("HCR_SPOTIFY_TOKEN_CACHE")
+        result.checks.append(
+            Check(
+                "Spotify token cache",
+                token_cache.exists(),
+                "OK" if token_cache.exists() else "missing, run `python -m hcr_sync spotify auth`",
+                warning=not token_cache.exists(),
+            )
+        )
 
     active_downloaders = active_user_units(list_value(config.get("HCR_LEGACY_DOWNLOADER_UNITS")))
     allowed = config.bool("HCR_ALLOW_LEGACY_DOWNLOADER_RUNNING")

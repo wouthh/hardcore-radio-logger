@@ -18,7 +18,7 @@ from .db import (
     upsert_spotify_asset,
     wanted_tracks,
 )
-from .identity import duplicate_title_tokens, match_confidence
+from .identity import compact_text, duplicate_title_tokens, match_confidence
 
 NON_TRACK_RE = re.compile(
     r"\b("
@@ -29,11 +29,19 @@ NON_TRACK_RE = re.compile(
     re.I,
 )
 BRACKETED_TITLE_EXTRA_RE = re.compile(r"\s*[\(\[].*?[\)\]]")
+GENERIC_BRACKETED_VERSION_RE = re.compile(
+    r"\s*[\(\[]\s*"
+    r"(?:original|extended|radio|edit|album|single|full|club|official|hq|hd)"
+    r"(?:\s+(?:mix|version|edit|cut))?"
+    r"\s*[\)\]]",
+    re.I,
+)
 GENERIC_VERSION_SUFFIX_RE = re.compile(
     r"\s+-\s+(?:original|extended|radio|radio edit|edit|album|single|full)(?:\s+(?:mix|version|edit))?$",
     re.I,
 )
 REMIX_RE = re.compile(r"\bremix\b", re.I)
+MAIN_ARTIST_SPLIT_RE = re.compile(r"\s+(?:&|\+|x|and|vs\.?|feat\.?|ft\.?|featuring)\s+|[,/|]", re.I)
 
 
 @dataclass(frozen=True)
@@ -115,20 +123,27 @@ class SpotipyClient:
         return PlaylistSnapshot(playlist_id=playlist_id, snapshot_id=snapshot_id, tracks=tracks, complete=complete)
 
     def search_track(self, artist: str, title: str) -> list[SpotifyTrack]:
-        query = f"artist:{artist} track:{title}" if artist else title
-        result = self.sp.search(q=query, type="track", limit=10)
         tracks = []
-        for item in (result.get("tracks") or {}).get("items") or []:
-            artists = item.get("artists") or []
-            tracks.append(
-                SpotifyTrack(
-                    uri=str(item.get("uri") or ""),
-                    track_id=str(item.get("id") or ""),
-                    artist=", ".join(str(artist.get("name") or "") for artist in artists),
-                    title=str(item.get("name") or ""),
-                    duration_ms=item.get("duration_ms"),
+        seen_ids: set[str] = set()
+        for query in _spotify_search_queries(artist, title):
+            result = self.sp.search(q=query, type="track", limit=10)
+            for item in (result.get("tracks") or {}).get("items") or []:
+                artists = item.get("artists") or []
+                track_id = str(item.get("id") or "")
+                uri = str(item.get("uri") or "")
+                name = str(item.get("name") or "")
+                if not track_id or not uri or not name or track_id in seen_ids:
+                    continue
+                seen_ids.add(track_id)
+                tracks.append(
+                    SpotifyTrack(
+                        uri=uri,
+                        track_id=track_id,
+                        artist=", ".join(str(artist.get("name") or "") for artist in artists),
+                        title=name,
+                        duration_ms=item.get("duration_ms"),
+                    )
                 )
-            )
         return tracks
 
     def add_tracks(self, playlist_id: str, uris: list[str]) -> None:
@@ -164,6 +179,7 @@ class SpotifySummary:
     seen: int = 0
     linked: int = 0
     added: int = 0
+    tentative_added: int = 0
     review: int = 0
     skipped: int = 0
     rate_limited: bool = False
@@ -185,6 +201,48 @@ def looks_like_non_track(artist: str, title: str) -> bool:
 def _core_spotify_title(title: str) -> str:
     title = BRACKETED_TITLE_EXTRA_RE.sub("", title or "")
     return GENERIC_VERSION_SUFFIX_RE.sub("", title).strip()
+
+
+def _searchable_spotify_title(title: str) -> str:
+    title = GENERIC_BRACKETED_VERSION_RE.sub("", title or "")
+    return GENERIC_VERSION_SUFFIX_RE.sub("", title).strip()
+
+
+def _main_spotify_artist(artist: str) -> str:
+    parts = [compact_text(part) for part in MAIN_ARTIST_SPLIT_RE.split(artist or "") if compact_text(part)]
+    return parts[0] if parts else compact_text(artist)
+
+
+def _spotify_search_queries(artist: str, title: str) -> list[str]:
+    artist = compact_text(artist)
+    title = compact_text(title)
+    main_artist = _main_spotify_artist(artist)
+    clean_title = _searchable_spotify_title(title)
+
+    parts: list[tuple[str, str]] = [(artist, title)]
+    if clean_title and clean_title != title:
+        parts.append((artist, clean_title))
+    if main_artist and main_artist != artist:
+        parts.append((main_artist, clean_title or title))
+    if clean_title and (main_artist != artist or clean_title != title):
+        parts.append((main_artist or artist, clean_title))
+
+    queries: list[str] = []
+    seen: set[str] = set()
+    for query_artist, query_title in parts:
+        query_artist = compact_text(query_artist)
+        query_title = compact_text(query_title)
+        if not query_artist and not query_title:
+            continue
+        query = f"artist:{query_artist} track:{query_title}" if query_artist else query_title
+        if query not in seen:
+            seen.add(query)
+            queries.append(query)
+
+    free_text = compact_text(f"{main_artist or artist} {clean_title or title}")
+    if free_text and free_text not in seen:
+        queries.append(free_text)
+    return queries
 
 
 def _spotify_match_score(track, candidate: SpotifyTrack) -> float:
@@ -212,6 +270,16 @@ def _is_rate_limited(exc: Exception) -> bool:
     status = getattr(exc, "http_status", None)
     headers = getattr(exc, "headers", {}) or {}
     return status == 429 or "Retry-After" in headers
+
+
+def _is_terminal_review_asset(asset, tentative_threshold: float) -> bool:
+    score = asset["match_confidence"]
+    return score is not None and float(score) < tentative_threshold
+
+
+def _is_removed_tentative_asset(asset, match_threshold: float) -> bool:
+    score = asset["match_confidence"]
+    return score is not None and float(score) < match_threshold
 
 
 def _validate_playlist_snapshot(snapshot: PlaylistSnapshot) -> None:
@@ -341,12 +409,29 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                 (playlist_id,),
             )
         }
-        review_ids = {
-            row["track_id"]
+        review_assets = {
+            row["track_id"]: row
             for row in con.execute(
-                "SELECT track_id FROM spotify_assets WHERE playlist_id = ? AND status = 'review' AND in_playlist = 0",
+                "SELECT * FROM spotify_assets WHERE playlist_id = ? AND status = 'review' AND in_playlist = 0",
                 (playlist_id,),
             )
+        }
+        threshold = config.float("HCR_SPOTIFY_MATCH_THRESHOLD")
+        tentative_threshold = config.float("HCR_SPOTIFY_TENTATIVE_ADD_THRESHOLD")
+        add_review_matches = config.bool("HCR_SPOTIFY_ADD_REVIEW_MATCHES")
+        tentative_removed_event_ids = {
+            row["track_id"]
+            for row in con.execute(
+                "SELECT DISTINCT track_id FROM events WHERE event_type = 'spotify_tentative_removed_by_user' AND track_id IS NOT NULL"
+            )
+        }
+        removed_tentative_ids = {
+            row["track_id"]
+            for row in con.execute(
+                "SELECT * FROM spotify_assets WHERE playlist_id = ? AND status = 'removed' AND in_playlist = 0",
+                (playlist_id,),
+            )
+            if _is_removed_tentative_asset(row, threshold) or row["track_id"] in tentative_removed_event_ids
         }
         sync_limit = config.int("HCR_SPOTIFY_SYNC_LIMIT")
         searched = 0
@@ -354,7 +439,11 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
             if track["id"] in existing:
                 summary.skipped += 1
                 continue
-            if track["id"] in review_ids:
+            if track["id"] in removed_tentative_ids:
+                summary.review += 1
+                continue
+            review_asset = review_assets.get(track["id"])
+            if review_asset and (not add_review_matches or _is_terminal_review_asset(review_asset, tentative_threshold)):
                 summary.review += 1
                 continue
             if looks_like_non_track(track["display_artist"], track["display_title"]):
@@ -397,8 +486,9 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                 if score > best_score:
                     best = candidate
                     best_score = score
-            threshold = config.float("HCR_SPOTIFY_MATCH_THRESHOLD")
-            if best is None or best_score < threshold:
+            confident_match = best is not None and best_score >= threshold
+            tentative_match = best is not None and add_review_matches and best_score >= tentative_threshold
+            if not confident_match and not tentative_match:
                 summary.review += 1
                 if apply:
                     with transaction(con):
@@ -406,14 +496,27 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                             con,
                             track_id=track["id"],
                             playlist_id=playlist_id,
+                            spotify_track_uri=best.uri if best else "",
+                            spotify_track_id=best.track_id if best else "",
+                            spotify_artist=best.artist if best else "",
+                            spotify_title=best.title if best else "",
                             in_playlist=False,
-                            match_confidence=best_score or None,
+                            match_confidence=best_score if best else 0.0,
                             status="review",
                         )
-                        add_event(con, track["id"], "ambiguous_spotify_match", "spotify_sync", {"score": best_score})
+                        add_event(
+                            con,
+                            track["id"],
+                            "ambiguous_spotify_match",
+                            "spotify_sync",
+                            {"score": best_score, "spotify_track_id": best.track_id if best else ""},
+                            dedupe_key=f"ambiguous_spotify_match:{track['id']}:{best.track_id if best else 'none'}:{best_score:.3f}",
+                        )
                 continue
             if not apply:
                 summary.added += 1
+                if tentative_match and not confident_match:
+                    summary.tentative_added += 1
                 continue
             with transaction(con):
                 current = con.execute("SELECT status FROM tracks WHERE id = ?", (track["id"],)).fetchone()
@@ -444,9 +547,19 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                     spotify_title=best.title,
                     in_playlist=True,
                     match_confidence=best_score,
-                    status="added",
+                    status="added" if confident_match else "review",
                     added_at=now_utc(),
                 )
-                add_event(con, track["id"], "spotify_added", "spotify_sync", {"spotify_track_id": best.track_id})
+                event_type = "spotify_added" if confident_match else "spotify_tentatively_added"
+                add_event(
+                    con,
+                    track["id"],
+                    event_type,
+                    "spotify_sync",
+                    {"spotify_track_id": best.track_id, "score": best_score},
+                    dedupe_key=f"{event_type}:{track['id']}:{best.track_id}",
+                )
                 summary.added += 1
+                if tentative_match and not confident_match:
+                    summary.tentative_added += 1
     return summary

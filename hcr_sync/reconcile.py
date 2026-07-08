@@ -34,6 +34,7 @@ class ReconcileSummary:
     excluded_local: int = 0
     suspected_spotify: int = 0
     excluded_spotify: int = 0
+    tentative_spotify_removed: int = 0
     spotify_removed: int = 0
     local_trashed: int = 0
     refused: list[str] = field(default_factory=list)
@@ -99,6 +100,13 @@ def _is_recent_self_added_spotify_asset(asset, previous_scan_at: str) -> bool:
     if not added_at:
         return False
     return not previous_scan_at or added_at > previous_scan_at
+
+
+def _is_tentative_spotify_asset(config: Config, asset) -> bool:
+    if asset["status"] == "review":
+        return True
+    score = asset["match_confidence"]
+    return score is not None and float(score) < config.float("HCR_SPOTIFY_MATCH_THRESHOLD")
 
 
 def _trash_file(config: Config, path: Path) -> Path | None:
@@ -316,6 +324,28 @@ def reconcile(
                         )
                         if not confirmed:
                             summary.suspected_spotify += 1
+                            continue
+                        if _is_tentative_spotify_asset(config, asset):
+                            add_event(
+                                con,
+                                asset["track_id"],
+                                "spotify_tentative_removed_by_user",
+                                "spotify_removed",
+                                {
+                                    "spotify_track_id": asset["spotify_track_id"],
+                                    "match_confidence": asset["match_confidence"],
+                                },
+                                dedupe_key=f"spotify_tentative_removed_by_user:{asset['track_id']}:{asset['id']}",
+                            )
+                            con.execute(
+                                """
+                                UPDATE spotify_assets
+                                   SET in_playlist = 0, status = 'removed', suspected_missing_at = NULL, updated_at = ?
+                                 WHERE id = ?
+                                """,
+                                (now_utc(), asset["id"]),
+                            )
+                            summary.tentative_spotify_removed += 1
                             continue
                         add_event(
                             con,

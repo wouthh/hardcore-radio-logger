@@ -70,12 +70,17 @@ def _filename_title(path: Path) -> tuple[str, str]:
 
 
 def inspect_audio_file(path: Path) -> LocalAudioFile | None:
-    artist, title = _tag_values(path)
-    if not title:
-        artist, title = _filename_title(path)
+    video_id = youtube_id_from_path(path)
+    filename_artist, filename_title = _filename_title(path)
+    if video_id and filename_artist and filename_title:
+        artist, title = filename_artist, filename_title
+    else:
+        artist, title = _tag_values(path)
+        if not title:
+            artist, title = filename_artist, filename_title
     if not artist and not title:
         return None
-    return LocalAudioFile(path=path, artist=artist, title=title, youtube_video_id=youtube_id_from_path(path))
+    return LocalAudioFile(path=path, artist=artist, title=title, youtube_video_id=video_id)
 
 
 def scan_music_folder(config: Config) -> list[LocalAudioFile]:

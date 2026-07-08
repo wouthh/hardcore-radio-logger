@@ -4,7 +4,7 @@ from pathlib import Path
 from hcr_sync.config import DEFAULTS, Config
 from hcr_sync.db import connect, init_db, mark_excluded, transaction
 from hcr_sync.identity import parse_artist_title
-from hcr_sync.local_files import import_local_files
+from hcr_sync.local_files import import_local_files, inspect_audio_file
 from hcr_sync.logger_importer import import_logger
 
 
@@ -79,3 +79,29 @@ def test_local_backfill_imports_existing_file_and_sets_baseline(tmp_path):
         assert asset["youtube_video_id"] == "abc123xyz"
         assert con.execute("SELECT value FROM sync_state WHERE key = 'local_baseline_complete'").fetchone()["value"] == "true"
     assert summary.baseline_complete is True
+
+
+def test_inspect_audio_file_prefers_download_filename_over_bad_tags_for_video_id(tmp_path, monkeypatch):
+    path = tmp_path / "Angerfist - Gathering Of Gods [Extended Mix] [Y4tgndTal5w].mp3"
+    path.write_bytes(b"not really audio")
+    monkeypatch.setattr("hcr_sync.local_files._tag_values", lambda _path: ("Rob-In", "Angerfist - Gathering Of Gods [Extended Mix]"))
+
+    item = inspect_audio_file(path)
+
+    assert item is not None
+    assert item.artist == "Angerfist"
+    assert item.title == "Gathering Of Gods [Extended Mix]"
+    assert item.youtube_video_id == "Y4tgndTal5w"
+
+
+def test_inspect_audio_file_prefers_en_dash_download_filename_over_bad_tags(tmp_path, monkeypatch):
+    path = tmp_path / "Drokz – The Mind (Signs Of Life) [JrNBkozgrsY].mp3"
+    path.write_bytes(b"not really audio")
+    monkeypatch.setattr("hcr_sync.local_files._tag_values", lambda _path: ("Davide Montana", "Drokz – The Mind (Signs Of Life)"))
+
+    item = inspect_audio_file(path)
+
+    assert item is not None
+    assert item.artist == "Drokz"
+    assert item.title == "The Mind (Signs Of Life)"
+    assert item.youtube_video_id == "JrNBkozgrsY"

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -18,6 +19,15 @@ from .db import (
     wanted_tracks,
 )
 from .identity import match_confidence
+
+NON_TRACK_RE = re.compile(
+    r"\b("
+    r"full\s+mix|full\s+set|dj\s+set|live\s+set|liveset|mixtape|megamix|yearmix|podcast|radio\s+show|"
+    r"compilation|full\s+album|continuous\s+mix|mix\s+session|festival\s+set|various\s+artists|"
+    r"aftermovie|trailer|teaser|preview|interview|documentary|recap|artist\s+series|episode"
+    r")\b",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -143,8 +153,19 @@ def spotify_auth(config: Config, client: SpotifyClientProtocol | None = None) ->
     return client.auth_check()
 
 
+def spotify_enabled(config: Config) -> bool:
+    return config.bool("HCR_SPOTIFY_ENABLED")
+
+
+def looks_like_non_track(artist: str, title: str) -> bool:
+    return bool(NON_TRACK_RE.search(f"{artist} {title}"))
+
+
 def backfill_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol | None = None) -> SpotifySummary:
     summary = SpotifySummary()
+    if not spotify_enabled(config):
+        summary.skipped += 1
+        return summary
     playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID")
     if not playlist_id:
         raise RuntimeError("HCR_SPOTIFY_PLAYLIST_ID is required")
@@ -191,6 +212,9 @@ def backfill_spotify(config: Config, *, apply: bool, client: SpotifyClientProtoc
 
 def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol | None = None) -> SpotifySummary:
     summary = SpotifySummary()
+    if not spotify_enabled(config):
+        summary.skipped += 1
+        return summary
     playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID")
     if not playlist_id:
         summary.skipped += 1
@@ -209,10 +233,33 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
             if track["id"] in existing:
                 summary.skipped += 1
                 continue
+            if looks_like_non_track(track["display_artist"], track["display_title"]):
+                summary.review += 1
+                if apply:
+                    with transaction(con):
+                        upsert_spotify_asset(
+                            con,
+                            track_id=track["id"],
+                            playlist_id=playlist_id,
+                            in_playlist=False,
+                            match_confidence=0.0,
+                            status="review",
+                        )
+                        add_event(
+                            con,
+                            track["id"],
+                            "ambiguous_spotify_match",
+                            "spotify_sync",
+                            {"reason": "source row looks like a mix, set, compilation, or non-track item"},
+                            dedupe_key=f"spotify_non_track_source:{track['id']}",
+                        )
+                continue
             candidates = client.search_track(track["display_artist"], track["display_title"])
             best = None
             best_score = 0.0
             for candidate in candidates:
+                if looks_like_non_track(candidate.artist, candidate.title):
+                    continue
                 score = match_confidence(
                     artist=track["display_artist"],
                     title=track["display_title"],

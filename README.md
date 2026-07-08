@@ -78,6 +78,8 @@ playlist-modify-private
 
 Set `HCR_SPOTIFY_TOKEN_CACHE` to a path outside the repository.
 
+Set `HCR_SPOTIFY_ENABLED=false` to keep polling, importing, local scanning, and YouTube sync running while Spotify is not ready. Spotify backfill/sync and Spotify removal detection are skipped while disabled.
+
 Authenticate before enabling systemd:
 
 ```bash
@@ -87,6 +89,8 @@ python -m hcr_sync spotify backfill --apply
 ```
 
 The systemd timer should not be the first thing that triggers OAuth.
+
+Spotify sync uses conservative matching and does not auto-add source rows or candidates that look like full mixes, DJ sets, podcasts, radio shows, compilations, full albums, trailers, interviews, or other non-track items. Those are left for review instead.
 
 ## Using The Built-In Poller
 

@@ -70,6 +70,30 @@ def test_spotify_backfill_and_sync_with_fake_client(tmp_path):
     assert sync_client.added == ["spotify:track:2"]
 
 
+def test_spotify_disabled_skips_without_client(tmp_path):
+    config = make_config(tmp_path, HCR_SPOTIFY_ENABLED="false")
+    init_db(config)
+
+    assert backfill_spotify(config, apply=True).skipped == 1
+    assert sync_spotify(config, apply=True).skipped == 1
+
+
+def test_spotify_sync_reviews_non_track_sources_without_searching(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:mix", track_id="mix", artist="Various Artists", title="Full Mix")])
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Various Artists", title="Dominator Festival Full Mix", status="wanted")
+
+    summary = sync_spotify(config, apply=True, client=client)
+
+    assert summary.review == 1
+    assert client.added == []
+    with connect(config) as con:
+        assert con.execute("SELECT status FROM spotify_assets").fetchone()["status"] == "review"
+
+
 def test_reconcile_refuses_missing_music_dir_before_destructive_detection(tmp_path):
     config = make_config(tmp_path)
     init_db(config)

@@ -167,7 +167,34 @@ def test_youtube_sync_skips_existing_review_asset_without_search(tmp_path):
     assert client.downloads == []
 
 
-def test_youtube_sync_downloads_when_only_local_audio_has_no_video_id(tmp_path):
+def test_youtube_sync_skips_idless_local_audio_by_default(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    local_audio = config.music_dir / "EQUAL2 & PSYCHOWEAPON - HARDCORE LIFESTYLE.m4a"
+    local_audio.write_bytes(b"existing audio")
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="EQUAL2 & PSYCHOWEAPON", title="HARDCORE LIFESTYLE", status="wanted")
+            upsert_youtube_asset(
+                con,
+                track_id=track["id"],
+                file_path=str(local_audio),
+                file_exists=True,
+                match_confidence=1.0,
+                status="downloaded",
+            )
+
+    client = FakeYouTube()
+    summary = sync_youtube(config, apply=True, client=client)
+
+    assert summary.already_local == 1
+    assert summary.downloaded == 0
+    assert client.searches == []
+    assert local_audio.exists()
+
+
+def test_youtube_sync_downloads_when_idless_local_completion_is_enabled(tmp_path):
     config = make_config(tmp_path)
     init_db(config)
     config.music_dir.mkdir()
@@ -209,7 +236,7 @@ def test_youtube_sync_downloads_when_only_local_audio_has_no_video_id(tmp_path):
             return path
 
     client = CompletingYouTube()
-    summary = sync_youtube(config, apply=True, client=client)
+    summary = sync_youtube(config, apply=True, client=client, complete_idless_local=True)
 
     assert summary.downloaded == 1
     assert summary.already_local == 0

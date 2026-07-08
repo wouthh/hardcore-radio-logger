@@ -98,7 +98,7 @@ def cmd_spotify(args: argparse.Namespace, config: Config) -> int:
 
 def cmd_youtube(args: argparse.Namespace, config: Config) -> int:
     if args.youtube_command == "sync":
-        summary = sync_youtube(config, apply=is_apply(args))
+        summary = sync_youtube(config, apply=is_apply(args), complete_idless_local=args.complete_idless_local)
         print_kv("youtube_sync", summary)
         return 0
     return 2
@@ -178,7 +178,7 @@ def cmd_run_once(args: argparse.Namespace, config: Config) -> int:
         print_kv("reconcile", rec_summary)
         for refusal in rec_summary.refused:
             print(f"REFUSED {refusal}")
-        yt_summary = sync_youtube(config, apply=apply)
+        yt_summary = sync_youtube(config, apply=apply, complete_idless_local=args.complete_idless_local)
         print_kv("youtube_sync", yt_summary)
         sp_summary = sync_spotify(config, apply=apply)
         print_kv("spotify_sync", sp_summary)
@@ -230,6 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
     youtube_sub = youtube_parser.add_subparsers(dest="youtube_command", required=True)
     youtube_sync_parser = youtube_sub.add_parser("sync")
     add_apply_args(youtube_sync_parser)
+    youtube_sync_parser.add_argument("--complete-idless-local", action="store_true", default=None)
     youtube_parser.set_defaults(func=cmd_youtube)
 
     rec_parser = sub.add_parser("reconcile")
@@ -258,6 +259,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_apply_args(run_parser)
     run_parser.add_argument("--force-mass-delete", action="store_true")
     run_parser.add_argument("--force-confirm-deletions", action="store_true")
+    run_parser.add_argument("--complete-idless-local", action="store_true", default=None)
     run_parser.set_defaults(func=cmd_run_once)
 
     return parser

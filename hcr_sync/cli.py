@@ -14,7 +14,7 @@ from .logger_importer import import_logger
 from .poller import poll_radio
 from .reconcile import manual_exclude, reconcile
 from .report import build_report, format_report
-from .spotify_sync import backfill_spotify, scan_spotify_playlist, spotify_auth, sync_spotify
+from .spotify_sync import SpotifySummary, backfill_spotify, scan_spotify_playlist, spotify_auth, sync_spotify
 from .system import LegacyDownloaderActive, assert_legacy_downloader_safe, sync_lock
 from .youtube_sync import sync_youtube
 
@@ -177,8 +177,14 @@ def cmd_run_once(args: argparse.Namespace, config: Config) -> int:
         print_kv("import_logger", import_summary)
         local_summary = import_local_files(config, apply=apply, establish_baseline=False)
         print_kv("scan_local", local_summary)
-        spotify_scan_summary = scan_spotify_playlist(config, apply=apply)
-        print_kv("spotify_scan", spotify_scan_summary)
+        try:
+            spotify_scan_summary = scan_spotify_playlist(config, apply=apply)
+        except Exception as exc:
+            spotify_scan_summary = SpotifySummary(skipped=1)
+            print_kv("spotify_scan", spotify_scan_summary)
+            print(f"REFUSED spotify: playlist scan failed: {exc}")
+        else:
+            print_kv("spotify_scan", spotify_scan_summary)
         rec_summary = reconcile(
             config,
             apply=apply,

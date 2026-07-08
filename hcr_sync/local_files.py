@@ -105,6 +105,51 @@ def _existing_asset_for_local_file(con, item: LocalAudioFile):
     ).fetchone()
 
 
+def _missing_idless_asset_for_track(con, track_id: int):
+    rows = list(
+        con.execute(
+            """
+            SELECT *
+              FROM youtube_assets
+             WHERE track_id = ?
+               AND file_exists = 1
+               AND status = 'downloaded'
+               AND file_path IS NOT NULL
+               AND NULLIF(youtube_video_id, '') IS NULL
+            """,
+            (track_id,),
+        )
+    )
+    missing = [row for row in rows if not Path(row["file_path"]).exists()]
+    return missing[0] if len(missing) == 1 else None
+
+
+def _move_local_asset_path(con, asset, item: LocalAudioFile) -> None:
+    now = now_utc()
+    con.execute(
+        """
+        UPDATE youtube_assets
+           SET file_path = ?,
+               file_exists = 1,
+               match_confidence = 1.0,
+               status = 'downloaded',
+               last_seen_at = ?,
+               suspected_missing_at = NULL,
+               updated_at = ?
+         WHERE id = ?
+        """,
+        (str(item.path), now, now, asset["id"]),
+    )
+    add_event(
+        con,
+        asset["track_id"],
+        "local_file_path_updated",
+        "local_scan",
+        {"old_path": asset["file_path"], "new_path": str(item.path), "reason": "single missing idless asset matched current scan"},
+        dedupe_key=f"local_file_path_updated:{asset['track_id']}:{asset['id']}:{item.path}",
+    )
+
+
 def import_local_files(config: Config, *, apply: bool, establish_baseline: bool) -> LocalSummary:
     summary = LocalSummary()
     scanned = scan_music_folder(config)
@@ -118,23 +163,29 @@ def import_local_files(config: Config, *, apply: bool, establish_baseline: bool)
         with transaction(con):
             for item in scanned:
                 existing_asset = _existing_asset_for_local_file(con, item)
+                moved_asset = None
                 if existing_asset:
                     track_id = existing_asset["track_id"]
                 else:
                     track = ensure_track(con, artist=item.artist, title=item.title, status="wanted")
                     track_id = track["id"]
+                    if not item.youtube_video_id:
+                        moved_asset = _missing_idless_asset_for_track(con, track_id)
                 summary.tracks_seen += 1
-                upsert_youtube_asset(
-                    con,
-                    track_id=track_id,
-                    youtube_video_id=item.youtube_video_id,
-                    youtube_url=f"https://www.youtube.com/watch?v={item.youtube_video_id}" if item.youtube_video_id else "",
-                    file_path=str(item.path),
-                    file_exists=True,
-                    match_confidence=1.0,
-                    status="downloaded",
-                    downloaded_at=None,
-                )
+                if moved_asset:
+                    _move_local_asset_path(con, moved_asset, item)
+                else:
+                    upsert_youtube_asset(
+                        con,
+                        track_id=track_id,
+                        youtube_video_id=item.youtube_video_id,
+                        youtube_url=f"https://www.youtube.com/watch?v={item.youtube_video_id}" if item.youtube_video_id else "",
+                        file_path=str(item.path),
+                        file_exists=True,
+                        match_confidence=1.0,
+                        status="downloaded",
+                        downloaded_at=None,
+                    )
                 add_event(
                     con,
                     track_id,
@@ -144,9 +195,12 @@ def import_local_files(config: Config, *, apply: bool, establish_baseline: bool)
                     dedupe_key=f"local_file_seen:{track_id}:{item.path}",
                 )
                 summary.assets_upserted += 1
-            set_state(con, "last_local_scan_count", str(len(scanned)))
-            set_state(con, "last_local_scan_at", now_utc())
+            scan_at = now_utc()
+            set_state(con, "last_local_import_scan_count", str(len(scanned)))
+            set_state(con, "last_local_import_scan_at", scan_at)
             if establish_baseline:
+                set_state(con, "last_local_scan_count", str(len(scanned)))
+                set_state(con, "last_local_scan_at", scan_at)
                 set_state(con, "local_baseline_complete", "true")
                 summary.baseline_complete = True
     return summary

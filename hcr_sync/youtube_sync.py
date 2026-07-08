@@ -190,6 +190,36 @@ def _suspected_local_delete_track_keys(con) -> set[int]:
     }
 
 
+def _youtube_candidate_used_by_other_track(
+    con,
+    *,
+    track_id: int,
+    youtube_video_id: str = "",
+    file_path: str = "",
+):
+    conditions = []
+    params: list[object] = [track_id]
+    if youtube_video_id:
+        conditions.append("youtube_video_id = ?")
+        params.append(youtube_video_id)
+    if file_path:
+        conditions.append("file_path = ?")
+        params.append(file_path)
+    if not conditions:
+        return None
+    return con.execute(
+        f"""
+        SELECT *
+          FROM youtube_assets
+         WHERE track_id != ?
+           AND status != 'deleted'
+           AND ({' OR '.join(conditions)})
+         LIMIT 1
+        """,
+        params,
+    ).fetchone()
+
+
 def _existing_local_match(con, *, track, artist: str, title: str, require_youtube_id: bool):
     youtube_id_filter = "AND NULLIF(y.youtube_video_id, '') IS NOT NULL" if require_youtube_id else ""
     rows = con.execute(
@@ -331,6 +361,32 @@ def _mark_youtube_error(con, track_id: int, candidate: YouTubeCandidate, *, scor
     )
 
 
+def _mark_youtube_candidate_conflict(con, track_id: int, candidate: YouTubeCandidate, *, score: float, existing_asset) -> None:
+    upsert_youtube_asset(
+        con,
+        track_id=track_id,
+        match_confidence=score,
+        file_exists=False,
+        status="review",
+    )
+    add_event(
+        con,
+        track_id,
+        "youtube_candidate_already_linked",
+        "youtube_sync",
+        {
+            "youtube_video_id": candidate.video_id,
+            "youtube_url": candidate.url,
+            "candidate_title": candidate.title,
+            "score": score,
+            "existing_track_id": existing_asset["track_id"],
+            "existing_asset_id": existing_asset["id"],
+            "reason": "candidate YouTube video is already linked to another DB track",
+        },
+        dedupe_key=f"youtube_candidate_already_linked:{track_id}:{candidate.video_id or candidate.url}:{existing_asset['id']}",
+    )
+
+
 def sync_youtube(
     config: Config,
     *,
@@ -420,6 +476,23 @@ def sync_youtube(
                 if apply:
                     with transaction(con):
                         _mark_youtube_review(con, track["id"], reason="below threshold or not found", score=best_score or None)
+                continue
+            conflicting_asset = _youtube_candidate_used_by_other_track(
+                con,
+                track_id=track["id"],
+                youtube_video_id=best.video_id,
+            )
+            if conflicting_asset:
+                summary.review += 1
+                if apply:
+                    with transaction(con):
+                        _mark_youtube_candidate_conflict(
+                            con,
+                            track["id"],
+                            best,
+                            score=best_score,
+                            existing_asset=conflicting_asset,
+                        )
                 continue
             if not apply:
                 summary.downloaded += 1

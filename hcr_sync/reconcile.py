@@ -76,6 +76,8 @@ def _spotify_guard(config: Config, con, snapshot, *, force_mass_delete: bool) ->
         return "spotify playlist pagination did not complete"
     if not snapshot.snapshot_id:
         return "spotify playlist snapshot id is missing"
+    if snapshot.tracks and not any(track.track_id for track in snapshot.tracks):
+        return "spotify playlist snapshot has no usable track identities"
     previous = int(get_state(con, "last_spotify_playlist_count", "0") or "0")
     if previous and len(snapshot.tracks) < previous * config.float("HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO"):
         return "spotify playlist count is suspiciously low"
@@ -280,6 +282,20 @@ def reconcile(
                 )
                 for asset in known_spotify:
                     if asset["spotify_track_id"] in current_ids:
+                        if apply and asset["suspected_missing_at"]:
+                            with transaction(con):
+                                con.execute(
+                                    "UPDATE spotify_assets SET suspected_missing_at = NULL, updated_at = ? WHERE id = ?",
+                                    (now_utc(), asset["id"]),
+                                )
+                                add_event(
+                                    con,
+                                    asset["track_id"],
+                                    "spotify_removal_suspicion_cleared",
+                                    "reconcile",
+                                    {"spotify_track_id": asset["spotify_track_id"]},
+                                    dedupe_key=f"spotify_removal_suspicion_cleared:{asset['track_id']}:{asset['id']}:{snapshot.snapshot_id}",
+                                )
                         continue
                     if _is_recent_self_added_spotify_asset(asset, previous_spotify_scan_at):
                         continue

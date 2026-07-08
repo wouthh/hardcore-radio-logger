@@ -5,7 +5,7 @@ import pytest
 from hcr_sync.config import DEFAULTS, Config
 from hcr_sync.db import connect, ensure_track, init_db, set_state, transaction, upsert_spotify_asset, upsert_youtube_asset
 from hcr_sync.reconcile import manual_exclude, reconcile
-from hcr_sync.spotify_sync import PlaylistSnapshot, SpotifyTrack, backfill_spotify, sync_spotify
+from hcr_sync.spotify_sync import PlaylistSnapshot, SpotifyTrack, _spotify_track_from_playlist_item, backfill_spotify, sync_spotify
 from hcr_sync.system import LegacyDownloaderActive, assert_legacy_downloader_safe
 from hcr_sync.youtube_sync import YouTubeCandidate, sync_youtube
 
@@ -47,6 +47,29 @@ class FakeSpotify:
 
     def remove_tracks(self, playlist_id, uris):
         self.removed.extend(uris)
+
+
+def test_playlist_item_parser_accepts_spotify_item_shape():
+    track = _spotify_track_from_playlist_item(
+        {
+            "item": {
+                "id": "abc",
+                "uri": "spotify:track:abc",
+                "name": "Song",
+                "type": "track",
+                "duration_ms": 180000,
+                "artists": [{"name": "Artist"}],
+            }
+        }
+    )
+
+    assert track == SpotifyTrack(
+        uri="spotify:track:abc",
+        track_id="abc",
+        artist="Artist",
+        title="Song",
+        duration_ms=180000,
+    )
 
 
 def test_spotify_backfill_and_sync_with_fake_client(tmp_path):
@@ -385,6 +408,79 @@ def test_reconcile_refuses_empty_spotify_snapshot_with_known_assets(tmp_path):
 
     assert "spotify: spotify playlist snapshot is empty while DB has known playlist assets" in summary.refused
     assert summary.suspected_spotify == 0
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM spotify_assets").fetchone()
+        assert asset["suspected_missing_at"] is None
+
+
+def test_reconcile_refuses_spotify_snapshot_without_track_identities(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_spotify_asset(
+                con,
+                track_id=track["id"],
+                playlist_id="playlist",
+                spotify_track_uri="spotify:track:1",
+                spotify_track_id="1",
+                spotify_artist="Artist",
+                spotify_title="Title",
+                in_playlist=True,
+                match_confidence=1.0,
+                status="added",
+                added_at="2026-01-01T00:00:00Z",
+            )
+            set_state(con, "spotify_baseline_complete", "true")
+            set_state(con, "last_spotify_playlist_count", "1")
+            set_state(con, "last_spotify_scan_at", "2026-01-01T01:00:00Z")
+            set_state(con, "local_baseline_complete", "true")
+
+    snapshot_track = SpotifyTrack(uri="", track_id="", artist="", title="")
+    summary = reconcile(config, apply=True, spotify_client=FakeSpotify(snapshot_tracks=[snapshot_track]))
+
+    assert "spotify: spotify playlist snapshot has no usable track identities" in summary.refused
+    assert summary.suspected_spotify == 0
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM spotify_assets").fetchone()
+        assert asset["suspected_missing_at"] is None
+
+
+def test_reconcile_clears_spotify_removal_suspicion_when_track_is_seen(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_spotify_asset(
+                con,
+                track_id=track["id"],
+                playlist_id="playlist",
+                spotify_track_uri="spotify:track:1",
+                spotify_track_id="1",
+                spotify_artist="Artist",
+                spotify_title="Title",
+                in_playlist=True,
+                match_confidence=1.0,
+                status="added",
+                added_at="2026-01-01T00:00:00Z",
+            )
+            con.execute("UPDATE spotify_assets SET suspected_missing_at = ? WHERE spotify_track_id = ?", ("2026-01-01T01:00:00Z", "1"))
+            set_state(con, "spotify_baseline_complete", "true")
+            set_state(con, "last_spotify_playlist_count", "1")
+            set_state(con, "last_spotify_scan_at", "2026-01-01T02:00:00Z")
+            set_state(con, "local_baseline_complete", "true")
+
+    summary = reconcile(
+        config,
+        apply=True,
+        spotify_client=FakeSpotify(snapshot_tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")]),
+    )
+
+    assert summary.refused == []
+    assert summary.planned == []
     with connect(config) as con:
         asset = con.execute("SELECT * FROM spotify_assets").fetchone()
         assert asset["suspected_missing_at"] is None

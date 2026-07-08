@@ -155,17 +155,18 @@ class YouTubeSummary:
     skipped: int = 0
 
 
-def _local_track_keys(config: Config) -> set[int]:
+def _local_track_keys(config: Config, *, require_youtube_id: bool) -> set[int]:
+    youtube_id_filter = "AND NULLIF(youtube_video_id, '') IS NOT NULL" if require_youtube_id else ""
     with connect(config) as con:
         return {
             row["track_id"]
             for row in con.execute(
-                """
+                f"""
                 SELECT track_id
                   FROM youtube_assets
                  WHERE file_exists = 1
                    AND status = 'downloaded'
-                   AND NULLIF(youtube_video_id, '') IS NOT NULL
+                   {youtube_id_filter}
                 """
             )
         }
@@ -180,9 +181,10 @@ def _review_track_keys(con) -> set[int]:
     }
 
 
-def _existing_local_match(con, *, track, artist: str, title: str):
+def _existing_local_match(con, *, track, artist: str, title: str, require_youtube_id: bool):
+    youtube_id_filter = "AND NULLIF(y.youtube_video_id, '') IS NOT NULL" if require_youtube_id else ""
     rows = con.execute(
-        """
+        f"""
         SELECT
             y.id AS asset_id,
             y.file_path,
@@ -195,7 +197,7 @@ def _existing_local_match(con, *, track, artist: str, title: str):
          WHERE y.file_exists = 1
            AND y.status = 'downloaded'
            AND y.file_path IS NOT NULL
-           AND NULLIF(y.youtube_video_id, '') IS NOT NULL
+           {youtube_id_filter}
            AND t.id != ?
         """,
         (track["id"],),
@@ -285,14 +287,22 @@ def _mark_youtube_review(con, track_id: int, *, reason: str, score: float | None
     )
 
 
-def sync_youtube(config: Config, *, apply: bool, client: YouTubeClientProtocol | None = None) -> YouTubeSummary:
+def sync_youtube(
+    config: Config,
+    *,
+    apply: bool,
+    client: YouTubeClientProtocol | None = None,
+    complete_idless_local: bool | None = None,
+) -> YouTubeSummary:
     if apply:
         assert_legacy_downloader_safe(config)
+    if complete_idless_local is None:
+        complete_idless_local = config.bool("HCR_YOUTUBE_COMPLETE_IDLESS_LOCAL")
     summary = YouTubeSummary()
     client = client or YtDlpClient(config)
     with connect(config) as con:
         tracks = wanted_tracks(con)
-        local_ids = _local_track_keys(config)
+        local_ids = _local_track_keys(config, require_youtube_id=complete_idless_local)
         review_ids = _review_track_keys(con)
         for track in tracks:
             summary.wanted += 1
@@ -319,6 +329,7 @@ def sync_youtube(config: Config, *, apply: bool, client: YouTubeClientProtocol |
                 track=track,
                 artist=track["display_artist"],
                 title=track["display_title"],
+                require_youtube_id=complete_idless_local,
             )
             if existing_match:
                 summary.already_local += 1
@@ -361,6 +372,7 @@ def sync_youtube(config: Config, *, apply: bool, client: YouTubeClientProtocol |
                 track=track,
                 artist=candidate_artist or track["display_artist"],
                 title=candidate_title or best.title,
+                require_youtube_id=complete_idless_local,
             )
             if candidate_existing_match:
                 summary.already_local += 1

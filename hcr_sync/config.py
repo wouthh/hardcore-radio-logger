@@ -45,6 +45,7 @@ DEFAULTS: dict[str, str] = {
     "HCR_NODE_RUNTIME": "",
     "HCR_YOUTUBE_DOWNLOAD_ARCHIVE": "./youtube-download-archive.txt",
     "HCR_DOWNLOAD_TMP_DIR": "./download-tmp",
+    "HCR_YOUTUBE_COMPLETE_IDLESS_LOCAL": "false",
     "HCR_YOUTUBE_MATCH_THRESHOLD": "0.90",
     "HCR_SPOTIFY_MATCH_THRESHOLD": "0.90",
     "HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO": "0.60",

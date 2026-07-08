@@ -101,6 +101,13 @@ python -m hcr_sync spotify scan --apply
 
 Spotify sync uses conservative matching and does not auto-add source rows or candidates that look like full mixes, DJ sets, podcasts, radio shows, compilations, full albums, trailers, interviews, or other non-track items. Those are left for review instead.
 
+YouTube sync normally treats any known local audio file as already local, including files that were imported without a YouTube video ID. To deliberately test or complete those files into YouTube-ID MP3 downloads, opt in explicitly:
+
+```bash
+python -m hcr_sync youtube sync --dry-run --complete-idless-local
+python -m hcr_sync youtube sync --apply --complete-idless-local
+```
+
 ## Using The Built-In Poller
 
 If `HCR_RUN_POLLER=true`, `run-once` polls Hardcore Radio itself before importing logger files. The poller only writes observations. It does not download audio and does not touch Spotify.

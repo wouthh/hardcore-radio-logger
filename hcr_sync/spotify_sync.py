@@ -286,13 +286,17 @@ def _format_utc(value: datetime) -> str:
     return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _retry_after_until(exc: Exception) -> str:
+def _retry_after_until(config: Config, exc: Exception) -> str:
     headers = getattr(exc, "headers", {}) or {}
     retry_after = headers.get("Retry-After") or headers.get("retry-after") or ""
+    if not retry_after:
+        match = re.search(r"Retry(?:\s+will\s+occur)?\s+after:\s*(\d+)", str(exc), re.I)
+        if match:
+            retry_after = match.group(1)
     try:
         seconds = max(1, int(float(retry_after)))
     except (TypeError, ValueError):
-        seconds = 900
+        seconds = config.int("HCR_SPOTIFY_RATE_LIMIT_FALLBACK_SECONDS")
     return _format_utc(datetime.now(timezone.utc) + timedelta(seconds=seconds))
 
 
@@ -301,9 +305,9 @@ def _spotify_cooldown_active(con) -> bool:
     return bool(until and until > datetime.now(timezone.utc))
 
 
-def _remember_spotify_rate_limit(con, exc: Exception) -> None:
+def _remember_spotify_rate_limit(con, config: Config, exc: Exception) -> None:
     with transaction(con):
-        set_state(con, "spotify_rate_limited_until", _retry_after_until(exc))
+        set_state(con, "spotify_rate_limited_until", _retry_after_until(config, exc))
 
 
 def _is_terminal_review_asset(asset, tentative_threshold: float) -> bool:
@@ -513,7 +517,7 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                 candidates = client.search_track(track["display_artist"], track["display_title"])
             except Exception as exc:
                 if _is_rate_limited(exc):
-                    _remember_spotify_rate_limit(con, exc)
+                    _remember_spotify_rate_limit(con, config, exc)
                     summary.rate_limited = True
                     summary.skipped += 1
                     break
@@ -566,7 +570,7 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                 client.add_tracks(playlist_id, [best.uri])
             except Exception as exc:
                 if _is_rate_limited(exc):
-                    _remember_spotify_rate_limit(con, exc)
+                    _remember_spotify_rate_limit(con, config, exc)
                     summary.rate_limited = True
                     summary.skipped += 1
                     break

@@ -143,3 +143,25 @@ def test_youtube_sync_rejects_multi_title_candidate(tmp_path):
     assert asset is not None
     assert asset["match_confidence"] is None
     assert event is not None
+
+
+def test_youtube_sync_skips_existing_review_asset_without_search(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Ambiguous Track", status="wanted")
+            upsert_youtube_asset(
+                con,
+                track_id=track["id"],
+                file_exists=False,
+                match_confidence=0.5,
+                status="review",
+            )
+
+    client = FakeYouTube()
+    summary = sync_youtube(config, apply=True, client=client)
+
+    assert summary.review == 1
+    assert client.searches == []
+    assert client.downloads == []

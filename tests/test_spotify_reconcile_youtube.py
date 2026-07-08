@@ -143,6 +143,65 @@ def test_spotify_sync_allows_bracketed_subtitle_when_core_title_matches(tmp_path
     assert client.added == ["spotify:track:mind"]
 
 
+def test_spotify_sync_skips_existing_review_asset_without_search(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")])
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_spotify_asset(
+                con,
+                track_id=track["id"],
+                playlist_id="playlist",
+                in_playlist=False,
+                match_confidence=None,
+                status="review",
+            )
+
+    summary = sync_spotify(config, apply=True, client=client)
+
+    assert summary.review == 1
+    assert client.added == []
+
+
+def test_spotify_sync_respects_per_run_limit(tmp_path):
+    config = make_config(tmp_path, HCR_SPOTIFY_SYNC_LIMIT="1")
+    init_db(config)
+    client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")])
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Artist", title="Title", status="wanted")
+            ensure_track(con, artist="Other", title="Song", status="wanted")
+
+    summary = sync_spotify(config, apply=True, client=client)
+
+    assert summary.added == 1
+    assert summary.skipped == 1
+    assert len(client.added) == 1
+
+
+def test_spotify_sync_stops_cleanly_on_rate_limit(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+
+    class RateLimitedSpotify(FakeSpotify):
+        def search_track(self, artist, title):
+            exc = RuntimeError("rate limited")
+            exc.http_status = 429
+            exc.headers = {"Retry-After": "3600"}
+            raise exc
+
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Artist", title="Title", status="wanted")
+
+    summary = sync_spotify(config, apply=True, client=RateLimitedSpotify())
+
+    assert summary.rate_limited is True
+    assert summary.skipped == 1
+
+
 def test_spotify_sync_adds_even_when_youtube_is_review(tmp_path):
     config = make_config(tmp_path)
     init_db(config)

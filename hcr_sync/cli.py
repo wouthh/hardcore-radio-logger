@@ -8,13 +8,14 @@ import sys
 from .config import Config, load_config
 from .db import connect, ensure_track, init_db, track_by_id, transaction, unexclude_track
 from .doctor import format_doctor, run_doctor
+from .identity import canonical_key
 from .local_files import import_local_files
 from .logger_importer import import_logger
 from .poller import poll_radio
 from .reconcile import manual_exclude, reconcile
 from .report import build_report, format_report
 from .spotify_sync import backfill_spotify, scan_spotify_playlist, spotify_auth, sync_spotify
-from .system import LegacyDownloaderActive, sync_lock
+from .system import LegacyDownloaderActive, assert_legacy_downloader_safe, sync_lock
 from .youtube_sync import sync_youtube
 
 
@@ -119,19 +120,26 @@ def cmd_reconcile(args: argparse.Namespace, config: Config) -> int:
     return 1 if summary.refused and is_apply(args) else 0
 
 
-def _track_id_for_exclude(config: Config, args: argparse.Namespace) -> int:
+def _track_id_for_exclude(config: Config, args: argparse.Namespace, *, create: bool) -> int | None:
     if args.track_id:
         return args.track_id
     if not args.artist and not args.title:
         raise RuntimeError("provide --track-id or --artist/--title")
     with connect(config) as con:
+        if not create:
+            key = canonical_key(args.artist or "", args.title or "")
+            row = con.execute("SELECT id FROM tracks WHERE canonical_key = ?", (key,)).fetchone()
+            return int(row["id"]) if row else None
         with transaction(con):
             track = ensure_track(con, artist=args.artist or "", title=args.title or "", status="wanted")
             return int(track["id"])
 
 
 def cmd_exclude(args: argparse.Namespace, config: Config) -> int:
-    track_id = _track_id_for_exclude(config, args)
+    track_id = _track_id_for_exclude(config, args, create=is_apply(args))
+    if track_id is None:
+        print(f"exclude dry_run track_id=(new) artist={args.artist!r} title={args.title!r} reason={args.reason!r}")
+        return 0
     summary = manual_exclude(config, track_id=track_id, reason=args.reason, apply=is_apply(args))
     print_kv("exclude", summary)
     return 0
@@ -159,6 +167,8 @@ def cmd_report(args: argparse.Namespace, config: Config) -> int:
 
 def cmd_run_once(args: argparse.Namespace, config: Config) -> int:
     apply = is_apply(args)
+    if apply:
+        assert_legacy_downloader_safe(config)
     with sync_lock(config.sync_lock_path):
         if config.bool("HCR_RUN_POLLER"):
             changed, track = poll_radio(config, apply=apply)
@@ -178,6 +188,12 @@ def cmd_run_once(args: argparse.Namespace, config: Config) -> int:
         print_kv("reconcile", rec_summary)
         for refusal in rec_summary.refused:
             print(f"REFUSED {refusal}")
+        fatal_refusals = fatal_reconcile_refusals(rec_summary.refused)
+        if apply and fatal_refusals:
+            print("SKIPPED youtube_sync reason=fatal_reconcile_refusal")
+            print("SKIPPED spotify_sync reason=fatal_reconcile_refusal")
+            print(format_report(build_report(config)))
+            return 1
         yt_summary = sync_youtube(config, apply=apply, complete_idless_local=args.complete_idless_local)
         print_kv("youtube_sync", yt_summary)
         sp_summary = sync_spotify(config, apply=apply)

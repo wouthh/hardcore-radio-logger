@@ -514,6 +514,66 @@ def test_spotify_sync_stops_cleanly_on_rate_limit(tmp_path):
         assert cooldown_events == 1
 
 
+def test_spotify_sync_dry_run_rate_limit_does_not_write_cooldown(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+
+    class RateLimitedSpotify(FakeSpotify):
+        def search_track(self, artist, title):
+            self.search_calls.append((artist, title))
+            exc = RuntimeError("rate limited")
+            exc.http_status = 429
+            exc.headers = {"Retry-After": "3600"}
+            raise exc
+
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Artist", title="Title", status="wanted")
+
+    summary = sync_spotify(config, apply=False, client=RateLimitedSpotify())
+
+    assert summary.rate_limited is True
+    with connect(config) as con:
+        assert con.execute("SELECT * FROM sync_state WHERE key LIKE 'spotify_rate_limit%'").fetchall() == []
+        assert con.execute("SELECT * FROM events WHERE event_type = 'spotify_rate_limited'").fetchone() is None
+
+
+def test_spotify_sync_reviews_candidate_track_id_linked_to_other_track_without_adding(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:same", track_id="same", artist="Artist", title="Title")])
+    with connect(config) as con:
+        with transaction(con):
+            other = ensure_track(con, artist="Other Artist", title="Other Title", status="wanted")
+            ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_spotify_asset(
+                con,
+                track_id=other["id"],
+                playlist_id="playlist",
+                spotify_track_uri="spotify:track:same",
+                spotify_track_id="same",
+                spotify_artist="Other Artist",
+                spotify_title="Other Title",
+                in_playlist=True,
+                match_confidence=1.0,
+                status="added",
+            )
+
+    summary = sync_spotify(config, apply=True, client=client)
+
+    assert summary.review == 1
+    assert client.added == []
+    with connect(config) as con:
+        rows = list(con.execute("SELECT * FROM spotify_assets ORDER BY track_id"))
+        event = con.execute("SELECT * FROM events WHERE event_type = 'spotify_candidate_already_linked'").fetchone()
+        assert len(rows) == 2
+        assert rows[0]["spotify_track_id"] == "same"
+        assert rows[0]["in_playlist"] == 1
+        assert rows[1]["status"] == "review"
+        assert rows[1]["spotify_track_id"] is None
+        assert event is not None
+
+
 def test_spotify_rate_limit_cooldown_parses_retry_text(tmp_path):
     config = make_config(tmp_path, HCR_SPOTIFY_RATE_LIMIT_FALLBACK_SECONDS="7200")
     init_db(config)

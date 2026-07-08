@@ -367,3 +367,61 @@ def test_youtube_sync_records_download_failure_and_continues(tmp_path):
         assert error_asset["file_exists"] == 0
         assert downloaded_asset["status"] == "downloaded"
         assert event is not None
+
+
+def test_youtube_sync_reviews_candidate_video_id_linked_to_other_track_without_downloading(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    existing_file = config.music_dir / "Noise Maker - Completely Different [samevid123].mp3"
+    existing_file.write_bytes(b"audio")
+    with connect(config) as con:
+        with transaction(con):
+            other = ensure_track(con, artist="Noise Maker", title="Completely Different", status="wanted")
+            ensure_track(con, artist="Drokz", title="Karma", status="wanted")
+            upsert_youtube_asset(
+                con,
+                track_id=other["id"],
+                youtube_video_id="samevid123",
+                youtube_url="https://www.youtube.com/watch?v=samevid123",
+                file_path=str(existing_file),
+                file_exists=True,
+                match_confidence=1.0,
+                status="downloaded",
+            )
+
+    class DuplicateVideoYouTube:
+        def __init__(self):
+            self.downloads = []
+
+        def search(self, artist, title):
+            return [
+                YouTubeCandidate(
+                    title="Drokz - Karma",
+                    url="https://www.youtube.com/watch?v=samevid123",
+                    video_id="samevid123",
+                    channel="Drokz",
+                    duration=180,
+                )
+            ]
+
+        def download(self, candidate):
+            self.downloads.append(candidate)
+            path = config.music_dir / "Drokz - Karma [samevid123].mp3"
+            path.write_bytes(b"audio")
+            return path
+
+    client = DuplicateVideoYouTube()
+    summary = sync_youtube(config, apply=True, client=client)
+
+    assert summary.review == 1
+    assert client.downloads == []
+    with connect(config) as con:
+        rows = list(con.execute("SELECT * FROM youtube_assets ORDER BY track_id"))
+        event = con.execute("SELECT * FROM events WHERE event_type = 'youtube_candidate_already_linked'").fetchone()
+        assert len(rows) == 2
+        assert rows[0]["youtube_video_id"] == "samevid123"
+        assert rows[0]["file_exists"] == 1
+        assert rows[1]["status"] == "review"
+        assert rows[1]["youtube_video_id"] is None
+        assert event is not None

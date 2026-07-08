@@ -359,6 +359,61 @@ def _suspected_local_delete_track_ids(con) -> set[int]:
     }
 
 
+def _spotify_candidate_used_by_other_track(con, *, playlist_id: str, track_id: int, spotify_track_id: str):
+    if not spotify_track_id:
+        return None
+    return con.execute(
+        """
+        SELECT *
+          FROM spotify_assets
+         WHERE playlist_id = ?
+           AND spotify_track_id = ?
+           AND track_id != ?
+         LIMIT 1
+        """,
+        (playlist_id, spotify_track_id, track_id),
+    ).fetchone()
+
+
+def _mark_spotify_candidate_conflict(
+    con,
+    *,
+    playlist_id: str,
+    track,
+    candidate: SpotifyTrack,
+    score: float,
+    existing_asset,
+) -> None:
+    upsert_spotify_asset(
+        con,
+        track_id=track["id"],
+        playlist_id=playlist_id,
+        spotify_track_uri=candidate.uri,
+        spotify_track_id="",
+        spotify_artist=candidate.artist,
+        spotify_title=candidate.title,
+        in_playlist=False,
+        match_confidence=score,
+        status="review",
+    )
+    add_event(
+        con,
+        track["id"],
+        "spotify_candidate_already_linked",
+        "spotify_sync",
+        {
+            "spotify_track_id": candidate.track_id,
+            "spotify_artist": candidate.artist,
+            "spotify_title": candidate.title,
+            "score": score,
+            "existing_track_id": existing_asset["track_id"],
+            "existing_asset_id": existing_asset["id"],
+            "reason": "candidate Spotify track is already linked to another DB track",
+        },
+        dedupe_key=f"spotify_candidate_already_linked:{track['id']}:{candidate.track_id}:{existing_asset['id']}",
+    )
+
+
 def _validate_playlist_snapshot(snapshot: PlaylistSnapshot) -> None:
     if not snapshot.complete or not snapshot.snapshot_id:
         raise RuntimeError("Spotify playlist snapshot was incomplete")
@@ -492,8 +547,9 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
     client = client or SpotipyClient(config)
     with connect(config) as con:
         if _spotify_cooldown_active(con):
-            with transaction(con):
-                _log_spotify_cooldown_skip(con)
+            if apply:
+                with transaction(con):
+                    _log_spotify_cooldown_skip(con)
             summary.rate_limited = True
             summary.skipped += 1
             return summary
@@ -588,7 +644,8 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                 candidates = client.search_track(track["display_artist"], track["display_title"])
             except Exception as exc:
                 if _is_rate_limited(exc):
-                    _remember_spotify_rate_limit(con, config, exc)
+                    if apply:
+                        _remember_spotify_rate_limit(con, config, exc)
                     summary.rate_limited = True
                     summary.skipped += 1
                     break
@@ -637,6 +694,25 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                             dedupe_key=f"ambiguous_spotify_match:{track['id']}:{best.track_id if best else 'none'}:{best_score:.3f}",
                         )
                 continue
+            conflicting_asset = _spotify_candidate_used_by_other_track(
+                con,
+                playlist_id=playlist_id,
+                track_id=track["id"],
+                spotify_track_id=best.track_id,
+            )
+            if conflicting_asset:
+                summary.review += 1
+                if apply:
+                    with transaction(con):
+                        _mark_spotify_candidate_conflict(
+                            con,
+                            playlist_id=playlist_id,
+                            track=track,
+                            candidate=best,
+                            score=best_score,
+                            existing_asset=conflicting_asset,
+                        )
+                continue
             if not apply:
                 summary.added += 1
                 if tentative_match and not confident_match:
@@ -651,7 +727,8 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                 client.add_tracks(playlist_id, [best.uri])
             except Exception as exc:
                 if _is_rate_limited(exc):
-                    _remember_spotify_rate_limit(con, config, exc)
+                    if apply:
+                        _remember_spotify_rate_limit(con, config, exc)
                     summary.rate_limited = True
                     summary.skipped += 1
                     break

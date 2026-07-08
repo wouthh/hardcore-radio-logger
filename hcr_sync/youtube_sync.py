@@ -165,6 +165,15 @@ def _local_track_keys(config: Config) -> set[int]:
         }
 
 
+def _review_track_keys(con) -> set[int]:
+    return {
+        row["track_id"]
+        for row in con.execute(
+            "SELECT track_id FROM youtube_assets WHERE status = 'review' AND file_exists = 0"
+        )
+    }
+
+
 def _existing_local_match(con, *, track, artist: str, title: str):
     rows = con.execute(
         """
@@ -277,8 +286,15 @@ def sync_youtube(config: Config, *, apply: bool, client: YouTubeClientProtocol |
     with connect(config) as con:
         tracks = wanted_tracks(con)
         local_ids = _local_track_keys(config)
+        review_ids = _review_track_keys(con)
         for track in tracks:
             summary.wanted += 1
+            if track["id"] in local_ids:
+                summary.already_local += 1
+                continue
+            if track["id"] in review_ids:
+                summary.review += 1
+                continue
             if SOURCE_NON_TRACK_RE.search(f"{track['display_artist']} {track['display_title']}"):
                 summary.review += 1
                 if apply:
@@ -290,9 +306,6 @@ def sync_youtube(config: Config, *, apply: bool, client: YouTubeClientProtocol |
                 if apply:
                     with transaction(con):
                         _mark_youtube_review(con, track["id"], reason="placeholder artist/title from logger", score=0.0)
-                continue
-            if track["id"] in local_ids:
-                summary.already_local += 1
                 continue
             existing_match = _existing_local_match(
                 con,

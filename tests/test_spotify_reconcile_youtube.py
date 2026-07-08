@@ -547,6 +547,72 @@ def test_reconcile_two_pass_local_delete_then_cascade(tmp_path):
     assert statuses["Keep"] == "wanted"
 
 
+def test_reconcile_two_pass_spotify_remove_then_cascade_clears_suspicion(tmp_path):
+    config = make_config(tmp_path, HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO="0.40")
+    init_db(config)
+    config.music_dir.mkdir()
+    path = config.music_dir / "Artist - Title.mp3"
+    path.write_bytes(b"x")
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            keep_track = ensure_track(con, artist="Keep", title="Song", status="wanted")
+            upsert_youtube_asset(con, track_id=track["id"], file_path=str(path), file_exists=True, match_confidence=1.0, status="downloaded")
+            upsert_spotify_asset(
+                con,
+                track_id=track["id"],
+                playlist_id="playlist",
+                spotify_track_uri="spotify:track:1",
+                spotify_track_id="1",
+                spotify_artist="Artist",
+                spotify_title="Title",
+                in_playlist=True,
+                match_confidence=1.0,
+                status="added",
+                added_at="2026-01-01T00:00:00Z",
+            )
+            upsert_spotify_asset(
+                con,
+                track_id=keep_track["id"],
+                playlist_id="playlist",
+                spotify_track_uri="spotify:track:2",
+                spotify_track_id="2",
+                spotify_artist="Keep",
+                spotify_title="Song",
+                in_playlist=True,
+                match_confidence=1.0,
+                status="added",
+                added_at="2026-01-01T00:00:00Z",
+            )
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "1")
+            set_state(con, "spotify_baseline_complete", "true")
+            set_state(con, "last_spotify_playlist_count", "2")
+            set_state(con, "last_spotify_scan_at", "2026-01-01T01:00:00Z")
+
+    snapshot = [SpotifyTrack(uri="spotify:track:2", track_id="2", artist="Keep", title="Song")]
+    first = reconcile(config, apply=True, spotify_client=FakeSpotify(snapshot_tracks=snapshot))
+    second = reconcile(config, apply=True, spotify_client=FakeSpotify(snapshot_tracks=snapshot))
+
+    assert first.suspected_spotify == 1
+    assert second.excluded_spotify == 1
+    assert second.local_trashed == 1
+    assert not path.exists()
+    with connect(config) as con:
+        track = con.execute("SELECT * FROM tracks WHERE display_artist = 'Artist'").fetchone()
+        keep_track = con.execute("SELECT * FROM tracks WHERE display_artist = 'Keep'").fetchone()
+        spotify = con.execute("SELECT * FROM spotify_assets WHERE spotify_track_id = '1'").fetchone()
+        keep_spotify = con.execute("SELECT * FROM spotify_assets WHERE spotify_track_id = '2'").fetchone()
+        youtube = con.execute("SELECT * FROM youtube_assets").fetchone()
+        assert track["status"] == "excluded"
+        assert keep_track["status"] == "wanted"
+        assert spotify["status"] == "removed"
+        assert spotify["in_playlist"] == 0
+        assert spotify["suspected_missing_at"] is None
+        assert keep_spotify["in_playlist"] == 1
+        assert youtube["status"] == "deleted"
+
+
 def test_manual_exclude_leaves_non_audio_asset_path_untouched(tmp_path):
     config = make_config(tmp_path)
     init_db(config)

@@ -18,6 +18,7 @@ class Report:
     tracks_missing_local_file: int = 0
     tracks_in_spotify: int = 0
     tracks_missing_spotify: int = 0
+    tentative_spotify_tracks: int = 0
     ambiguous_youtube: int = 0
     ambiguous_spotify: int = 0
     pending_suspicions: int = 0
@@ -42,15 +43,18 @@ def build_report(config: Config) -> Report:
             """
         ).fetchone()["count"]
         report.tracks_in_spotify = con.execute(
-            "SELECT COUNT(DISTINCT track_id) AS count FROM spotify_assets WHERE in_playlist = 1 AND status = 'added'"
+            "SELECT COUNT(DISTINCT track_id) AS count FROM spotify_assets WHERE in_playlist = 1"
         ).fetchone()["count"]
         report.tracks_missing_spotify = con.execute(
             """
             SELECT COUNT(*) AS count
               FROM tracks
              WHERE status = 'wanted'
-               AND id NOT IN (SELECT track_id FROM spotify_assets WHERE in_playlist = 1 AND status = 'added')
+               AND id NOT IN (SELECT track_id FROM spotify_assets WHERE in_playlist = 1)
             """
+        ).fetchone()["count"]
+        report.tentative_spotify_tracks = con.execute(
+            "SELECT COUNT(DISTINCT track_id) AS count FROM spotify_assets WHERE in_playlist = 1 AND status = 'review'"
         ).fetchone()["count"]
         report.ambiguous_youtube = con.execute(
             "SELECT COUNT(*) AS count FROM youtube_assets WHERE status = 'review'"
@@ -79,6 +83,7 @@ def format_report(report: Report) -> str:
             f"tracks_missing_local_file={report.tracks_missing_local_file}",
             f"tracks_in_spotify={report.tracks_in_spotify}",
             f"tracks_missing_spotify={report.tracks_missing_spotify}",
+            f"tentative_spotify_tracks={report.tentative_spotify_tracks}",
             f"ambiguous_youtube_matches={report.ambiguous_youtube}",
             f"ambiguous_spotify_matches={report.ambiguous_spotify}",
             f"pending_destructive_confirmations={report.pending_suspicions}",

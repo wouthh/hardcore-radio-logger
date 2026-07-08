@@ -101,6 +101,8 @@ python -m hcr_sync spotify scan --apply
 
 Spotify sync uses conservative matching and does not auto-add source rows or candidates that look like full mixes, DJ sets, podcasts, radio shows, compilations, full albums, trailers, interviews, or other non-track items. Those are left for review instead.
 
+When `HCR_SPOTIFY_ADD_REVIEW_MATCHES=true`, matches below `HCR_SPOTIFY_MATCH_THRESHOLD` but at or above `HCR_SPOTIFY_TENTATIVE_ADD_THRESHOLD` are added to Spotify as tentative review assets. If a tentative Spotify asset is removed later, only that Spotify candidate is marked removed; the track is not tombstoned and local audio is not moved to trash.
+
 YouTube sync normally treats any known local audio file as already local, including files that were imported without a YouTube video ID. To deliberately test or complete those files into YouTube-ID MP3 downloads, opt in explicitly:
 
 ```bash

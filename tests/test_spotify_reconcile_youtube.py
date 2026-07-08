@@ -5,7 +5,7 @@ import pytest
 from hcr_sync.config import DEFAULTS, Config
 from hcr_sync.db import connect, ensure_track, init_db, mark_excluded, set_state, transaction, upsert_spotify_asset, upsert_youtube_asset
 from hcr_sync.reconcile import manual_exclude, reconcile
-from hcr_sync.spotify_sync import PlaylistSnapshot, SpotifyTrack, _spotify_track_from_playlist_item, backfill_spotify, scan_spotify_playlist, sync_spotify
+from hcr_sync.spotify_sync import PlaylistSnapshot, SpotifyTrack, _spotify_search_queries, _spotify_track_from_playlist_item, backfill_spotify, scan_spotify_playlist, sync_spotify
 from hcr_sync.system import LegacyDownloaderActive, assert_legacy_downloader_safe
 from hcr_sync.youtube_sync import YouTubeCandidate, sync_youtube
 
@@ -32,6 +32,7 @@ class FakeSpotify:
         self.search_tracks = search_tracks or []
         self.added = []
         self.removed = []
+        self.search_calls = []
 
     def auth_check(self):
         return "fake-user"
@@ -40,6 +41,7 @@ class FakeSpotify:
         return PlaylistSnapshot(playlist_id=playlist_id, snapshot_id="snap", tracks=self.snapshot_tracks, complete=True)
 
     def search_track(self, artist, title):
+        self.search_calls.append((artist, title))
         return self.search_tracks
 
     def add_tracks(self, playlist_id, uris):
@@ -281,7 +283,7 @@ def test_spotify_sync_allows_bracketed_subtitle_when_core_title_matches(tmp_path
 
 
 def test_spotify_sync_skips_existing_review_asset_without_search(tmp_path):
-    config = make_config(tmp_path)
+    config = make_config(tmp_path, HCR_SPOTIFY_ADD_REVIEW_MATCHES="false")
     init_db(config)
     client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")])
     with connect(config) as con:
@@ -300,6 +302,102 @@ def test_spotify_sync_skips_existing_review_asset_without_search(tmp_path):
 
     assert summary.review == 1
     assert client.added == []
+
+
+def test_spotify_search_queries_try_main_artist_and_clean_title():
+    queries = _spotify_search_queries("EQUAL2 & PSYCHOWEAPON", "HARDCORE LIFESTYLE (Extended Mix)")
+
+    assert queries[0] == "artist:EQUAL2 & PSYCHOWEAPON track:HARDCORE LIFESTYLE (Extended Mix)"
+    assert "artist:EQUAL2 & PSYCHOWEAPON track:HARDCORE LIFESTYLE" in queries
+    assert "artist:EQUAL2 track:HARDCORE LIFESTYLE" in queries
+    assert "EQUAL2 HARDCORE LIFESTYLE" in queries
+
+
+def test_spotify_sync_tentatively_adds_review_match_below_confident_threshold(tmp_path):
+    config = make_config(
+        tmp_path,
+        HCR_SPOTIFY_MATCH_THRESHOLD="1.01",
+        HCR_SPOTIFY_TENTATIVE_ADD_THRESHOLD="0.90",
+    )
+    init_db(config)
+    client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")])
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Artist", title="Title", status="wanted")
+
+    summary = sync_spotify(config, apply=True, client=client)
+
+    assert summary.added == 1
+    assert summary.tentative_added == 1
+    assert client.added == ["spotify:track:1"]
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM spotify_assets").fetchone()
+        assert asset["in_playlist"] == 1
+        assert asset["status"] == "review"
+        assert asset["spotify_track_id"] == "1"
+
+
+def test_spotify_sync_does_not_readd_removed_tentative_match(tmp_path):
+    config = make_config(
+        tmp_path,
+        HCR_SPOTIFY_MATCH_THRESHOLD="1.01",
+        HCR_SPOTIFY_TENTATIVE_ADD_THRESHOLD="0.90",
+    )
+    init_db(config)
+    client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")])
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_spotify_asset(
+                con,
+                track_id=track["id"],
+                playlist_id="playlist",
+                spotify_track_uri="spotify:track:1",
+                spotify_track_id="1",
+                spotify_artist="Artist",
+                spotify_title="Title",
+                in_playlist=False,
+                match_confidence=1.0,
+                status="removed",
+            )
+
+    summary = sync_spotify(config, apply=True, client=client)
+
+    assert summary.review == 1
+    assert client.search_calls == []
+    assert client.added == []
+
+
+def test_spotify_sync_retries_old_review_once_then_keeps_terminal_review(tmp_path):
+    config = make_config(tmp_path, HCR_SPOTIFY_TENTATIVE_ADD_THRESHOLD="0.85")
+    init_db(config)
+    low_match = SpotifyTrack(uri="spotify:track:low", track_id="low", artist="Other", title="Title")
+    client = FakeSpotify(search_tracks=[low_match])
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_spotify_asset(
+                con,
+                track_id=track["id"],
+                playlist_id="playlist",
+                in_playlist=False,
+                match_confidence=None,
+                status="review",
+            )
+
+    first = sync_spotify(config, apply=True, client=client)
+    second = sync_spotify(config, apply=True, client=client)
+
+    assert first.review == 1
+    assert second.review == 1
+    assert client.added == []
+    assert len(client.search_calls) == 1
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM spotify_assets").fetchone()
+        assert asset["status"] == "review"
+        assert asset["in_playlist"] == 0
+        assert asset["match_confidence"] == 0.55
+        assert asset["spotify_track_id"] == "low"
 
 
 def test_spotify_sync_respects_per_run_limit(tmp_path):
@@ -725,6 +823,75 @@ def test_reconcile_two_pass_spotify_remove_then_cascade_clears_suspicion(tmp_pat
         assert spotify["suspected_missing_at"] is None
         assert keep_spotify["in_playlist"] == 1
         assert youtube["status"] == "deleted"
+
+
+def test_reconcile_tentative_spotify_remove_does_not_exclude_or_trash_local(tmp_path):
+    config = make_config(
+        tmp_path,
+        HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO="0.40",
+        HCR_SPOTIFY_MATCH_THRESHOLD="1.01",
+    )
+    init_db(config)
+    config.music_dir.mkdir()
+    path = config.music_dir / "Artist - Title.mp3"
+    path.write_bytes(b"x")
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            keep_track = ensure_track(con, artist="Keep", title="Song", status="wanted")
+            upsert_youtube_asset(con, track_id=track["id"], file_path=str(path), file_exists=True, match_confidence=1.0, status="downloaded")
+            upsert_spotify_asset(
+                con,
+                track_id=track["id"],
+                playlist_id="playlist",
+                spotify_track_uri="spotify:track:tentative",
+                spotify_track_id="tentative",
+                spotify_artist="Artist",
+                spotify_title="Title",
+                in_playlist=True,
+                match_confidence=1.0,
+                status="review",
+                added_at="2026-01-01T00:00:00Z",
+            )
+            upsert_spotify_asset(
+                con,
+                track_id=keep_track["id"],
+                playlist_id="playlist",
+                spotify_track_uri="spotify:track:keep",
+                spotify_track_id="keep",
+                spotify_artist="Keep",
+                spotify_title="Song",
+                in_playlist=True,
+                match_confidence=1.0,
+                status="added",
+                added_at="2026-01-01T00:00:00Z",
+            )
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "1")
+            set_state(con, "spotify_baseline_complete", "true")
+            set_state(con, "last_spotify_playlist_count", "2")
+            set_state(con, "last_spotify_scan_at", "2026-01-01T01:00:00Z")
+
+    snapshot = [SpotifyTrack(uri="spotify:track:keep", track_id="keep", artist="Keep", title="Song")]
+    first = reconcile(config, apply=True, spotify_client=FakeSpotify(snapshot_tracks=snapshot))
+    second = reconcile(config, apply=True, spotify_client=FakeSpotify(snapshot_tracks=snapshot))
+
+    assert first.suspected_spotify == 1
+    assert second.tentative_spotify_removed == 1
+    assert second.excluded_spotify == 0
+    assert second.local_trashed == 0
+    assert path.exists()
+    with connect(config) as con:
+        track = con.execute("SELECT * FROM tracks WHERE display_artist = 'Artist'").fetchone()
+        spotify = con.execute("SELECT * FROM spotify_assets WHERE spotify_track_id = 'tentative'").fetchone()
+        youtube = con.execute("SELECT * FROM youtube_assets").fetchone()
+        assert track["status"] == "wanted"
+        assert spotify["status"] == "removed"
+        assert spotify["in_playlist"] == 0
+        assert spotify["suspected_missing_at"] is None
+        assert youtube["status"] == "downloaded"
+        assert youtube["file_exists"] == 1
+        assert con.execute("SELECT COUNT(*) AS count FROM exclusions").fetchone()["count"] == 0
 
 
 def test_manual_exclude_leaves_non_audio_asset_path_untouched(tmp_path):

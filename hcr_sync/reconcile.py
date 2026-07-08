@@ -18,7 +18,13 @@ from .db import (
     upsert_youtube_asset,
 )
 from .local_files import AUDIO_EXTENSIONS, audio_paths
-from .spotify_sync import SpotifyClientProtocol, SpotipyClient, spotify_enabled
+from .spotify_sync import (
+    SpotifyClientProtocol,
+    SpotipyClient,
+    _is_rate_limited,
+    _remember_spotify_rate_limit,
+    spotify_enabled,
+)
 
 
 @dataclass
@@ -135,8 +141,18 @@ def _cascade_local(con, config: Config, track_id: int, summary: ReconcileSummary
     )
     for row in rows:
         old_path = Path(row["file_path"])
+        existed_before = old_path.exists()
+        is_audio_path = old_path.suffix.casefold() in AUDIO_EXTENSIONS
         moved_to = _trash_file(config, old_path)
-        touched_file = moved_to is not None or (old_path.suffix.casefold() in AUDIO_EXTENSIONS and not old_path.exists())
+        touched_file = moved_to is not None or (existed_before and is_audio_path and not old_path.exists())
+        if moved_to:
+            event_type = "local_file_moved_to_trash"
+        elif touched_file:
+            event_type = "local_file_deleted"
+        elif not existed_before:
+            event_type = "local_file_missing_during_cascade"
+        else:
+            event_type = "local_file_left_unmanaged"
         con.execute(
             """
             UPDATE youtube_assets
@@ -148,7 +164,7 @@ def _cascade_local(con, config: Config, track_id: int, summary: ReconcileSummary
         add_event(
             con,
             track_id,
-            "local_file_moved_to_trash" if moved_to else ("local_file_deleted" if touched_file else "local_file_left_unmanaged"),
+            event_type,
             "reconcile",
             {
                 "old_path": row["file_path"],
@@ -297,6 +313,20 @@ def reconcile(
         else:
             for asset in known_local:
                 if asset["file_path"] in current_paths:
+                    if apply and asset["suspected_missing_at"]:
+                        with transaction(con):
+                            con.execute(
+                                "UPDATE youtube_assets SET suspected_missing_at = NULL, updated_at = ? WHERE id = ?",
+                                (now_utc(), asset["id"]),
+                            )
+                            add_event(
+                                con,
+                                asset["track_id"],
+                                "local_delete_suspicion_cleared",
+                                "reconcile",
+                                {"file_path": asset["file_path"]},
+                                dedupe_key=f"local_delete_suspicion_cleared:{asset['track_id']}:{asset['id']}",
+                            )
                     continue
                 summary.planned.append(PlannedAction(asset["track_id"], "local_deleted", asset["file_path"]))
                 if not apply:
@@ -349,6 +379,8 @@ def reconcile(
                     with transaction(con):
                         _cascade_excluded_spotify(con, config, summary, spotify_client)
             except Exception as exc:
+                if apply and _is_rate_limited(exc):
+                    _remember_spotify_rate_limit(con, config, exc)
                 summary.refused.append(f"spotify: playlist fetch failed: {exc}")
         if playlist_id:
             current_ids = {track.track_id for track in snapshot.tracks if track.track_id} if snapshot is not None else set()

@@ -83,6 +83,10 @@ def _spotify_guard(config: Config, con, snapshot, *, force_mass_delete: bool) ->
         "SELECT COUNT(*) AS count FROM spotify_assets WHERE playlist_id = ? AND in_playlist = 1",
         (config.get("HCR_SPOTIFY_PLAYLIST_ID"),),
     ).fetchone()["count"]
+    if known and len(snapshot.tracks) == 0:
+        return "spotify playlist snapshot is empty while DB has known playlist assets"
+    if known and len(snapshot.tracks) < known * config.float("HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO"):
+        return "spotify playlist count is suspiciously low compared to DB playlist assets"
     if known - len(snapshot.tracks) > config.int("HCR_RECONCILE_MAX_EXCLUSIONS") and not force_mass_delete:
         return "too many spotify exclusions would be detected without --force-mass-delete"
     return ""

@@ -328,7 +328,11 @@ def reconcile(
                         mark_excluded(con, track_id=asset["track_id"], source="spotify_removed", reason="spotify playlist removal")
                         _cascade_local(con, config, asset["track_id"], summary)
                         con.execute(
-                            "UPDATE spotify_assets SET in_playlist = 0, status = 'removed', updated_at = ? WHERE id = ?",
+                            """
+                            UPDATE spotify_assets
+                               SET in_playlist = 0, status = 'removed', suspected_missing_at = NULL, updated_at = ?
+                             WHERE id = ?
+                            """,
                             (now_utc(), asset["id"]),
                         )
                         summary.excluded_spotify += 1

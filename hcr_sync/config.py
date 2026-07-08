@@ -43,6 +43,7 @@ DEFAULTS: dict[str, str] = {
     "HCR_SPOTIFY_STATUS_RETRIES": "0",
     "HCR_SPOTIFY_ADD_REVIEW_MATCHES": "true",
     "HCR_SPOTIFY_TENTATIVE_ADD_THRESHOLD": "0.85",
+    "HCR_SPOTIFY_RATE_LIMIT_FALLBACK_SECONDS": "21600",
     "HCR_YTDLP_BIN": "yt-dlp",
     "HCR_NODE_RUNTIME": "",
     "HCR_YOUTUBE_DOWNLOAD_ARCHIVE": "./youtube-download-archive.txt",

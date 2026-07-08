@@ -1,4 +1,5 @@
 from pathlib import Path
+from datetime import datetime, timezone
 
 import pytest
 
@@ -446,6 +447,32 @@ def test_spotify_sync_stops_cleanly_on_rate_limit(tmp_path):
     assert second.skipped == 1
     assert next_client.search_calls == []
     assert next_client.added == []
+
+
+def test_spotify_rate_limit_cooldown_parses_retry_text(tmp_path):
+    config = make_config(tmp_path, HCR_SPOTIFY_RATE_LIMIT_FALLBACK_SECONDS="7200")
+    init_db(config)
+
+    class TextRateLimitedSpotify(FakeSpotify):
+        def search_track(self, artist, title):
+            self.search_calls.append((artist, title))
+            exc = RuntimeError("Your application has reached a rate/request limit. Retry will occur after: 120 s")
+            exc.http_status = 429
+            exc.headers = {}
+            raise exc
+
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Artist", title="Title", status="wanted")
+
+    summary = sync_spotify(config, apply=True, client=TextRateLimitedSpotify())
+
+    assert summary.rate_limited is True
+    with connect(config) as con:
+        value = con.execute("SELECT value FROM sync_state WHERE key = 'spotify_rate_limited_until'").fetchone()["value"]
+    until = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    delta_seconds = (until - datetime.now(timezone.utc)).total_seconds()
+    assert 60 <= delta_seconds <= 180
 
 
 def test_spotify_sync_adds_even_when_youtube_is_review(tmp_path):

@@ -103,6 +103,8 @@ Spotify sync uses conservative matching and does not auto-add source rows or can
 
 When `HCR_SPOTIFY_ADD_REVIEW_MATCHES=true`, matches below `HCR_SPOTIFY_MATCH_THRESHOLD` but at or above `HCR_SPOTIFY_TENTATIVE_ADD_THRESHOLD` are added to Spotify as tentative review assets. If a tentative Spotify asset is removed later, only that Spotify candidate is marked removed; the track is not tombstoned and local audio is not moved to trash.
 
+When Spotify returns a rate limit, sync stores a cooldown in the database and skips Spotify add-sync until that time. If the API client does not expose an exact `Retry-After`, `HCR_SPOTIFY_RATE_LIMIT_FALLBACK_SECONDS` is used.
+
 YouTube sync normally treats any known local audio file as already local, including files that were imported without a YouTube video ID. To deliberately test or complete those files into YouTube-ID MP3 downloads, opt in explicitly:
 
 ```bash

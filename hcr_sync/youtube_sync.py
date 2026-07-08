@@ -11,7 +11,7 @@ from typing import Protocol
 
 from .config import Config
 from .db import add_event, connect, now_utc, transaction, upsert_youtube_asset, wanted_tracks
-from .identity import compact_text, duplicate_title_tokens, likely_same_recording, match_confidence, normalize_for_match, parse_artist_title
+from .identity import compact_text, duplicate_artist_tokens, duplicate_title_tokens, likely_same_recording, match_confidence, normalize_for_match, parse_artist_title
 from .local_files import scan_music_folder, youtube_id_from_path
 from .system import assert_legacy_downloader_safe
 
@@ -261,6 +261,14 @@ def _candidate_score(track, candidate: YouTubeCandidate) -> float:
     candidate_artist, candidate_title = parse_artist_title(candidate.title)
     if not candidate_title:
         candidate_title = candidate.title
+    source_artist_tokens = duplicate_artist_tokens(track["display_artist"])
+    if not source_artist_tokens:
+        source_title_tokens = duplicate_title_tokens(track["display_title"])
+        candidate_title_tokens = duplicate_title_tokens(candidate_title)
+        if source_title_tokens and candidate_title_tokens:
+            reverse_overlap = len(source_title_tokens & candidate_title_tokens) / max(1, len(candidate_title_tokens))
+            if reverse_overlap < 0.75:
+                return 0.0
     return match_confidence(
         artist=track["display_artist"],
         title=track["display_title"],

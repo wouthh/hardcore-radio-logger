@@ -3,7 +3,13 @@ set -euo pipefail
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 env_file="${HCR_CONFIG_FILE:-%h/.config/hcr-sync/hcr-sync.env}"
-python_bin="${PYTHON_BIN:-$(command -v python3)}"
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+  python_bin="$PYTHON_BIN"
+elif [[ -x "$project_dir/.venv/bin/python" ]]; then
+  python_bin="$project_dir/.venv/bin/python"
+else
+  python_bin="$(command -v python3)"
+fi
 systemd_user_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 mkdir -p "$systemd_user_dir"

@@ -146,6 +146,8 @@ systemctl --user list-timers hcr-sync.timer
 journalctl --user -u hcr-sync.service -f
 ```
 
+The installer uses `.venv/bin/python` automatically when it exists. Set `PYTHON_BIN=/path/to/python` before running the installer to override that.
+
 After editing the env file, restart the service or wait for the next timer run. After editing service or timer files, run:
 
 ```bash

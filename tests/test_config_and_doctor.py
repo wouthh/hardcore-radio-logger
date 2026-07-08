@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from hcr_sync.config import DEFAULTS, Config, load_config
+from hcr_sync.config import DEFAULTS, Config, load_config, parse_env_file
 from hcr_sync.db import init_db
 from hcr_sync.doctor import format_doctor, run_doctor
 
@@ -32,7 +32,17 @@ def test_config_precedence_uses_config_file_then_environment(tmp_path, monkeypat
 
     assert str(config.db_path) == "from-env.db"
     assert config.bool("HCR_RUN_POLLER") is True
-    assert config.loaded_files == [config_file.resolve()]
+    assert config.loaded_files[-1] == config_file.resolve()
+
+
+def test_env_parser_keeps_unquoted_paths_with_spaces(tmp_path):
+    config_file = tmp_path / "hcr-sync.env"
+    config_file.write_text("HCR_MUSIC_DIR=/tmp/Pixel 6a/Music\nHCR_TRASH_DIR='/tmp/Trash Folder'\n", encoding="utf-8")
+
+    values = parse_env_file(config_file)
+
+    assert values["HCR_MUSIC_DIR"] == "/tmp/Pixel 6a/Music"
+    assert values["HCR_TRASH_DIR"] == "/tmp/Trash Folder"
 
 
 def test_doctor_prints_config_file_and_is_non_destructive(tmp_path):

@@ -306,6 +306,31 @@ def _mark_youtube_review(con, track_id: int, *, reason: str, score: float | None
     )
 
 
+def _mark_youtube_error(con, track_id: int, candidate: YouTubeCandidate, *, score: float, error: Exception) -> None:
+    upsert_youtube_asset(
+        con,
+        track_id=track_id,
+        youtube_video_id=candidate.video_id,
+        youtube_url=candidate.url,
+        match_confidence=score,
+        file_exists=False,
+        status="error",
+    )
+    add_event(
+        con,
+        track_id,
+        "youtube_download_failed",
+        "youtube_sync",
+        {
+            "youtube_video_id": candidate.video_id,
+            "youtube_url": candidate.url,
+            "candidate_title": candidate.title,
+            "error": str(error)[:500],
+        },
+        dedupe_key=f"youtube_download_failed:{track_id}:{candidate.video_id or candidate.url}",
+    )
+
+
 def sync_youtube(
     config: Config,
     *,
@@ -430,7 +455,13 @@ def sync_youtube(
                 if not current or current["status"] == "excluded":
                     summary.skipped += 1
                     continue
-            output = client.download(best)
+            try:
+                output = client.download(best)
+            except Exception as exc:
+                summary.skipped += 1
+                with transaction(con):
+                    _mark_youtube_error(con, track["id"], best, score=best_score, error=exc)
+                continue
             with transaction(con):
                 current = con.execute("SELECT status FROM tracks WHERE id = ?", (track["id"],)).fetchone()
                 if not current or current["status"] == "excluded":

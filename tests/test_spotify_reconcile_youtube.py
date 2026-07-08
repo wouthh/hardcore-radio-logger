@@ -214,7 +214,47 @@ def test_spotify_scan_does_not_reactivate_excluded_track(tmp_path):
     assert summary.skipped == 1
     with connect(config) as con:
         assert con.execute("SELECT status FROM tracks").fetchone()["status"] == "excluded"
-        assert con.execute("SELECT COUNT(*) AS count FROM spotify_assets").fetchone()["count"] == 0
+        asset = con.execute("SELECT * FROM spotify_assets").fetchone()
+        assert asset["in_playlist"] == 1
+        assert asset["spotify_track_id"] == "1"
+
+
+def test_spotify_scan_records_excluded_playlist_asset_for_reconcile_removal(tmp_path):
+    config = make_config(tmp_path, HCR_SPOTIFY_ENABLED="true")
+    init_db(config)
+    config.music_dir.mkdir()
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            mark_excluded(con, track_id=track["id"], source="manual", reason="manual")
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "0")
+            set_state(con, "spotify_baseline_complete", "true")
+            set_state(con, "last_spotify_playlist_count", "1")
+
+    scan_summary = scan_spotify_playlist(
+        config,
+        apply=True,
+        client=FakeSpotify(snapshot_tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")]),
+    )
+
+    assert scan_summary.skipped == 1
+    with connect(config) as con:
+        assert con.execute("SELECT status FROM tracks").fetchone()["status"] == "excluded"
+        asset = con.execute("SELECT * FROM spotify_assets").fetchone()
+        assert asset["in_playlist"] == 1
+        assert asset["spotify_track_id"] == "1"
+
+    spotify = FakeSpotify(snapshot_tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")])
+    reconcile_summary = reconcile(config, apply=True, spotify_client=spotify)
+
+    assert reconcile_summary.refused == []
+    assert reconcile_summary.spotify_removed == 1
+    assert spotify.removed == ["spotify:track:1"]
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM spotify_assets").fetchone()
+        assert asset["in_playlist"] == 0
+        assert asset["status"] == "removed"
 
 
 def test_spotify_disabled_skips_without_client(tmp_path):
@@ -682,6 +722,40 @@ def test_reconcile_does_not_exclude_tracks_missing_never_created_assets(tmp_path
         assert con.execute("SELECT status FROM tracks").fetchone()["status"] == "wanted"
 
 
+def test_reconcile_refuses_many_local_known_missing_even_when_replacement_files_keep_count(tmp_path):
+    config = make_config(
+        tmp_path,
+        HCR_SPOTIFY_ENABLED="false",
+        HCR_RECONCILE_MAX_EXCLUSIONS="1",
+    )
+    init_db(config)
+    config.music_dir.mkdir()
+    with connect(config) as con:
+        with transaction(con):
+            for index in range(3):
+                track = ensure_track(con, artist=f"Missing {index}", title="Song", status="wanted")
+                upsert_youtube_asset(
+                    con,
+                    track_id=track["id"],
+                    file_path=str(config.music_dir / f"missing-{index}.mp3"),
+                    file_exists=True,
+                    match_confidence=1.0,
+                    status="downloaded",
+                )
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "3")
+    for index in range(3):
+        (config.music_dir / f"replacement-{index}.mp3").write_bytes(b"x")
+
+    summary = reconcile(config, apply=True)
+
+    assert "local: too many local exclusions would be detected without --force-mass-delete" in summary.refused
+    assert summary.suspected_local == 0
+    with connect(config) as con:
+        assert con.execute("SELECT COUNT(*) AS count FROM tracks WHERE status = 'excluded'").fetchone()["count"] == 0
+        assert con.execute("SELECT COUNT(*) AS count FROM youtube_assets WHERE suspected_missing_at IS NOT NULL").fetchone()["count"] == 0
+
+
 def test_reconcile_does_not_suspect_recent_self_added_spotify_asset(tmp_path):
     config = make_config(tmp_path)
     init_db(config)
@@ -783,6 +857,46 @@ def test_reconcile_refuses_spotify_snapshot_without_track_identities(tmp_path):
         assert asset["suspected_missing_at"] is None
 
 
+def test_reconcile_refuses_many_spotify_known_missing_even_when_replacements_keep_count(tmp_path):
+    config = make_config(tmp_path, HCR_RECONCILE_MAX_EXCLUSIONS="1")
+    init_db(config)
+    config.music_dir.mkdir()
+    with connect(config) as con:
+        with transaction(con):
+            for index in range(3):
+                track = ensure_track(con, artist=f"Missing {index}", title="Song", status="wanted")
+                upsert_spotify_asset(
+                    con,
+                    track_id=track["id"],
+                    playlist_id="playlist",
+                    spotify_track_uri=f"spotify:track:old-{index}",
+                    spotify_track_id=f"old-{index}",
+                    spotify_artist=f"Missing {index}",
+                    spotify_title="Song",
+                    in_playlist=True,
+                    match_confidence=1.0,
+                    status="added",
+                    added_at="2026-01-01T00:00:00Z",
+                )
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "0")
+            set_state(con, "spotify_baseline_complete", "true")
+            set_state(con, "last_spotify_playlist_count", "3")
+            set_state(con, "last_spotify_scan_at", "2026-01-01T01:00:00Z")
+
+    replacements = [
+        SpotifyTrack(uri=f"spotify:track:new-{index}", track_id=f"new-{index}", artist=f"New {index}", title="Song")
+        for index in range(3)
+    ]
+    summary = reconcile(config, apply=True, spotify_client=FakeSpotify(snapshot_tracks=replacements))
+
+    assert "spotify: too many spotify exclusions would be detected without --force-mass-delete" in summary.refused
+    assert summary.suspected_spotify == 0
+    with connect(config) as con:
+        assert con.execute("SELECT COUNT(*) AS count FROM tracks WHERE status = 'excluded'").fetchone()["count"] == 0
+        assert con.execute("SELECT COUNT(*) AS count FROM spotify_assets WHERE suspected_missing_at IS NOT NULL").fetchone()["count"] == 0
+
+
 def test_reconcile_clears_spotify_removal_suspicion_when_track_is_seen(tmp_path):
     config = make_config(tmp_path)
     init_db(config)
@@ -881,6 +995,43 @@ def test_reconcile_two_pass_local_delete_then_cascade(tmp_path):
         statuses = {row["display_artist"]: row["status"] for row in con.execute("SELECT * FROM tracks")}
     assert statuses["Gone"] == "excluded"
     assert statuses["Keep"] == "wanted"
+
+
+def test_reconcile_trashes_excluded_local_file_reintroduced_by_scan(tmp_path):
+    config = make_config(tmp_path, HCR_SPOTIFY_ENABLED="false")
+    init_db(config)
+    config.music_dir.mkdir()
+    path = config.music_dir / "Artist - Title.mp3"
+    path.write_bytes(b"x")
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            mark_excluded(con, track_id=track["id"], source="manual", reason="manual")
+            upsert_youtube_asset(
+                con,
+                track_id=track["id"],
+                file_path=str(path),
+                file_exists=True,
+                match_confidence=1.0,
+                status="downloaded",
+            )
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "1")
+
+    summary = reconcile(config, apply=True)
+
+    assert summary.local_trashed == 1
+    assert not path.exists()
+    assert any(config.trash_dir.iterdir())
+    with connect(config) as con:
+        track = con.execute("SELECT * FROM tracks").fetchone()
+        asset = con.execute("SELECT * FROM youtube_assets").fetchone()
+        event = con.execute("SELECT * FROM events WHERE event_type = 'local_file_moved_to_trash'").fetchone()
+        last_local_count = con.execute("SELECT value FROM sync_state WHERE key = 'last_local_scan_count'").fetchone()["value"]
+        assert track["status"] == "excluded"
+        assert asset["status"] == "deleted"
+        assert event is not None
+        assert last_local_count == "0"
 
 
 def test_excluded_track_keeps_pending_spotify_removal_until_client_available(tmp_path):
@@ -989,6 +1140,7 @@ def test_reconcile_two_pass_spotify_remove_then_cascade_clears_suspicion(tmp_pat
         youtube = con.execute("SELECT * FROM youtube_assets").fetchone()
         spotify_removed_payload = json.loads(con.execute("SELECT payload_json FROM events WHERE event_type = 'spotify_removed_by_user'").fetchone()["payload_json"])
         trash_payload = json.loads(con.execute("SELECT payload_json FROM events WHERE event_type = 'local_file_moved_to_trash'").fetchone()["payload_json"])
+        last_local_count = con.execute("SELECT value FROM sync_state WHERE key = 'last_local_scan_count'").fetchone()["value"]
         assert track["status"] == "excluded"
         assert keep_track["status"] == "wanted"
         assert spotify["status"] == "removed"
@@ -996,6 +1148,7 @@ def test_reconcile_two_pass_spotify_remove_then_cascade_clears_suspicion(tmp_pat
         assert spotify["suspected_missing_at"] is None
         assert keep_spotify["in_playlist"] == 1
         assert youtube["status"] == "deleted"
+        assert last_local_count == "0"
         assert spotify_removed_payload["reason"] == "confirmed Spotify playlist removal; global exclusion cascade"
         assert trash_payload["reason"] == "local cascade after exclusion"
         assert trash_payload["delete_mode"] == "trash"

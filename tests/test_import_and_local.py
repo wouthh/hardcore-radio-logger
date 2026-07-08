@@ -6,6 +6,7 @@ from hcr_sync.db import connect, init_db, mark_excluded, transaction, upsert_you
 from hcr_sync.identity import parse_artist_title
 from hcr_sync.local_files import import_local_files, inspect_audio_file
 from hcr_sync.logger_importer import import_logger
+from hcr_sync.poller import poll_radio
 
 
 def make_config(tmp_path: Path, **overrides: str) -> Config:
@@ -42,6 +43,57 @@ def test_logger_import_is_idempotent_and_creates_wanted_track(tmp_path):
         assert con.execute("SELECT value FROM sync_state WHERE key = 'last_seen_tracks_jsonl_size'").fetchone()
     assert first.observations_added == 1
     assert second.observations_added == 0
+
+
+def test_verbose_logger_import_logs_duplicate_rows(tmp_path):
+    config = make_config(tmp_path, HCR_AUDIT_VERBOSE="true")
+    init_db(config)
+    config.seen_tracks_path.write_text(
+        json.dumps({"first_seen_at": "2026-01-01T00:00:00Z", "track": "Artist - Title"}) + "\n",
+        encoding="utf-8",
+    )
+
+    import_logger(config, apply=True)
+    import_logger(config, apply=True)
+
+    with connect(config) as con:
+        rows = list(con.execute("SELECT payload_json FROM events WHERE event_type = 'logger_entry_imported' ORDER BY id"))
+
+    payloads = [json.loads(row["payload_json"]) for row in rows]
+    assert [payload["observation_added"] for payload in payloads] == [True, False]
+    assert [payload["duplicate"] for payload in payloads] == [False, True]
+
+
+def test_verbose_poll_radio_logs_new_and_duplicate_tracks(monkeypatch, tmp_path):
+    config = make_config(
+        tmp_path,
+        HCR_AUDIT_VERBOSE="true",
+        HCR_LOGGER_LOCK_FILE=str(tmp_path / ".logger.lock"),
+        HCR_STREAM_URL="https://stream.hardcoreradio.nl:9000/hcr.ogg",
+    )
+    init_db(config)
+    payload = {
+        "icestats": {
+            "source": {
+                "listenurl": "https://stream.hardcoreradio.nl:9000/hcr.ogg",
+                "server_type": "audio/ogg",
+                "artist": "Artist",
+                "title": "Title",
+            }
+        }
+    }
+    monkeypatch.setattr("hcr_sync.poller.fetch_status", lambda _status_url: payload)
+
+    first = poll_radio(config, apply=True)
+    second = poll_radio(config, apply=True)
+
+    assert first == (True, "Artist - Title")
+    assert second == (False, "Artist - Title")
+    with connect(config) as con:
+        rows = list(con.execute("SELECT payload_json FROM events WHERE event_type = 'radio_poll_seen' ORDER BY id"))
+    payloads = [json.loads(row["payload_json"]) for row in rows]
+    assert [payload["duplicate"] for payload in payloads] == [False, True]
+    assert [payload["changed"] for payload in payloads] == [True, False]
 
 
 def test_logger_import_does_not_reactivate_excluded_track(tmp_path):

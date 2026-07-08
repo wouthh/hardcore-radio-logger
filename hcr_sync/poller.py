@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Config
-from .db import now_utc
+from .db import add_event, connect, now_utc, transaction
 from .identity import compact_text, display_from_parts, fingerprint, normalize_for_match
 
 MAX_STATUS_BYTES = 1_000_000
@@ -147,6 +147,24 @@ def poll_radio(config: Config, *, apply: bool) -> tuple[bool, str]:
     with file_lock(config.logger_lock_path):
         seen = _seen_fingerprints(config.seen_tracks_path)
         if track_fingerprint in seen:
+            if config.bool("HCR_AUDIT_VERBOSE"):
+                with connect(config) as con:
+                    with transaction(con):
+                        add_event(
+                            con,
+                            None,
+                            "radio_poll_seen",
+                            "poll_radio",
+                            {
+                                "track": track,
+                                "fingerprint": track_fingerprint,
+                                "duplicate": True,
+                                "changed": False,
+                                "observed_at": observed_at,
+                                "status_url": status_url,
+                                "stream_url": stream_url,
+                            },
+                        )
             return False, track
         config.played_tracks_path.parent.mkdir(parents=True, exist_ok=True)
         config.seen_tracks_path.parent.mkdir(parents=True, exist_ok=True)
@@ -161,4 +179,22 @@ def poll_radio(config: Config, *, apply: bool) -> tuple[bool, str]:
         }
         with config.seen_tracks_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    if config.bool("HCR_AUDIT_VERBOSE"):
+        with connect(config) as con:
+            with transaction(con):
+                add_event(
+                    con,
+                    None,
+                    "radio_poll_seen",
+                    "poll_radio",
+                    {
+                        "track": track,
+                        "fingerprint": track_fingerprint,
+                        "duplicate": False,
+                        "changed": True,
+                        "observed_at": observed_at,
+                        "status_url": status_url,
+                        "stream_url": stream_url,
+                    },
+                )
     return True, track

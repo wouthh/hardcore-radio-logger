@@ -54,6 +54,7 @@ DEFAULTS: dict[str, str] = {
     "HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO": "0.60",
     "HCR_RECONCILE_REQUIRE_TWO_PASSES": "true",
     "HCR_RECONCILE_MAX_EXCLUSIONS": "25",
+    "HCR_AUDIT_VERBOSE": "false",
 }
 
 

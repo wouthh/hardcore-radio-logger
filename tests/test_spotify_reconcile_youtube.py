@@ -95,6 +95,54 @@ def test_spotify_sync_reviews_non_track_sources_without_searching(tmp_path):
         assert con.execute("SELECT status FROM spotify_assets").fetchone()["status"] == "review"
 
 
+def test_spotify_sync_rejects_generic_title_inside_longer_candidate(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:weekend", track_id="weekend", artist="Drokz", title="I am ready for the weekend")])
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Drokz", title="Weekend", status="wanted")
+
+    summary = sync_spotify(config, apply=True, client=client)
+
+    assert summary.review == 1
+    assert client.added == []
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM spotify_assets WHERE status = 'review'").fetchone()
+    assert asset is not None
+
+
+def test_spotify_sync_rejects_named_remix_when_source_is_not_remix(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:understream", track_id="understream", artist="Drokz, Execrate", title="The Understream - Execrate Remix")])
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Drokz", title="The Understream", status="wanted")
+
+    summary = sync_spotify(config, apply=True, client=client)
+
+    assert summary.review == 1
+    assert client.added == []
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM spotify_assets WHERE status = 'review'").fetchone()
+    assert asset is not None
+
+
+def test_spotify_sync_allows_bracketed_subtitle_when_core_title_matches(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:mind", track_id="mind", artist="Drokz", title="The Mind (Signs Of Life)")])
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Drokz", title="The Mind", status="wanted")
+
+    summary = sync_spotify(config, apply=True, client=client)
+
+    assert summary.added == 1
+    assert client.added == ["spotify:track:mind"]
+
+
 def test_spotify_sync_adds_even_when_youtube_is_review(tmp_path):
     config = make_config(tmp_path)
     init_db(config)

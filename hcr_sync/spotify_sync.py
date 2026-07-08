@@ -18,7 +18,7 @@ from .db import (
     upsert_spotify_asset,
     wanted_tracks,
 )
-from .identity import match_confidence
+from .identity import duplicate_title_tokens, match_confidence
 
 NON_TRACK_RE = re.compile(
     r"\b("
@@ -28,6 +28,12 @@ NON_TRACK_RE = re.compile(
     r")\b",
     re.I,
 )
+BRACKETED_TITLE_EXTRA_RE = re.compile(r"\s*[\(\[].*?[\)\]]")
+GENERIC_VERSION_SUFFIX_RE = re.compile(
+    r"\s+-\s+(?:original|extended|radio|radio edit|edit|album|single|full)(?:\s+(?:mix|version|edit))?$",
+    re.I,
+)
+REMIX_RE = re.compile(r"\bremix\b", re.I)
 
 
 @dataclass(frozen=True)
@@ -161,6 +167,32 @@ def looks_like_non_track(artist: str, title: str) -> bool:
     return bool(NON_TRACK_RE.search(f"{artist} {title}"))
 
 
+def _core_spotify_title(title: str) -> str:
+    title = BRACKETED_TITLE_EXTRA_RE.sub("", title or "")
+    return GENERIC_VERSION_SUFFIX_RE.sub("", title).strip()
+
+
+def _spotify_match_score(track, candidate: SpotifyTrack) -> float:
+    if looks_like_non_track(candidate.artist, candidate.title):
+        return 0.0
+    source_tokens = duplicate_title_tokens(track["display_title"])
+    candidate_tokens = duplicate_title_tokens(_core_spotify_title(candidate.title))
+    if not source_tokens or not candidate_tokens:
+        return 0.0
+    overlap = len(source_tokens & candidate_tokens) / max(1, len(source_tokens))
+    reverse_overlap = len(source_tokens & candidate_tokens) / max(1, len(candidate_tokens))
+    if overlap < 0.75 or reverse_overlap < 0.75:
+        return 0.0
+    if REMIX_RE.search(candidate.title) and not REMIX_RE.search(track["display_title"]):
+        return 0.0
+    return match_confidence(
+        artist=track["display_artist"],
+        title=track["display_title"],
+        candidate_artist=candidate.artist,
+        candidate_title=candidate.title,
+    )
+
+
 def backfill_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol | None = None) -> SpotifySummary:
     summary = SpotifySummary()
     if not spotify_enabled(config):
@@ -258,14 +290,7 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
             best = None
             best_score = 0.0
             for candidate in candidates:
-                if looks_like_non_track(candidate.artist, candidate.title):
-                    continue
-                score = match_confidence(
-                    artist=track["display_artist"],
-                    title=track["display_title"],
-                    candidate_artist=candidate.artist,
-                    candidate_title=candidate.title,
-                )
+                score = _spotify_match_score(track, candidate)
                 if score > best_score:
                     best = candidate
                     best_score = score

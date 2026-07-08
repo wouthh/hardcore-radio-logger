@@ -181,6 +181,15 @@ def _review_track_keys(con) -> set[int]:
     }
 
 
+def _suspected_local_delete_track_keys(con) -> set[int]:
+    return {
+        row["track_id"]
+        for row in con.execute(
+            "SELECT DISTINCT track_id FROM youtube_assets WHERE suspected_missing_at IS NOT NULL"
+        )
+    }
+
+
 def _existing_local_match(con, *, track, artist: str, title: str, require_youtube_id: bool):
     youtube_id_filter = "AND NULLIF(y.youtube_video_id, '') IS NOT NULL" if require_youtube_id else ""
     rows = con.execute(
@@ -312,10 +321,24 @@ def sync_youtube(
     client = client or YtDlpClient(config)
     with connect(config) as con:
         tracks = wanted_tracks(con)
+        suspected_local_delete_ids = _suspected_local_delete_track_keys(con)
         local_ids = _local_track_keys(config, require_youtube_id=complete_idless_local)
         review_ids = _review_track_keys(con)
         for track in tracks:
             summary.wanted += 1
+            if track["id"] in suspected_local_delete_ids:
+                summary.skipped += 1
+                if apply:
+                    with transaction(con):
+                        add_event(
+                            con,
+                            track["id"],
+                            "youtube_skipped_suspected_local_delete",
+                            "youtube_sync",
+                            {"reason": "local deletion is awaiting confirmation"},
+                            dedupe_key=f"youtube_skipped_suspected_local_delete:{track['id']}",
+                        )
+                continue
             if track["id"] in local_ids:
                 summary.already_local += 1
                 continue

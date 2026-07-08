@@ -171,6 +171,21 @@ def _cascade_spotify(con, config: Config, track_id: int, summary: ReconcileSumma
         )
     )
     uris = [row["spotify_track_uri"] for row in rows if row["spotify_track_uri"]]
+    if uris and client is None:
+        for row in rows:
+            add_event(
+                con,
+                track_id,
+                "spotify_removal_deferred_due_to_missing_client",
+                "reconcile",
+                {
+                    "playlist_id": playlist_id,
+                    "spotify_track_id": row["spotify_track_id"],
+                    "reason": "track is excluded but Spotify client was not available for removal",
+                },
+                dedupe_key=f"spotify_removal_deferred_due_to_missing_client:{track_id}:{row['id']}",
+            )
+        return
     if client and uris:
         client.remove_tracks(playlist_id, uris)
         summary.spotify_removed += len(uris)
@@ -190,6 +205,25 @@ def _cascade_spotify(con, config: Config, track_id: int, summary: ReconcileSumma
             "reconcile",
             {"playlist_id": playlist_id, "spotify_track_id": row["spotify_track_id"], "reason": "local/global exclusion cascade"},
         )
+
+
+def _cascade_excluded_spotify(con, config: Config, summary: ReconcileSummary, client: SpotifyClientProtocol | None) -> None:
+    playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID")
+    rows = list(
+        con.execute(
+            """
+            SELECT DISTINCT t.id AS track_id
+              FROM tracks t
+              JOIN spotify_assets s ON s.track_id = t.id
+             WHERE t.status = 'excluded'
+               AND s.playlist_id = ?
+               AND s.in_playlist = 1
+            """,
+            (playlist_id,),
+        )
+    )
+    for row in rows:
+        _cascade_spotify(con, config, int(row["track_id"]), summary, client)
 
 
 def _confirm_or_suspect(
@@ -287,6 +321,9 @@ def reconcile(
                 client = spotify_client or SpotipyClient(config)
                 snapshot = client.playlist_snapshot(playlist_id)
                 spotify_client = client
+                if apply:
+                    with transaction(con):
+                        _cascade_excluded_spotify(con, config, summary, spotify_client)
             except Exception as exc:
                 summary.refused.append(f"spotify: playlist fetch failed: {exc}")
         if playlist_id:

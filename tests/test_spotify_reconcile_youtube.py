@@ -530,6 +530,63 @@ def test_spotify_sync_adds_even_when_youtube_is_review(tmp_path):
     assert youtube is not None
 
 
+def test_suspected_local_delete_is_held_out_of_spotify_and_youtube_sync(tmp_path):
+    config = make_config(tmp_path, HCR_SPOTIFY_ENABLED="true")
+    init_db(config)
+    config.music_dir.mkdir()
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_youtube_asset(
+                con,
+                track_id=track["id"],
+                file_path=str(config.music_dir / "Artist - Title.mp3"),
+                file_exists=True,
+                match_confidence=1.0,
+                status="downloaded",
+            )
+            con.execute("UPDATE youtube_assets SET suspected_missing_at = ? WHERE track_id = ?", ("2026-01-01T00:00:00Z", track["id"]))
+
+    spotify = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")])
+    spotify_summary = sync_spotify(config, apply=True, client=spotify)
+
+    assert spotify_summary.skipped == 1
+    assert spotify.search_calls == []
+    assert spotify.added == []
+
+    class SearchingYouTube:
+        def __init__(self):
+            self.search_calls = []
+
+        def search(self, artist, title):
+            self.search_calls.append((artist, title))
+            return [
+                YouTubeCandidate(
+                    title="Artist - Title",
+                    url="https://www.youtube.com/watch?v=abc123xyz",
+                    video_id="abc123xyz",
+                    channel="Artist",
+                    duration=180,
+                )
+            ]
+
+        def download(self, candidate):
+            path = config.music_dir / "Artist - Title [abc123xyz].mp3"
+            path.write_bytes(b"audio")
+            return path
+
+    youtube = SearchingYouTube()
+    youtube_summary = sync_youtube(config, apply=True, client=youtube)
+
+    assert youtube_summary.skipped == 1
+    assert youtube.search_calls == []
+    with connect(config) as con:
+        spotify_event = con.execute("SELECT * FROM events WHERE event_type = 'spotify_skipped_suspected_local_delete'").fetchone()
+        youtube_event = con.execute("SELECT * FROM events WHERE event_type = 'youtube_skipped_suspected_local_delete'").fetchone()
+        assert spotify_event is not None
+        assert youtube_event is not None
+
+
 def test_youtube_sync_downloads_even_when_spotify_is_review(tmp_path):
     config = make_config(tmp_path, HCR_SPOTIFY_ENABLED="false")
     init_db(config)
@@ -824,6 +881,53 @@ def test_reconcile_two_pass_local_delete_then_cascade(tmp_path):
         statuses = {row["display_artist"]: row["status"] for row in con.execute("SELECT * FROM tracks")}
     assert statuses["Gone"] == "excluded"
     assert statuses["Keep"] == "wanted"
+
+
+def test_excluded_track_keeps_pending_spotify_removal_until_client_available(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_spotify_asset(
+                con,
+                track_id=track["id"],
+                playlist_id="playlist",
+                spotify_track_uri="spotify:track:1",
+                spotify_track_id="1",
+                spotify_artist="Artist",
+                spotify_title="Title",
+                in_playlist=True,
+                match_confidence=1.0,
+                status="added",
+            )
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "0")
+            set_state(con, "spotify_baseline_complete", "true")
+            set_state(con, "last_spotify_playlist_count", "1")
+            track_id = track["id"]
+
+    manual_exclude(config, track_id=track_id, reason="manual", apply=True, spotify_client=None)
+
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM spotify_assets").fetchone()
+        deferred = con.execute("SELECT * FROM events WHERE event_type = 'spotify_removal_deferred_due_to_missing_client'").fetchone()
+        assert asset["in_playlist"] == 1
+        assert asset["status"] == "added"
+        assert deferred is not None
+
+    spotify = FakeSpotify(snapshot_tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")])
+    summary = reconcile(config, apply=True, spotify_client=spotify)
+
+    assert summary.spotify_removed == 1
+    assert spotify.removed == ["spotify:track:1"]
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM spotify_assets").fetchone()
+        removed = con.execute("SELECT * FROM events WHERE event_type = 'removed_from_spotify_due_to_exclusion'").fetchone()
+        assert asset["in_playlist"] == 0
+        assert asset["status"] == "removed"
+        assert removed is not None
 
 
 def test_reconcile_two_pass_spotify_remove_then_cascade_clears_suspicion(tmp_path):

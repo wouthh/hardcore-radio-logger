@@ -350,6 +350,15 @@ def _is_removed_tentative_asset(asset, match_threshold: float) -> bool:
     return score is not None and float(score) < match_threshold
 
 
+def _suspected_local_delete_track_ids(con) -> set[int]:
+    return {
+        row["track_id"]
+        for row in con.execute(
+            "SELECT DISTINCT track_id FROM youtube_assets WHERE suspected_missing_at IS NOT NULL"
+        )
+    }
+
+
 def _validate_playlist_snapshot(snapshot: PlaylistSnapshot) -> None:
     if not snapshot.complete or not snapshot.snapshot_id:
         raise RuntimeError("Spotify playlist snapshot was incomplete")
@@ -476,6 +485,7 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
             summary.skipped += 1
             return summary
         tracks = wanted_tracks(con)
+        suspected_local_delete_ids = _suspected_local_delete_track_ids(con)
         existing = {
             row["track_id"]
             for row in con.execute(
@@ -510,6 +520,19 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
         sync_limit = config.int("HCR_SPOTIFY_SYNC_LIMIT")
         searched = 0
         for track in tracks:
+            if track["id"] in suspected_local_delete_ids:
+                summary.skipped += 1
+                if apply:
+                    with transaction(con):
+                        add_event(
+                            con,
+                            track["id"],
+                            "spotify_skipped_suspected_local_delete",
+                            "spotify_sync",
+                            {"reason": "local deletion is awaiting confirmation"},
+                            dedupe_key=f"spotify_skipped_suspected_local_delete:{track['id']}",
+                        )
+                continue
             if track["id"] in existing:
                 summary.skipped += 1
                 continue

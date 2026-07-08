@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
 from .config import Config
@@ -272,6 +273,39 @@ def _is_rate_limited(exc: Exception) -> bool:
     return status == 429 or "Retry-After" in headers
 
 
+def _parse_utc(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _format_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _retry_after_until(exc: Exception) -> str:
+    headers = getattr(exc, "headers", {}) or {}
+    retry_after = headers.get("Retry-After") or headers.get("retry-after") or ""
+    try:
+        seconds = max(1, int(float(retry_after)))
+    except (TypeError, ValueError):
+        seconds = 900
+    return _format_utc(datetime.now(timezone.utc) + timedelta(seconds=seconds))
+
+
+def _spotify_cooldown_active(con) -> bool:
+    until = _parse_utc(get_state(con, "spotify_rate_limited_until", ""))
+    return bool(until and until > datetime.now(timezone.utc))
+
+
+def _remember_spotify_rate_limit(con, exc: Exception) -> None:
+    with transaction(con):
+        set_state(con, "spotify_rate_limited_until", _retry_after_until(exc))
+
+
 def _is_terminal_review_asset(asset, tentative_threshold: float) -> bool:
     score = asset["match_confidence"]
     return score is not None and float(score) < tentative_threshold
@@ -401,6 +435,10 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
         return summary
     client = client or SpotipyClient(config)
     with connect(config) as con:
+        if _spotify_cooldown_active(con):
+            summary.rate_limited = True
+            summary.skipped += 1
+            return summary
         tracks = wanted_tracks(con)
         existing = {
             row["track_id"]
@@ -475,6 +513,7 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                 candidates = client.search_track(track["display_artist"], track["display_title"])
             except Exception as exc:
                 if _is_rate_limited(exc):
+                    _remember_spotify_rate_limit(con, exc)
                     summary.rate_limited = True
                     summary.skipped += 1
                     break
@@ -527,6 +566,7 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                 client.add_tracks(playlist_id, [best.uri])
             except Exception as exc:
                 if _is_rate_limited(exc):
+                    _remember_spotify_rate_limit(con, exc)
                     summary.rate_limited = True
                     summary.skipped += 1
                     break

@@ -422,6 +422,7 @@ def test_spotify_sync_stops_cleanly_on_rate_limit(tmp_path):
 
     class RateLimitedSpotify(FakeSpotify):
         def search_track(self, artist, title):
+            self.search_calls.append((artist, title))
             exc = RuntimeError("rate limited")
             exc.http_status = 429
             exc.headers = {"Retry-After": "3600"}
@@ -435,6 +436,16 @@ def test_spotify_sync_stops_cleanly_on_rate_limit(tmp_path):
 
     assert summary.rate_limited is True
     assert summary.skipped == 1
+    with connect(config) as con:
+        assert con.execute("SELECT value FROM sync_state WHERE key = 'spotify_rate_limited_until'").fetchone() is not None
+
+    next_client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")])
+    second = sync_spotify(config, apply=True, client=next_client)
+
+    assert second.rate_limited is True
+    assert second.skipped == 1
+    assert next_client.search_calls == []
+    assert next_client.added == []
 
 
 def test_spotify_sync_adds_even_when_youtube_is_review(tmp_path):

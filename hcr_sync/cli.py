@@ -34,6 +34,10 @@ def print_kv(prefix: str, obj) -> None:
     print(f"{prefix} {rendered}".strip())
 
 
+def fatal_reconcile_refusals(refusals: list[str]) -> list[str]:
+    return [refusal for refusal in refusals if not refusal.startswith("spotify:")]
+
+
 def cmd_db(args: argparse.Namespace, config: Config) -> int:
     if args.db_command == "init":
         init_db(config)
@@ -173,7 +177,7 @@ def cmd_run_once(args: argparse.Namespace, config: Config) -> int:
         sp_summary = sync_spotify(config, apply=apply)
         print_kv("spotify_sync", sp_summary)
         print(format_report(build_report(config)))
-    return 1 if apply and rec_summary.refused else 0
+    return 1 if apply and fatal_reconcile_refusals(rec_summary.refused) else 0
 
 
 def build_parser() -> argparse.ArgumentParser:

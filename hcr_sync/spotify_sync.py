@@ -359,6 +359,20 @@ def _suspected_local_delete_track_ids(con) -> set[int]:
     }
 
 
+def _spotify_candidate_conflict_track_ids(con) -> set[int]:
+    return {
+        row["track_id"]
+        for row in con.execute(
+            """
+            SELECT DISTINCT track_id
+              FROM events
+             WHERE event_type = 'spotify_candidate_already_linked'
+               AND track_id IS NOT NULL
+            """
+        )
+    }
+
+
 def _spotify_candidate_used_by_other_track(con, *, playlist_id: str, track_id: int, spotify_track_id: str):
     if not spotify_track_id:
         return None
@@ -393,7 +407,7 @@ def _mark_spotify_candidate_conflict(
         spotify_artist=candidate.artist,
         spotify_title=candidate.title,
         in_playlist=False,
-        match_confidence=score,
+        match_confidence=0.0,
         status="review",
     )
     add_event(
@@ -558,6 +572,7 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
             return summary
         tracks = wanted_tracks(con)
         suspected_local_delete_ids = _suspected_local_delete_track_ids(con)
+        candidate_conflict_ids = _spotify_candidate_conflict_track_ids(con)
         existing = {
             row["track_id"]
             for row in con.execute(
@@ -609,6 +624,9 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                 summary.skipped += 1
                 continue
             if track["id"] in removed_tentative_ids:
+                summary.review += 1
+                continue
+            if track["id"] in candidate_conflict_ids:
                 summary.review += 1
                 continue
             review_asset = review_assets.get(track["id"])

@@ -583,6 +583,7 @@ def test_spotify_sync_reviews_candidate_track_id_linked_to_other_track_without_a
     summary = sync_spotify(config, apply=True, client=client)
 
     assert summary.review == 1
+    assert client.search_calls == [("Artist", "Title")]
     assert client.added == []
     with connect(config) as con:
         rows = list(con.execute("SELECT * FROM spotify_assets ORDER BY track_id"))
@@ -592,7 +593,15 @@ def test_spotify_sync_reviews_candidate_track_id_linked_to_other_track_without_a
         assert rows[0]["in_playlist"] == 1
         assert rows[1]["status"] == "review"
         assert rows[1]["spotify_track_id"] is None
+        assert rows[1]["match_confidence"] == 0.0
         assert event is not None
+
+    next_client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:same", track_id="same", artist="Artist", title="Title")])
+    next_summary = sync_spotify(config, apply=True, client=next_client)
+
+    assert next_summary.review == 1
+    assert next_client.search_calls == []
+    assert next_client.added == []
 
 
 def test_spotify_rate_limit_cooldown_parses_retry_text(tmp_path):

@@ -3,9 +3,9 @@ from pathlib import Path
 import pytest
 
 from hcr_sync.config import DEFAULTS, Config
-from hcr_sync.db import connect, ensure_track, init_db, set_state, transaction, upsert_spotify_asset, upsert_youtube_asset
+from hcr_sync.db import connect, ensure_track, init_db, mark_excluded, set_state, transaction, upsert_spotify_asset, upsert_youtube_asset
 from hcr_sync.reconcile import manual_exclude, reconcile
-from hcr_sync.spotify_sync import PlaylistSnapshot, SpotifyTrack, _spotify_track_from_playlist_item, backfill_spotify, sync_spotify
+from hcr_sync.spotify_sync import PlaylistSnapshot, SpotifyTrack, _spotify_track_from_playlist_item, backfill_spotify, scan_spotify_playlist, sync_spotify
 from hcr_sync.system import LegacyDownloaderActive, assert_legacy_downloader_safe
 from hcr_sync.youtube_sync import YouTubeCandidate, sync_youtube
 
@@ -92,6 +92,76 @@ def test_spotify_backfill_and_sync_with_fake_client(tmp_path):
 
     assert sync_summary.added == 1
     assert sync_client.added == ["spotify:track:2"]
+
+
+def test_spotify_scan_imports_playlist_addition_for_youtube_sync(tmp_path):
+    config = make_config(tmp_path, HCR_SPOTIFY_ENABLED="true")
+    init_db(config)
+    config.music_dir.mkdir()
+    spotify = FakeSpotify(
+        snapshot_tracks=[
+            SpotifyTrack(
+                uri="spotify:track:spotify-new",
+                track_id="spotify-new",
+                artist="Artist",
+                title="Title",
+            )
+        ]
+    )
+
+    scan_summary = scan_spotify_playlist(config, apply=True, client=spotify)
+
+    assert scan_summary.seen == 1
+    assert scan_summary.linked == 1
+    with connect(config) as con:
+        track = con.execute("SELECT * FROM tracks").fetchone()
+        asset = con.execute("SELECT * FROM spotify_assets").fetchone()
+        assert track["status"] == "wanted"
+        assert asset["in_playlist"] == 1
+
+    class DownloadingYouTube:
+        def search(self, artist, title):
+            return [
+                YouTubeCandidate(
+                    title="Artist - Title",
+                    url="https://www.youtube.com/watch?v=ytnew123",
+                    video_id="ytnew123",
+                    channel="Artist",
+                    duration=180,
+                )
+            ]
+
+        def download(self, candidate):
+            path = config.music_dir / "Artist - Title [ytnew123].mp3"
+            path.write_bytes(b"audio")
+            return path
+
+    youtube_summary = sync_youtube(config, apply=True, client=DownloadingYouTube())
+
+    assert youtube_summary.downloaded == 1
+    with connect(config) as con:
+        youtube = con.execute("SELECT * FROM youtube_assets WHERE youtube_video_id = 'ytnew123'").fetchone()
+        assert youtube is not None
+
+
+def test_spotify_scan_does_not_reactivate_excluded_track(tmp_path):
+    config = make_config(tmp_path, HCR_SPOTIFY_ENABLED="true")
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            mark_excluded(con, track_id=track["id"], source="manual", reason="manual")
+
+    summary = scan_spotify_playlist(
+        config,
+        apply=True,
+        client=FakeSpotify(snapshot_tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")]),
+    )
+
+    assert summary.skipped == 1
+    with connect(config) as con:
+        assert con.execute("SELECT status FROM tracks").fetchone()["status"] == "excluded"
+        assert con.execute("SELECT COUNT(*) AS count FROM spotify_assets").fetchone()["count"] == 0
 
 
 def test_spotify_disabled_skips_without_client(tmp_path):

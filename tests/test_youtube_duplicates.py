@@ -165,3 +165,59 @@ def test_youtube_sync_skips_existing_review_asset_without_search(tmp_path):
     assert summary.review == 1
     assert client.searches == []
     assert client.downloads == []
+
+
+def test_youtube_sync_downloads_when_only_local_audio_has_no_video_id(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    local_audio = config.music_dir / "EQUAL2 & PSYCHOWEAPON - HARDCORE LIFESTYLE.m4a"
+    local_audio.write_bytes(b"existing audio")
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="EQUAL2 & PSYCHOWEAPON", title="HARDCORE LIFESTYLE", status="wanted")
+            upsert_youtube_asset(
+                con,
+                track_id=track["id"],
+                file_path=str(local_audio),
+                file_exists=True,
+                match_confidence=1.0,
+                status="downloaded",
+            )
+
+    class CompletingYouTube:
+        def __init__(self):
+            self.searches = []
+            self.downloads = []
+
+        def search(self, artist, title):
+            self.searches.append((artist, title))
+            return [
+                YouTubeCandidate(
+                    title="EQUAL2 & PSYCHOWEAPON - HARDCORE LIFESTYLE",
+                    url="https://www.youtube.com/watch?v=hardcore123",
+                    video_id="hardcore123",
+                    channel="EQUAL2",
+                    duration=180,
+                )
+            ]
+
+        def download(self, candidate):
+            self.downloads.append(candidate)
+            path = config.music_dir / "EQUAL2 & PSYCHOWEAPON - HARDCORE LIFESTYLE [hardcore123].mp3"
+            path.write_bytes(b"mp3")
+            return path
+
+    client = CompletingYouTube()
+    summary = sync_youtube(config, apply=True, client=client)
+
+    assert summary.downloaded == 1
+    assert summary.already_local == 0
+    assert client.searches == [("EQUAL2 & PSYCHOWEAPON", "HARDCORE LIFESTYLE")]
+    assert len(client.downloads) == 1
+    assert local_audio.exists()
+    with connect(config) as con:
+        assets = list(con.execute("SELECT * FROM youtube_assets ORDER BY id"))
+        assert len(assets) == 2
+        assert assets[0]["youtube_video_id"] is None
+        assert assets[1]["youtube_video_id"] == "hardcore123"

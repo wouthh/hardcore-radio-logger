@@ -214,18 +214,22 @@ def _is_rate_limited(exc: Exception) -> bool:
     return status == 429 or "Retry-After" in headers
 
 
-def backfill_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol | None = None) -> SpotifySummary:
-    summary = SpotifySummary()
-    if not spotify_enabled(config):
-        summary.skipped += 1
-        return summary
-    playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID")
-    if not playlist_id:
-        raise RuntimeError("HCR_SPOTIFY_PLAYLIST_ID is required")
-    client = client or SpotipyClient(config)
-    snapshot = client.playlist_snapshot(playlist_id)
+def _validate_playlist_snapshot(snapshot: PlaylistSnapshot) -> None:
     if not snapshot.complete or not snapshot.snapshot_id:
         raise RuntimeError("Spotify playlist snapshot was incomplete")
+    if snapshot.tracks and not any(track.track_id for track in snapshot.tracks):
+        raise RuntimeError("Spotify playlist snapshot had no usable track identities")
+
+
+def _import_playlist_snapshot(
+    config: Config,
+    snapshot: PlaylistSnapshot,
+    *,
+    apply: bool,
+    event_source: str,
+    establish_baseline: bool,
+) -> SpotifySummary:
+    summary = SpotifySummary()
     summary.seen = len(snapshot.tracks)
     if not apply:
         summary.linked = len(snapshot.tracks)
@@ -234,10 +238,21 @@ def backfill_spotify(config: Config, *, apply: bool, client: SpotifyClientProtoc
         with transaction(con):
             for item in snapshot.tracks:
                 track = ensure_track(con, artist=item.artist, title=item.title, status="wanted")
+                if track["status"] == "excluded":
+                    add_event(
+                        con,
+                        track["id"],
+                        "skipped_excluded_track",
+                        event_source,
+                        {"spotify_track_id": item.track_id, "playlist_id": snapshot.playlist_id},
+                        dedupe_key=f"spotify_scan_skipped_excluded:{snapshot.playlist_id}:{item.track_id}",
+                    )
+                    summary.skipped += 1
+                    continue
                 upsert_spotify_asset(
                     con,
                     track_id=track["id"],
-                    playlist_id=playlist_id,
+                    playlist_id=snapshot.playlist_id,
                     spotify_track_uri=item.uri,
                     spotify_track_id=item.track_id,
                     spotify_artist=item.artist,
@@ -251,16 +266,53 @@ def backfill_spotify(config: Config, *, apply: bool, client: SpotifyClientProtoc
                     con,
                     track["id"],
                     "spotify_playlist_seen",
-                    "spotify_backfill",
-                    {"spotify_track_id": item.track_id, "playlist_id": playlist_id},
-                    dedupe_key=f"spotify_playlist_seen:{playlist_id}:{item.track_id}",
+                    event_source,
+                    {"spotify_track_id": item.track_id, "playlist_id": snapshot.playlist_id},
+                    dedupe_key=f"spotify_playlist_seen:{snapshot.playlist_id}:{item.track_id}",
                 )
                 summary.linked += 1
-            set_state(con, "spotify_baseline_complete", "true")
-            set_state(con, "last_spotify_snapshot_id", snapshot.snapshot_id)
-            set_state(con, "last_spotify_playlist_count", str(len(snapshot.tracks)))
-            set_state(con, "last_spotify_scan_at", now_utc())
+            if establish_baseline:
+                set_state(con, "spotify_baseline_complete", "true")
+                set_state(con, "last_spotify_snapshot_id", snapshot.snapshot_id)
+                set_state(con, "last_spotify_playlist_count", str(len(snapshot.tracks)))
+                set_state(con, "last_spotify_scan_at", now_utc())
     return summary
+
+
+def backfill_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol | None = None) -> SpotifySummary:
+    summary = SpotifySummary()
+    if not spotify_enabled(config):
+        summary.skipped += 1
+        return summary
+    playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID")
+    if not playlist_id:
+        raise RuntimeError("HCR_SPOTIFY_PLAYLIST_ID is required")
+    client = client or SpotipyClient(config)
+    snapshot = client.playlist_snapshot(playlist_id)
+    _validate_playlist_snapshot(snapshot)
+    return _import_playlist_snapshot(config, snapshot, apply=apply, event_source="spotify_backfill", establish_baseline=True)
+
+
+def scan_spotify_playlist(config: Config, *, apply: bool, client: SpotifyClientProtocol | None = None) -> SpotifySummary:
+    summary = SpotifySummary()
+    if not spotify_enabled(config):
+        summary.skipped += 1
+        return summary
+    playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID")
+    if not playlist_id:
+        summary.skipped += 1
+        return summary
+    client = client or SpotipyClient(config)
+    try:
+        snapshot = client.playlist_snapshot(playlist_id)
+        _validate_playlist_snapshot(snapshot)
+    except Exception as exc:
+        if _is_rate_limited(exc):
+            summary.rate_limited = True
+            summary.skipped += 1
+            return summary
+        raise
+    return _import_playlist_snapshot(config, snapshot, apply=apply, event_source="spotify_scan", establish_baseline=False)
 
 
 def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol | None = None) -> SpotifySummary:

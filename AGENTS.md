@@ -16,6 +16,7 @@ This project is a SQLite-backed sync system for Hardcore Radio observations, a l
 - systemd files committed to the repo are templates, not rendered local units.
 - systemd should run `python -m hcr_sync run-once --apply`.
 - If `HCR_RUN_POLLER=true`, `run-once` polls Hardcore Radio before import.
+- `run-once` should scan current Spotify playlist entries before reconciliation and YouTube sync so Spotify-added tracks become wanted YouTube download candidates.
 - If `HCR_RUN_POLLER=false`, an external logger producer must continue writing the configured logger files.
 - A legacy downloader must not run at the same time as `youtube sync --apply` or `run-once --apply` unless explicitly allowed.
 

@@ -78,7 +78,10 @@ class SpotipyClient:
                 scope=config.spotify_scopes,
                 cache_path=str(config.path("HCR_SPOTIFY_TOKEN_CACHE")),
                 open_browser=True,
-            )
+            ),
+            requests_timeout=config.int("HCR_SPOTIFY_REQUEST_TIMEOUT"),
+            retries=config.int("HCR_SPOTIFY_REQUEST_RETRIES"),
+            status_retries=config.int("HCR_SPOTIFY_STATUS_RETRIES"),
         )
 
     def auth_check(self) -> str:
@@ -152,6 +155,7 @@ class SpotifySummary:
     added: int = 0
     review: int = 0
     skipped: int = 0
+    rate_limited: bool = False
 
 
 def spotify_auth(config: Config, client: SpotifyClientProtocol | None = None) -> str:
@@ -191,6 +195,12 @@ def _spotify_match_score(track, candidate: SpotifyTrack) -> float:
         candidate_artist=candidate.artist,
         candidate_title=candidate.title,
     )
+
+
+def _is_rate_limited(exc: Exception) -> bool:
+    status = getattr(exc, "http_status", None)
+    headers = getattr(exc, "headers", {}) or {}
+    return status == 429 or "Retry-After" in headers
 
 
 def backfill_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol | None = None) -> SpotifySummary:
@@ -261,9 +271,21 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                 (playlist_id,),
             )
         }
+        review_ids = {
+            row["track_id"]
+            for row in con.execute(
+                "SELECT track_id FROM spotify_assets WHERE playlist_id = ? AND status = 'review' AND in_playlist = 0",
+                (playlist_id,),
+            )
+        }
+        sync_limit = config.int("HCR_SPOTIFY_SYNC_LIMIT")
+        searched = 0
         for track in tracks:
             if track["id"] in existing:
                 summary.skipped += 1
+                continue
+            if track["id"] in review_ids:
+                summary.review += 1
                 continue
             if looks_like_non_track(track["display_artist"], track["display_title"]):
                 summary.review += 1
@@ -286,7 +308,18 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                             dedupe_key=f"spotify_non_track_source:{track['id']}",
                         )
                 continue
-            candidates = client.search_track(track["display_artist"], track["display_title"])
+            if sync_limit > 0 and searched >= sync_limit:
+                summary.skipped += 1
+                continue
+            searched += 1
+            try:
+                candidates = client.search_track(track["display_artist"], track["display_title"])
+            except Exception as exc:
+                if _is_rate_limited(exc):
+                    summary.rate_limited = True
+                    summary.skipped += 1
+                    break
+                raise
             best = None
             best_score = 0.0
             for candidate in candidates:
@@ -317,7 +350,14 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                 if not current or current["status"] == "excluded":
                     summary.skipped += 1
                     continue
-            client.add_tracks(playlist_id, [best.uri])
+            try:
+                client.add_tracks(playlist_id, [best.uri])
+            except Exception as exc:
+                if _is_rate_limited(exc):
+                    summary.rate_limited = True
+                    summary.skipped += 1
+                    break
+                raise
             with transaction(con):
                 current = con.execute("SELECT status FROM tracks WHERE id = ?", (track["id"],)).fetchone()
                 if not current or current["status"] == "excluded":

@@ -248,3 +248,40 @@ def test_youtube_sync_downloads_when_idless_local_completion_is_enabled(tmp_path
         assert len(assets) == 2
         assert assets[0]["youtube_video_id"] is None
         assert assets[1]["youtube_video_id"] == "hardcore123"
+
+
+def test_youtube_sync_rejects_blank_artist_title_embedded_in_longer_candidate(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="", title="GET HYPE", status="wanted")
+
+    class EmbeddedTitleYouTube:
+        def __init__(self):
+            self.downloads = []
+
+        def search(self, artist, title):
+            return [
+                YouTubeCandidate(
+                    title="Martin Ikin - Headnoise (Get Hype)",
+                    url="https://www.youtube.com/watch?v=hVgNH8A9kso",
+                    video_id="hVgNH8A9kso",
+                    channel="PROFOUND",
+                    duration=344,
+                )
+            ]
+
+        def download(self, candidate):
+            self.downloads.append(candidate)
+            return config.music_dir / "bad.mp3"
+
+    client = EmbeddedTitleYouTube()
+    summary = sync_youtube(config, apply=True, client=client)
+
+    assert summary.review == 1
+    assert client.downloads == []
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM youtube_assets WHERE status = 'review'").fetchone()
+        assert asset is not None
+        assert asset["match_confidence"] is None

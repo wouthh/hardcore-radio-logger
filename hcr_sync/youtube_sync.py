@@ -11,7 +11,7 @@ from typing import Protocol
 
 from .config import Config
 from .db import add_event, connect, now_utc, transaction, upsert_youtube_asset, wanted_tracks
-from .identity import compact_text, match_confidence, parse_artist_title
+from .identity import compact_text, likely_same_recording, match_confidence, parse_artist_title
 from .local_files import scan_music_folder, youtube_id_from_path
 from .system import assert_legacy_downloader_safe
 
@@ -150,6 +150,36 @@ def _local_track_keys(config: Config) -> set[int]:
         }
 
 
+def _existing_local_match(con, *, track, artist: str, title: str):
+    rows = con.execute(
+        """
+        SELECT
+            y.id AS asset_id,
+            y.file_path,
+            y.youtube_video_id,
+            t.id AS track_id,
+            t.display_artist,
+            t.display_title
+          FROM youtube_assets y
+          JOIN tracks t ON t.id = y.track_id
+         WHERE y.file_exists = 1
+           AND y.status = 'downloaded'
+           AND y.file_path IS NOT NULL
+           AND t.id != ?
+        """,
+        (track["id"],),
+    ).fetchall()
+    for row in rows:
+        if likely_same_recording(
+            artist=artist,
+            title=title,
+            other_artist=row["display_artist"],
+            other_title=row["display_title"],
+        ):
+            return row
+    return None
+
+
 def _candidate_score(track, candidate: YouTubeCandidate) -> float:
     if candidate.is_live or candidate.duration is None:
         return 0.0
@@ -181,6 +211,29 @@ def sync_youtube(config: Config, *, apply: bool, client: YouTubeClientProtocol |
             if track["id"] in local_ids:
                 summary.already_local += 1
                 continue
+            existing_match = _existing_local_match(
+                con,
+                track=track,
+                artist=track["display_artist"],
+                title=track["display_title"],
+            )
+            if existing_match:
+                summary.already_local += 1
+                if apply:
+                    with transaction(con):
+                        add_event(
+                            con,
+                            track["id"],
+                            "youtube_skipped_existing_local_match",
+                            "youtube_sync",
+                            {
+                                "matched_track_id": existing_match["track_id"],
+                                "matched_asset_id": existing_match["asset_id"],
+                                "matched_file_path": existing_match["file_path"],
+                            },
+                            dedupe_key=f"youtube_skipped_existing_local_match:{track['id']}:{existing_match['asset_id']}",
+                        )
+                continue
             candidates = client.search(track["display_artist"], track["display_title"])
             best = None
             best_score = 0.0
@@ -205,6 +258,31 @@ def sync_youtube(config: Config, *, apply: bool, client: YouTubeClientProtocol |
                 continue
             if not apply:
                 summary.downloaded += 1
+                continue
+            candidate_artist, candidate_title = parse_artist_title(best.title)
+            candidate_existing_match = _existing_local_match(
+                con,
+                track=track,
+                artist=candidate_artist or track["display_artist"],
+                title=candidate_title or best.title,
+            )
+            if candidate_existing_match:
+                summary.already_local += 1
+                with transaction(con):
+                    add_event(
+                        con,
+                        track["id"],
+                        "youtube_skipped_existing_local_match",
+                        "youtube_sync",
+                        {
+                            "candidate_title": best.title,
+                            "candidate_url": best.url,
+                            "matched_track_id": candidate_existing_match["track_id"],
+                            "matched_asset_id": candidate_existing_match["asset_id"],
+                            "matched_file_path": candidate_existing_match["file_path"],
+                        },
+                        dedupe_key=f"youtube_skipped_candidate_existing_local_match:{track['id']}:{candidate_existing_match['asset_id']}:{best.video_id}",
+                    )
                 continue
             with transaction(con):
                 current = con.execute("SELECT status FROM tracks WHERE id = ?", (track["id"],)).fetchone()

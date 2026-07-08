@@ -12,6 +12,25 @@ BRACKET_NOISE_RE = re.compile(
     re.I,
 )
 PUNCT_RE = re.compile(r"[^0-9a-z]+")
+TITLE_DUPLICATE_STOP_WORDS = {
+    "official",
+    "audio",
+    "video",
+    "music",
+    "lyrics",
+    "lyric",
+    "hq",
+    "hd",
+    "extended",
+    "original",
+    "radio",
+    "edit",
+    "mix",
+    "remix",
+    "version",
+    "clip",
+}
+ARTIST_DUPLICATE_STOP_WORDS = {"the", "a", "an", "and", "dj", "mc", "feat", "ft", "featuring", "vs", "x"}
 
 
 def compact_text(value: object) -> str:
@@ -56,6 +75,41 @@ def fingerprint(value: str) -> str:
 
 def token_set(value: str) -> set[str]:
     return {token for token in normalize_for_match(value).split() if len(token) > 1}
+
+
+def duplicate_title_tokens(value: str) -> set[str]:
+    return {token for token in token_set(value) if token not in TITLE_DUPLICATE_STOP_WORDS}
+
+
+def duplicate_artist_tokens(value: str) -> set[str]:
+    return {token for token in token_set(value) if token not in ARTIST_DUPLICATE_STOP_WORDS}
+
+
+def likely_same_recording(
+    *,
+    artist: str,
+    title: str,
+    other_artist: str,
+    other_title: str,
+) -> bool:
+    source_title = duplicate_title_tokens(title)
+    candidate_title = duplicate_title_tokens(other_title)
+    if not source_title or not candidate_title:
+        return False
+
+    title_overlap = len(source_title & candidate_title) / max(1, len(source_title))
+    reverse_title_overlap = len(source_title & candidate_title) / max(1, len(candidate_title))
+    title_ok = title_overlap >= 0.75 or reverse_title_overlap >= 0.75
+    if not title_ok:
+        return False
+
+    source_artist = duplicate_artist_tokens(artist)
+    candidate_artist = duplicate_artist_tokens(other_artist)
+    if not source_artist or not candidate_artist:
+        return len(source_title & candidate_title) == len(source_title | candidate_title)
+    artist_overlap = len(source_artist & candidate_artist) / max(1, len(source_artist))
+    reverse_artist_overlap = len(source_artist & candidate_artist) / max(1, len(candidate_artist))
+    return artist_overlap >= 0.5 or reverse_artist_overlap >= 0.5
 
 
 def match_confidence(

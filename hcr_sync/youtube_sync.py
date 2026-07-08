@@ -19,6 +19,7 @@ BAD_VIDEO_RE = re.compile(
     r"\b(full\s+mix|full\s+set|dj\s+set|liveset|mixtape|megamix|yearmix|podcast|radio\s+show|compilation|full\s+album|festival\s+set|aftermovie|trailer|interview|documentary|gameplay)\b",
     re.I,
 )
+PLACEHOLDER_RE = re.compile(r"\bunknown\s+(?:artist|title)\b|#\s*0*\d+\b", re.I)
 
 
 @dataclass(frozen=True)
@@ -198,6 +199,24 @@ def _candidate_score(track, candidate: YouTubeCandidate) -> float:
     )
 
 
+def _mark_youtube_review(con, track_id: int, *, reason: str, score: float | None = None) -> None:
+    upsert_youtube_asset(
+        con,
+        track_id=track_id,
+        match_confidence=score,
+        file_exists=False,
+        status="review",
+    )
+    add_event(
+        con,
+        track_id,
+        "ambiguous_youtube_match",
+        "youtube_sync",
+        {"reason": reason, "score": score},
+        dedupe_key=f"ambiguous_youtube_match:{track_id}:{reason}",
+    )
+
+
 def sync_youtube(config: Config, *, apply: bool, client: YouTubeClientProtocol | None = None) -> YouTubeSummary:
     if apply:
         assert_legacy_downloader_safe(config)
@@ -208,6 +227,12 @@ def sync_youtube(config: Config, *, apply: bool, client: YouTubeClientProtocol |
         local_ids = _local_track_keys(config)
         for track in tracks:
             summary.wanted += 1
+            if PLACEHOLDER_RE.search(f"{track['display_artist']} {track['display_title']}"):
+                summary.review += 1
+                if apply:
+                    with transaction(con):
+                        _mark_youtube_review(con, track["id"], reason="placeholder artist/title from logger", score=0.0)
+                continue
             if track["id"] in local_ids:
                 summary.already_local += 1
                 continue
@@ -247,14 +272,7 @@ def sync_youtube(config: Config, *, apply: bool, client: YouTubeClientProtocol |
                 summary.review += 1
                 if apply:
                     with transaction(con):
-                        upsert_youtube_asset(
-                            con,
-                            track_id=track["id"],
-                            match_confidence=best_score or None,
-                            file_exists=False,
-                            status="review",
-                        )
-                        add_event(con, track["id"], "ambiguous_youtube_match", "youtube_sync", {"score": best_score})
+                        _mark_youtube_review(con, track["id"], reason="below threshold or not found", score=best_score or None)
                 continue
             if not apply:
                 summary.downloaded += 1

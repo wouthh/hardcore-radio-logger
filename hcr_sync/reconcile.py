@@ -41,7 +41,15 @@ class ReconcileSummary:
     planned: list[PlannedAction] = field(default_factory=list)
 
 
-def _local_scan_guard(config: Config, con, current_count: int, known_count: int, *, force_mass_delete: bool) -> str:
+def _local_scan_guard(
+    config: Config,
+    con,
+    current_count: int,
+    known_count: int,
+    missing_known_count: int,
+    *,
+    force_mass_delete: bool,
+) -> str:
     if get_state(con, "local_baseline_complete") != "true":
         return "local baseline is not complete"
     if not config.music_dir.exists():
@@ -54,21 +62,12 @@ def _local_scan_guard(config: Config, con, current_count: int, known_count: int,
     min_ratio = config.float("HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO")
     if previous and current_count < previous * min_ratio:
         return "music dir scan dropped below configured safety ratio"
-    missing = list(
-        con.execute(
-            """
-            SELECT COUNT(*) AS count
-              FROM youtube_assets
-             WHERE file_exists = 1 AND status = 'downloaded' AND file_path IS NOT NULL
-            """
-        )
-    )[0]["count"] - current_count
-    if missing > config.int("HCR_RECONCILE_MAX_EXCLUSIONS") and not force_mass_delete:
+    if missing_known_count > config.int("HCR_RECONCILE_MAX_EXCLUSIONS") and not force_mass_delete:
         return "too many local exclusions would be detected without --force-mass-delete"
     return ""
 
 
-def _spotify_guard(config: Config, con, snapshot, *, force_mass_delete: bool) -> str:
+def _spotify_guard(config: Config, con, snapshot, *, missing_known_count: int, force_mass_delete: bool) -> str:
     if get_state(con, "spotify_baseline_complete") != "true":
         return "spotify baseline is not complete"
     if snapshot is None:
@@ -90,7 +89,7 @@ def _spotify_guard(config: Config, con, snapshot, *, force_mass_delete: bool) ->
         return "spotify playlist snapshot is empty while DB has known playlist assets"
     if known and len(snapshot.tracks) < known * config.float("HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO"):
         return "spotify playlist count is suspiciously low compared to DB playlist assets"
-    if known - len(snapshot.tracks) > config.int("HCR_RECONCILE_MAX_EXCLUSIONS") and not force_mass_delete:
+    if missing_known_count > config.int("HCR_RECONCILE_MAX_EXCLUSIONS") and not force_mass_delete:
         return "too many spotify exclusions would be detected without --force-mass-delete"
     return ""
 
@@ -226,6 +225,23 @@ def _cascade_excluded_spotify(con, config: Config, summary: ReconcileSummary, cl
         _cascade_spotify(con, config, int(row["track_id"]), summary, client)
 
 
+def _cascade_excluded_local(con, config: Config, summary: ReconcileSummary) -> None:
+    rows = list(
+        con.execute(
+            """
+            SELECT DISTINCT t.id AS track_id
+              FROM tracks t
+              JOIN youtube_assets y ON y.track_id = t.id
+             WHERE t.status = 'excluded'
+               AND y.file_exists = 1
+               AND y.file_path IS NOT NULL
+            """
+        )
+    )
+    for row in rows:
+        _cascade_local(con, config, int(row["track_id"]), summary)
+
+
 def _confirm_or_suspect(
     con,
     *,
@@ -266,7 +282,16 @@ def reconcile(
                 "SELECT * FROM youtube_assets WHERE file_exists = 1 AND status = 'downloaded' AND file_path IS NOT NULL"
             )
         )
-        local_refusal = _local_scan_guard(config, con, len(current_paths), len(known_local), force_mass_delete=force_mass_delete)
+        missing_known_local_count = sum(1 for asset in known_local if asset["file_path"] not in current_paths)
+        local_refusal = _local_scan_guard(
+            config,
+            con,
+            len(current_paths),
+            len(known_local),
+            missing_known_local_count,
+            force_mass_delete=force_mass_delete,
+        )
+        local_scan_healthy = not local_refusal
         if local_refusal:
             summary.refused.append(f"local: {local_refusal}")
         else:
@@ -311,8 +336,7 @@ def reconcile(
                     summary.excluded_local += 1
             if apply:
                 with transaction(con):
-                    set_state(con, "last_local_scan_count", str(len(current_paths)))
-                    set_state(con, "last_local_scan_at", now_utc())
+                    _cascade_excluded_local(con, config, summary)
 
         playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID") if spotify_enabled(config) else ""
         snapshot = None
@@ -327,18 +351,25 @@ def reconcile(
             except Exception as exc:
                 summary.refused.append(f"spotify: playlist fetch failed: {exc}")
         if playlist_id:
-            spotify_refusal = _spotify_guard(config, con, snapshot, force_mass_delete=force_mass_delete)
+            current_ids = {track.track_id for track in snapshot.tracks if track.track_id} if snapshot is not None else set()
+            known_spotify = list(
+                con.execute(
+                    "SELECT * FROM spotify_assets WHERE playlist_id = ? AND in_playlist = 1 AND spotify_track_id IS NOT NULL",
+                    (playlist_id,),
+                )
+            )
+            missing_known_spotify_count = sum(1 for asset in known_spotify if asset["spotify_track_id"] not in current_ids)
+            spotify_refusal = _spotify_guard(
+                config,
+                con,
+                snapshot,
+                missing_known_count=missing_known_spotify_count,
+                force_mass_delete=force_mass_delete,
+            )
             if spotify_refusal:
                 summary.refused.append(f"spotify: {spotify_refusal}")
             elif snapshot is not None:
-                current_ids = {track.track_id for track in snapshot.tracks if track.track_id}
                 previous_spotify_scan_at = get_state(con, "last_spotify_scan_at", "")
-                known_spotify = list(
-                    con.execute(
-                        "SELECT * FROM spotify_assets WHERE playlist_id = ? AND in_playlist = 1 AND spotify_track_id IS NOT NULL",
-                        (playlist_id,),
-                    )
-                )
                 for asset in known_spotify:
                     if asset["spotify_track_id"] in current_ids:
                         if apply and asset["suspected_missing_at"]:
@@ -427,6 +458,10 @@ def reconcile(
                         set_state(con, "last_spotify_snapshot_id", snapshot.snapshot_id)
                         set_state(con, "last_spotify_playlist_count", str(len(snapshot.tracks)))
                         set_state(con, "last_spotify_scan_at", now_utc())
+        if apply and local_scan_healthy:
+            with transaction(con):
+                set_state(con, "last_local_scan_count", str(len(audio_paths(config.music_dir))))
+                set_state(con, "last_local_scan_at", now_utc())
     return summary
 
 

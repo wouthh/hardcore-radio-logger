@@ -23,10 +23,10 @@ nano ~/.config/hcr-sync/hcr-sync.env
 The CLI loads config in this order:
 
 1. Built-in safe defaults.
-2. `--config PATH`.
-3. `HCR_CONFIG_FILE`.
-4. `~/.config/hcr-sync/hcr-sync.env`, if present.
-5. Project `.env`, for development.
+2. `~/.config/hcr-sync/hcr-sync.env`, if present.
+3. Project `.env`, for development.
+4. `HCR_CONFIG_FILE`.
+5. `--config PATH`.
 6. Real process environment variables.
 
 You do not need to `source` the env file for normal CLI usage.

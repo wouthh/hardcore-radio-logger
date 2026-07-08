@@ -391,6 +391,19 @@ def _import_playlist_snapshot(
                 else:
                     track = ensure_track(con, artist=item.artist, title=item.title, status="wanted")
                 if track["status"] == "excluded":
+                    upsert_spotify_asset(
+                        con,
+                        track_id=track["id"],
+                        playlist_id=snapshot.playlist_id,
+                        spotify_track_uri=item.uri,
+                        spotify_track_id=item.track_id,
+                        spotify_artist=item.artist,
+                        spotify_title=item.title,
+                        in_playlist=True,
+                        match_confidence=1.0,
+                        status="added",
+                        added_at=None,
+                    )
                     add_event(
                         con,
                         track["id"],

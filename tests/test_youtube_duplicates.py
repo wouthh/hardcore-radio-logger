@@ -318,3 +318,52 @@ def test_youtube_sync_rejects_short_blank_artist_exact_title_candidate(tmp_path)
 
     assert summary.review == 1
     assert client.downloads == []
+
+
+def test_youtube_sync_records_download_failure_and_continues(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Fail Artist", title="Fail Title", status="wanted")
+            ensure_track(con, artist="Ok Artist", title="Ok Title", status="wanted")
+
+    class PartiallyFailingYouTube:
+        def __init__(self):
+            self.downloads = []
+
+        def search(self, artist, title):
+            video_id = "fail123" if artist == "Fail Artist" else "ok123"
+            return [
+                YouTubeCandidate(
+                    title=f"{artist} - {title}",
+                    url=f"https://www.youtube.com/watch?v={video_id}",
+                    video_id=video_id,
+                    channel=artist,
+                    duration=180,
+                )
+            ]
+
+        def download(self, candidate):
+            self.downloads.append(candidate.video_id)
+            if candidate.video_id == "fail123":
+                raise RuntimeError("download failed")
+            path = config.music_dir / "Ok Artist - Ok Title [ok123].mp3"
+            path.write_bytes(b"audio")
+            return path
+
+    client = PartiallyFailingYouTube()
+    summary = sync_youtube(config, apply=True, client=client)
+
+    assert summary.skipped == 1
+    assert summary.downloaded == 1
+    assert client.downloads == ["fail123", "ok123"]
+    with connect(config) as con:
+        error_asset = con.execute("SELECT * FROM youtube_assets WHERE youtube_video_id = 'fail123'").fetchone()
+        downloaded_asset = con.execute("SELECT * FROM youtube_assets WHERE youtube_video_id = 'ok123'").fetchone()
+        event = con.execute("SELECT * FROM events WHERE event_type = 'youtube_download_failed'").fetchone()
+        assert error_asset["status"] == "error"
+        assert error_asset["file_exists"] == 0
+        assert downloaded_asset["status"] == "downloaded"
+        assert event is not None

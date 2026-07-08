@@ -11,7 +11,7 @@ from typing import Protocol
 
 from .config import Config
 from .db import add_event, connect, now_utc, transaction, upsert_youtube_asset, wanted_tracks
-from .identity import compact_text, likely_same_recording, match_confidence, parse_artist_title
+from .identity import compact_text, duplicate_title_tokens, likely_same_recording, match_confidence, normalize_for_match, parse_artist_title
 from .local_files import scan_music_folder, youtube_id_from_path
 from .system import assert_legacy_downloader_safe
 
@@ -27,6 +27,11 @@ SOURCE_NON_TRACK_RE = re.compile(
     r"compilation|full\s+album|continuous\s+mix|mix\s+session|festival\s+set|aftermovie|trailer|teaser|"
     r"interview|documentary|recap|artist\s+series|episode"
     r")\b",
+    re.I,
+)
+TITLE_SEGMENT_RE = re.compile(r"\s+(?:-|–|—|\||/)\s+")
+CATALOG_SEGMENT_RE = re.compile(
+    r"^(?:[ab]\d?|side\s+[ab]\d?|nr\s*\d+|[a-z]{1,5}\s*\d{1,4}|[a-z]+\d+[a-z]*|\d+)$",
     re.I,
 )
 
@@ -190,12 +195,50 @@ def _existing_local_match(con, *, track, artist: str, title: str):
     return None
 
 
+def _looks_like_catalog_segment(segment: str) -> bool:
+    normalized = normalize_for_match(segment)
+    return not normalized or bool(CATALOG_SEGMENT_RE.fullmatch(normalized.replace(" ", "")))
+
+
+def _looks_like_artist_segment(segment: str, artist: str) -> bool:
+    segment_tokens = duplicate_title_tokens(segment)
+    artist_tokens = duplicate_title_tokens(artist)
+    return bool(segment_tokens and artist_tokens and segment_tokens <= artist_tokens)
+
+
+def _looks_like_multi_title_candidate(track, candidate: YouTubeCandidate) -> bool:
+    source_tokens = duplicate_title_tokens(track["display_title"])
+    if not source_tokens:
+        return False
+    segments = [compact_text(part) for part in TITLE_SEGMENT_RE.split(candidate.title) if compact_text(part)]
+    if len(segments) < 4:
+        return False
+
+    matched_source_title = False
+    extra_title_like_segments = 0
+    for segment in segments:
+        if _looks_like_catalog_segment(segment) or _looks_like_artist_segment(segment, track["display_artist"]):
+            continue
+        segment_tokens = duplicate_title_tokens(segment)
+        if not segment_tokens:
+            continue
+        overlap = len(source_tokens & segment_tokens) / max(1, len(source_tokens))
+        reverse_overlap = len(source_tokens & segment_tokens) / max(1, len(segment_tokens))
+        if overlap >= 0.75 or reverse_overlap >= 0.75:
+            matched_source_title = True
+        elif len(segment_tokens) >= 2:
+            extra_title_like_segments += 1
+    return matched_source_title and extra_title_like_segments > 0
+
+
 def _candidate_score(track, candidate: YouTubeCandidate) -> float:
     if candidate.is_live or candidate.duration is None:
         return 0.0
     if candidate.duration < 120 or candidate.duration > 480:
         return 0.0
     if BAD_VIDEO_RE.search(f"{candidate.title} {candidate.channel} {candidate.description}"):
+        return 0.0
+    if _looks_like_multi_title_candidate(track, candidate):
         return 0.0
     candidate_artist, candidate_title = parse_artist_title(candidate.title)
     if not candidate_title:

@@ -110,3 +110,36 @@ def test_youtube_sync_marks_source_non_track_review_without_search(tmp_path):
         event = con.execute("SELECT * FROM events WHERE event_type='ambiguous_youtube_match'").fetchone()
     assert asset is not None
     assert event is not None
+
+
+def test_youtube_sync_rejects_multi_title_candidate(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Drokz", title="Only The Strong Survive", status="wanted")
+
+    class MultiTitleYouTube(FakeYouTube):
+        def search(self, artist, title):
+            self.searches.append((artist, title))
+            return [
+                YouTubeCandidate(
+                    title="DROKZ - B2 - ONLY THE STRONG SURVIVE - I GOT TO BE ME - AA10",
+                    url="https://www.youtube.com/watch?v=E50h8DmX0LA",
+                    video_id="E50h8DmX0LA",
+                    channel="Example",
+                    duration=266,
+                )
+            ]
+
+    client = MultiTitleYouTube()
+    summary = sync_youtube(config, apply=True, client=client)
+
+    assert summary.review == 1
+    assert client.downloads == []
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM youtube_assets WHERE status='review'").fetchone()
+        event = con.execute("SELECT * FROM events WHERE event_type='ambiguous_youtube_match'").fetchone()
+    assert asset is not None
+    assert asset["match_confidence"] is None
+    assert event is not None

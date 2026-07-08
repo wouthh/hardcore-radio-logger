@@ -88,6 +88,13 @@ def _spotify_guard(config: Config, con, snapshot, *, force_mass_delete: bool) ->
     return ""
 
 
+def _is_recent_self_added_spotify_asset(asset, previous_scan_at: str) -> bool:
+    added_at = asset["added_at"]
+    if not added_at:
+        return False
+    return not previous_scan_at or added_at > previous_scan_at
+
+
 def _trash_file(config: Config, path: Path) -> Path | None:
     if not path.exists():
         return None
@@ -260,6 +267,7 @@ def reconcile(
                 summary.refused.append(f"spotify: {spotify_refusal}")
             elif snapshot is not None:
                 current_ids = {track.track_id for track in snapshot.tracks if track.track_id}
+                previous_spotify_scan_at = get_state(con, "last_spotify_scan_at", "")
                 known_spotify = list(
                     con.execute(
                         "SELECT * FROM spotify_assets WHERE playlist_id = ? AND in_playlist = 1 AND spotify_track_id IS NOT NULL",
@@ -268,6 +276,8 @@ def reconcile(
                 )
                 for asset in known_spotify:
                     if asset["spotify_track_id"] in current_ids:
+                        continue
+                    if _is_recent_self_added_spotify_asset(asset, previous_spotify_scan_at):
                         continue
                     summary.planned.append(PlannedAction(asset["track_id"], "spotify_removed", asset["spotify_track_id"]))
                     if not apply:

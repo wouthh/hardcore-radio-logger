@@ -1,0 +1,99 @@
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# SQLite runtime databases
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite-journal
+
+# Runtime locks and state
+*.lock
+*.pid
+.hcr-sync.lock
+
+# Logs
+logs/
+*.log
+*.out
+*.err
+
+# Hardcore Radio logger runtime data
+seen-tracks.jsonl
+played-tracks.tsv
+youtube-download-catalog.jsonl
+youtube-download-success.tsv
+youtube-download-failures.tsv
+youtube-download-errors.tsv
+youtube-download-*.tsv
+youtube-download-*.jsonl
+
+# Broad runtime data files, with fixture exceptions
+*.jsonl
+*.tsv
+*.csv
+!tests/fixtures/**/*.jsonl
+!tests/fixtures/**/*.tsv
+!tests/fixtures/**/*.csv
+!examples/**/*.jsonl
+!examples/**/*.tsv
+!examples/**/*.csv
+!docs/examples/**/*.jsonl
+!docs/examples/**/*.tsv
+!docs/examples/**/*.csv
+
+# Spotify auth/token cache
+.spotipy-cache*
+spotipy-token-cache*
+*.spotify-token-cache
+.cache/spotipy/
+
+# Downloaded music/audio files
+*.mp3
+*.m4a
+*.flac
+*.opus
+*.ogg
+*.wav
+*.aac
+
+# Trash/quarantine
+.hcr-trash/
+trash/
+quarantine/
+
+# Local-only migration notes and snapshots
+LOCAL_MIGRATION.md
+.local-migration/
+migration-snapshot/
+legacy-archive/
+systemctl-output*.txt
+process-output*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local rendered systemd units, templates are committed separately
+systemd/rendered/
+*.service.local
+*.timer.local

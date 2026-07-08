@@ -1,0 +1,8 @@
+[Unit]
+Description=Hardcore Radio 3-way music sync
+
+[Service]
+Type=oneshot
+WorkingDirectory={{PROJECT_DIR}}
+EnvironmentFile={{ENV_FILE}}
+ExecStart={{PYTHON_BIN}} -m hcr_sync run-once --apply

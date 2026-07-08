@@ -1,0 +1,4 @@
+mutagen>=1.47
+requests>=2.31
+spotipy>=2.24
+pytest>=8.0

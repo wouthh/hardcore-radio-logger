@@ -34,6 +34,7 @@ youtube-download-failures.tsv
 youtube-download-errors.tsv
 youtube-download-*.tsv
 youtube-download-*.jsonl
+youtube-download-archive.txt
 
 # Broad runtime data files, with fixture exceptions
 *.jsonl

@@ -20,6 +20,15 @@ BAD_VIDEO_RE = re.compile(
     re.I,
 )
 PLACEHOLDER_RE = re.compile(r"\bunknown\s+(?:artist|title)\b|#\s*0*\d+\b", re.I)
+SOURCE_NON_TRACK_RE = re.compile(
+    r"\b("
+    r"various\s+artists|hardcore\s+radio|festival\s+\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|studio\s+\d+|"
+    r"full\s+mix|full\s+set|dj\s+set|live\s+set|liveset|mixtape|megamix|yearmix|podcast|radio\s+show|"
+    r"compilation|full\s+album|continuous\s+mix|mix\s+session|festival\s+set|aftermovie|trailer|teaser|"
+    r"interview|documentary|recap|artist\s+series|episode"
+    r")\b",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -227,6 +236,12 @@ def sync_youtube(config: Config, *, apply: bool, client: YouTubeClientProtocol |
         local_ids = _local_track_keys(config)
         for track in tracks:
             summary.wanted += 1
+            if SOURCE_NON_TRACK_RE.search(f"{track['display_artist']} {track['display_title']}"):
+                summary.review += 1
+                if apply:
+                    with transaction(con):
+                        _mark_youtube_review(con, track["id"], reason="source row looks like mix, set, compilation, or non-track item", score=0.0)
+                continue
             if PLACEHOLDER_RE.search(f"{track['display_artist']} {track['display_title']}"):
                 summary.review += 1
                 if apply:

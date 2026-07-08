@@ -837,6 +837,51 @@ def test_reconcile_refuses_many_local_known_missing_even_when_replacement_files_
         assert con.execute("SELECT COUNT(*) AS count FROM youtube_assets WHERE suspected_missing_at IS NOT NULL").fetchone()["count"] == 0
 
 
+def test_scan_local_before_reconcile_preserves_ratio_guard_baseline(tmp_path):
+    config = make_config(
+        tmp_path,
+        HCR_SPOTIFY_ENABLED="false",
+        HCR_RECONCILE_MAX_EXCLUSIONS="25",
+        HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO="0.80",
+    )
+    init_db(config)
+    config.music_dir.mkdir()
+    paths = []
+    with connect(config) as con:
+        with transaction(con):
+            for index in range(10):
+                path = config.music_dir / f"Artist {index} - Title.mp3"
+                path.write_bytes(b"x")
+                paths.append(path)
+                track = ensure_track(con, artist=f"Artist {index}", title="Title", status="wanted")
+                upsert_youtube_asset(
+                    con,
+                    track_id=track["id"],
+                    file_path=str(path),
+                    file_exists=True,
+                    match_confidence=1.0,
+                    status="downloaded",
+                )
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "10")
+
+    for path in paths[:3]:
+        path.unlink()
+
+    from hcr_sync.local_files import import_local_files
+
+    import_local_files(config, apply=True, establish_baseline=False)
+    summary = reconcile(config, apply=True)
+
+    assert "local: music dir scan dropped below configured safety ratio" in summary.refused
+    assert summary.suspected_local == 0
+    with connect(config) as con:
+        assert con.execute("SELECT value FROM sync_state WHERE key = 'last_local_scan_count'").fetchone()["value"] == "10"
+        assert con.execute("SELECT value FROM sync_state WHERE key = 'last_local_import_scan_count'").fetchone()["value"] == "7"
+        assert con.execute("SELECT COUNT(*) AS count FROM tracks WHERE status = 'excluded'").fetchone()["count"] == 0
+        assert con.execute("SELECT COUNT(*) AS count FROM youtube_assets WHERE suspected_missing_at IS NOT NULL").fetchone()["count"] == 0
+
+
 def test_reconcile_does_not_suspect_recent_self_added_spotify_asset(tmp_path):
     config = make_config(tmp_path)
     init_db(config)
@@ -1049,6 +1094,45 @@ def test_reconcile_clears_local_delete_suspicion_when_file_is_seen(tmp_path):
         assert asset["suspected_missing_at"] is None
         assert con.execute("SELECT status FROM tracks").fetchone()["status"] == "wanted"
         assert event is not None
+
+
+def test_idless_local_file_rename_updates_asset_instead_of_suspecting_delete(tmp_path):
+    config = make_config(tmp_path, HCR_SPOTIFY_ENABLED="false")
+    init_db(config)
+    config.music_dir.mkdir()
+    old_path = config.music_dir / "Artist - Title.mp3"
+    new_path = config.music_dir / "Artist - Title.m4a"
+    old_path.write_bytes(b"x")
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_youtube_asset(
+                con,
+                track_id=track["id"],
+                file_path=str(old_path),
+                file_exists=True,
+                match_confidence=1.0,
+                status="downloaded",
+            )
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "1")
+
+    old_path.rename(new_path)
+
+    from hcr_sync.local_files import import_local_files
+
+    import_local_files(config, apply=True, establish_baseline=False)
+    summary = reconcile(config, apply=True)
+
+    assert summary.refused == []
+    assert summary.planned == []
+    assert summary.suspected_local == 0
+    with connect(config) as con:
+        assets = list(con.execute("SELECT * FROM youtube_assets"))
+        assert len(assets) == 1
+        assert assets[0]["file_path"] == str(new_path)
+        assert assets[0]["suspected_missing_at"] is None
+        assert con.execute("SELECT status FROM tracks").fetchone()["status"] == "wanted"
 
 
 def test_reconcile_ignores_lingering_non_audio_files_when_audio_scan_empty(tmp_path):

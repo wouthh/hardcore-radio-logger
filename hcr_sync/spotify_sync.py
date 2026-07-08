@@ -528,6 +528,9 @@ def scan_spotify_playlist(config: Config, *, apply: bool, client: SpotifyClientP
         _validate_playlist_snapshot(snapshot)
     except Exception as exc:
         if _is_rate_limited(exc):
+            if apply:
+                with connect(config) as con:
+                    _remember_spotify_rate_limit(con, config, exc)
             summary.rate_limited = True
             summary.skipped += 1
             return summary

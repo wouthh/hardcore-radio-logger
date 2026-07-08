@@ -514,6 +514,27 @@ def test_spotify_sync_stops_cleanly_on_rate_limit(tmp_path):
         assert cooldown_events == 1
 
 
+def test_spotify_scan_apply_records_rate_limit_cooldown(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+
+    class RateLimitedSpotify(FakeSpotify):
+        def playlist_snapshot(self, playlist_id):
+            exc = RuntimeError("rate limited")
+            exc.http_status = 429
+            exc.headers = {"Retry-After": "3600"}
+            raise exc
+
+    summary = scan_spotify_playlist(config, apply=True, client=RateLimitedSpotify())
+
+    assert summary.rate_limited is True
+    assert summary.skipped == 1
+    with connect(config) as con:
+        assert con.execute("SELECT value FROM sync_state WHERE key = 'spotify_rate_limited_until'").fetchone() is not None
+        payload = json.loads(con.execute("SELECT payload_json FROM events WHERE event_type = 'spotify_rate_limited'").fetchone()["payload_json"])
+        assert payload["retry_after_seconds"] == 3600
+
+
 def test_spotify_sync_dry_run_rate_limit_does_not_write_cooldown(tmp_path):
     config = make_config(tmp_path)
     init_db(config)
@@ -997,6 +1018,39 @@ def test_reconcile_clears_spotify_removal_suspicion_when_track_is_seen(tmp_path)
         assert con.execute("SELECT status FROM tracks").fetchone()["status"] == "wanted"
 
 
+def test_reconcile_clears_local_delete_suspicion_when_file_is_seen(tmp_path):
+    config = make_config(tmp_path, HCR_SPOTIFY_ENABLED="false")
+    init_db(config)
+    config.music_dir.mkdir()
+    path = config.music_dir / "Artist - Title.mp3"
+    path.write_bytes(b"x")
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_youtube_asset(
+                con,
+                track_id=track["id"],
+                file_path=str(path),
+                file_exists=True,
+                match_confidence=1.0,
+                status="downloaded",
+            )
+            con.execute("UPDATE youtube_assets SET suspected_missing_at = ? WHERE track_id = ?", ("2026-01-01T01:00:00Z", track["id"]))
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "1")
+
+    summary = reconcile(config, apply=True, spotify_client=FakeSpotify())
+
+    assert summary.refused == []
+    assert summary.planned == []
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM youtube_assets").fetchone()
+        event = con.execute("SELECT * FROM events WHERE event_type = 'local_delete_suspicion_cleared'").fetchone()
+        assert asset["suspected_missing_at"] is None
+        assert con.execute("SELECT status FROM tracks").fetchone()["status"] == "wanted"
+        assert event is not None
+
+
 def test_reconcile_ignores_lingering_non_audio_files_when_audio_scan_empty(tmp_path):
     config = make_config(tmp_path)
     init_db(config)
@@ -1334,6 +1388,38 @@ def test_manual_exclude_moves_local_file_to_trash(tmp_path):
     assert any(config.trash_dir.iterdir())
     with connect(config) as con:
         assert con.execute("SELECT status FROM tracks").fetchone()["status"] == "excluded"
+
+
+def test_manual_exclude_missing_local_asset_does_not_count_trash_or_delete_event(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    missing_path = config.music_dir / "Artist - Title.mp3"
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_youtube_asset(
+                con,
+                track_id=track["id"],
+                file_path=str(missing_path),
+                file_exists=True,
+                match_confidence=1.0,
+                status="downloaded",
+            )
+            track_id = track["id"]
+
+    summary = manual_exclude(config, track_id=track_id, reason="manual", apply=True, spotify_client=FakeSpotify())
+
+    assert summary.local_trashed == 0
+    assert not missing_path.exists()
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM youtube_assets").fetchone()
+        missing_event = con.execute("SELECT * FROM events WHERE event_type = 'local_file_missing_during_cascade'").fetchone()
+        deleted_event = con.execute("SELECT * FROM events WHERE event_type = 'local_file_deleted'").fetchone()
+        assert asset["file_exists"] == 0
+        assert asset["status"] == "deleted"
+        assert missing_event is not None
+        assert deleted_event is None
 
 
 def test_legacy_downloader_preflight_blocks_apply(monkeypatch, tmp_path):

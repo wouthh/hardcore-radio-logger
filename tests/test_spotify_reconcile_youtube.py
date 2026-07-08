@@ -357,6 +357,40 @@ def test_reconcile_does_not_suspect_recent_self_added_spotify_asset(tmp_path):
         assert asset["in_playlist"] == 1
 
 
+def test_reconcile_refuses_empty_spotify_snapshot_with_known_assets(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Title", status="wanted")
+            upsert_spotify_asset(
+                con,
+                track_id=track["id"],
+                playlist_id="playlist",
+                spotify_track_uri="spotify:track:1",
+                spotify_track_id="1",
+                spotify_artist="Artist",
+                spotify_title="Title",
+                in_playlist=True,
+                match_confidence=1.0,
+                status="added",
+                added_at="2026-01-01T00:00:00Z",
+            )
+            set_state(con, "spotify_baseline_complete", "true")
+            set_state(con, "last_spotify_playlist_count", "0")
+            set_state(con, "last_spotify_scan_at", "2026-01-01T01:00:00Z")
+            set_state(con, "local_baseline_complete", "true")
+
+    summary = reconcile(config, apply=True, spotify_client=FakeSpotify(snapshot_tracks=[]))
+
+    assert "spotify: spotify playlist snapshot is empty while DB has known playlist assets" in summary.refused
+    assert summary.suspected_spotify == 0
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM spotify_assets").fetchone()
+        assert asset["suspected_missing_at"] is None
+        assert con.execute("SELECT status FROM tracks").fetchone()["status"] == "wanted"
+
+
 def test_reconcile_ignores_lingering_non_audio_files_when_audio_scan_empty(tmp_path):
     config = make_config(tmp_path)
     init_db(config)

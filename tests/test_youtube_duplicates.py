@@ -70,3 +70,23 @@ def test_youtube_sync_skips_existing_local_near_duplicate_before_search(tmp_path
     with connect(config) as con:
         event = con.execute("SELECT * FROM events WHERE event_type='youtube_skipped_existing_local_match'").fetchone()
     assert event is not None
+
+
+def test_youtube_sync_marks_unknown_placeholder_review_without_search(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Unknown Artist #01", title="Unknown Title #01 (Original Mix)", status="wanted")
+
+    client = FakeYouTube()
+    summary = sync_youtube(config, apply=True, client=client)
+
+    assert summary.review == 1
+    assert client.searches == []
+    assert client.downloads == []
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM youtube_assets WHERE status='review'").fetchone()
+        event = con.execute("SELECT * FROM events WHERE event_type='ambiguous_youtube_match'").fetchone()
+    assert asset is not None
+    assert event is not None

@@ -60,14 +60,16 @@ def parse_env_file(path: Path) -> dict[str, str]:
         key = key.strip()
         if not key:
             continue
-        lexer = shlex.shlex(value, posix=True)
-        lexer.whitespace_split = True
-        lexer.commenters = "#"
-        try:
-            parts = list(lexer)
-        except ValueError:
-            parts = [value.strip()]
-        values[key] = parts[0] if parts else ""
+        value = value.strip()
+        if value.startswith(("'", '"')):
+            try:
+                values[key] = shlex.split(value, comments=True)[0]
+                continue
+            except (IndexError, ValueError):
+                pass
+        if " #" in value:
+            value = value.split(" #", 1)[0].rstrip()
+        values[key] = value
     return values
 
 
@@ -146,15 +148,15 @@ class Config:
 
 def _candidate_files(explicit_config: str | None) -> list[Path]:
     candidates: list[Path] = []
-    if explicit_config:
-        candidates.append(path_value(explicit_config))
-    if os.environ.get("HCR_CONFIG_FILE"):
-        candidates.append(path_value(os.environ["HCR_CONFIG_FILE"]))
     if DEFAULT_CONFIG_PATH.exists():
         candidates.append(DEFAULT_CONFIG_PATH)
     local_env = Path(".env")
     if local_env.exists():
         candidates.append(local_env)
+    if os.environ.get("HCR_CONFIG_FILE"):
+        candidates.append(path_value(os.environ["HCR_CONFIG_FILE"]))
+    if explicit_config:
+        candidates.append(path_value(explicit_config))
     return candidates
 
 

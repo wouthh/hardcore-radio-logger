@@ -320,12 +320,56 @@ def _spotify_cooldown_active(con) -> bool:
     return bool(until and until > datetime.now(timezone.utc))
 
 
-def _remember_spotify_rate_limit(con, config: Config, exc: Exception) -> None:
+SPOTIFY_RATE_LIMIT_STATE_KEYS = (
+    "spotify_rate_limited_until",
+    "spotify_rate_limit_last_response",
+    "spotify_rate_limit_source",
+)
+
+
+def _remember_spotify_rate_limit(con, config: Config, exc: Exception, *, event_source: str = "spotify_sync") -> None:
     payload = _rate_limit_details(config, exc)
+    payload["event_source"] = event_source
     with transaction(con):
         set_state(con, "spotify_rate_limited_until", str(payload["cooldown_until"]))
         set_state(con, "spotify_rate_limit_last_response", json.dumps(payload, sort_keys=True))
-        add_event(con, None, "spotify_rate_limited", "spotify_sync", payload)
+        set_state(con, "spotify_rate_limit_source", event_source)
+        add_event(con, None, "spotify_rate_limited", event_source, payload)
+
+
+def _spotify_rate_limit_source(con) -> str:
+    source = get_state(con, "spotify_rate_limit_source", "")
+    if source:
+        return source
+    last_response = get_state(con, "spotify_rate_limit_last_response", "")
+    if last_response:
+        try:
+            return str(json.loads(last_response).get("event_source") or "")
+        except json.JSONDecodeError:
+            return ""
+    return ""
+
+
+def _clear_spotify_rate_limit(con, *, event_source: str) -> None:
+    previous_until = get_state(con, "spotify_rate_limited_until", "")
+    previous_response = get_state(con, "spotify_rate_limit_last_response", "")
+    if not previous_until and not previous_response:
+        return
+    previous_source = _spotify_rate_limit_source(con)
+    if previous_source == "spotify_sync" and event_source != "spotify_sync":
+        return
+    con.execute(
+        f"DELETE FROM sync_state WHERE key IN ({','.join('?' for _ in SPOTIFY_RATE_LIMIT_STATE_KEYS)})",
+        SPOTIFY_RATE_LIMIT_STATE_KEYS,
+    )
+    add_event(
+        con,
+        None,
+        "spotify_rate_limit_cooldown_cleared",
+        event_source,
+        {"previous_cooldown_until": previous_until, "previous_event_source": previous_source},
+        dedupe_key=f"spotify_rate_limit_cooldown_cleared:{event_source}:{previous_until}:{previous_source}",
+    )
 
 
 def _log_spotify_cooldown_skip(con) -> None:
@@ -510,6 +554,7 @@ def _import_playlist_snapshot(
                 set_state(con, "last_spotify_snapshot_id", snapshot.snapshot_id)
                 set_state(con, "last_spotify_playlist_count", str(len(snapshot.tracks)))
                 set_state(con, "last_spotify_scan_at", now_utc())
+            _clear_spotify_rate_limit(con, event_source=event_source)
     return summary
 
 
@@ -544,7 +589,7 @@ def scan_spotify_playlist(config: Config, *, apply: bool, client: SpotifyClientP
         if _is_rate_limited(exc):
             if apply:
                 with connect(config) as con:
-                    _remember_spotify_rate_limit(con, config, exc)
+                    _remember_spotify_rate_limit(con, config, exc, event_source="spotify_scan")
             summary.rate_limited = True
             summary.skipped += 1
             return summary

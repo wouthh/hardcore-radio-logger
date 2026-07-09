@@ -21,6 +21,7 @@ from .local_files import AUDIO_EXTENSIONS, audio_paths
 from .spotify_sync import (
     SpotifyClientProtocol,
     SpotipyClient,
+    _clear_spotify_rate_limit,
     _is_rate_limited,
     _remember_spotify_rate_limit,
     spotify_enabled,
@@ -390,7 +391,7 @@ def reconcile(
                         _cascade_excluded_spotify(con, config, summary, spotify_client)
             except Exception as exc:
                 if apply and _is_rate_limited(exc):
-                    _remember_spotify_rate_limit(con, config, exc)
+                    _remember_spotify_rate_limit(con, config, exc, event_source="reconcile")
                 summary.refused.append(f"spotify: playlist fetch failed: {exc}")
         if playlist_id:
             current_ids = {track.track_id for track in snapshot.tracks if track.track_id} if snapshot is not None else set()
@@ -500,6 +501,7 @@ def reconcile(
                         set_state(con, "last_spotify_snapshot_id", snapshot.snapshot_id)
                         set_state(con, "last_spotify_playlist_count", str(len(snapshot.tracks)))
                         set_state(con, "last_spotify_scan_at", now_utc())
+                        _clear_spotify_rate_limit(con, event_source="reconcile")
         if apply and local_scan_healthy:
             with transaction(con):
                 set_state(con, "last_local_scan_count", str(len(audio_paths(config.music_dir))))

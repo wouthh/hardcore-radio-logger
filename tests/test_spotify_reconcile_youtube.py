@@ -531,8 +531,74 @@ def test_spotify_scan_apply_records_rate_limit_cooldown(tmp_path):
     assert summary.skipped == 1
     with connect(config) as con:
         assert con.execute("SELECT value FROM sync_state WHERE key = 'spotify_rate_limited_until'").fetchone() is not None
-        payload = json.loads(con.execute("SELECT payload_json FROM events WHERE event_type = 'spotify_rate_limited'").fetchone()["payload_json"])
+        event = con.execute("SELECT * FROM events WHERE event_type = 'spotify_rate_limited'").fetchone()
+        payload = json.loads(event["payload_json"])
+        assert event["event_source"] == "spotify_scan"
         assert payload["retry_after_seconds"] == 3600
+
+
+def test_successful_spotify_scan_clears_stale_rate_limit_and_allows_sync(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Artist", title="Title", status="wanted")
+            set_state(con, "spotify_rate_limited_until", "2099-01-01T00:00:00Z")
+            set_state(con, "spotify_rate_limit_last_response", "{}")
+
+    scan_summary = scan_spotify_playlist(config, apply=True, client=FakeSpotify(snapshot_tracks=[]))
+    sync_client = FakeSpotify(
+        search_tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")]
+    )
+    sync_summary = sync_spotify(config, apply=True, client=sync_client)
+
+    assert scan_summary.rate_limited is False
+    assert sync_summary.added == 1
+    assert sync_client.search_calls == [("Artist", "Title")]
+    assert sync_client.added == ["spotify:track:1"]
+    with connect(config) as con:
+        assert con.execute("SELECT * FROM sync_state WHERE key LIKE 'spotify_rate_limit%'").fetchall() == []
+        event = con.execute("SELECT * FROM events WHERE event_type = 'spotify_rate_limit_cooldown_cleared'").fetchone()
+        assert event["event_source"] == "spotify_scan"
+
+
+def test_successful_spotify_scan_keeps_sync_rate_limit_cooldown(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            set_state(con, "spotify_rate_limited_until", "2099-01-01T00:00:00Z")
+            set_state(con, "spotify_rate_limit_last_response", json.dumps({"event_source": "spotify_sync"}))
+            set_state(con, "spotify_rate_limit_source", "spotify_sync")
+
+    scan_summary = scan_spotify_playlist(config, apply=True, client=FakeSpotify(snapshot_tracks=[]))
+
+    assert scan_summary.rate_limited is False
+    with connect(config) as con:
+        assert con.execute("SELECT value FROM sync_state WHERE key = 'spotify_rate_limited_until'").fetchone() is not None
+        assert con.execute("SELECT * FROM events WHERE event_type = 'spotify_rate_limit_cooldown_cleared'").fetchone() is None
+
+
+def test_successful_reconcile_spotify_fetch_clears_stale_rate_limit(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    with connect(config) as con:
+        with transaction(con):
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "0")
+            set_state(con, "spotify_baseline_complete", "true")
+            set_state(con, "last_spotify_playlist_count", "0")
+            set_state(con, "spotify_rate_limited_until", "2099-01-01T00:00:00Z")
+            set_state(con, "spotify_rate_limit_last_response", "{}")
+
+    summary = reconcile(config, apply=True, spotify_client=FakeSpotify(snapshot_tracks=[]))
+
+    assert summary.refused == []
+    with connect(config) as con:
+        assert con.execute("SELECT * FROM sync_state WHERE key LIKE 'spotify_rate_limit%'").fetchall() == []
+        event = con.execute("SELECT * FROM events WHERE event_type = 'spotify_rate_limit_cooldown_cleared'").fetchone()
+        assert event["event_source"] == "reconcile"
 
 
 def test_spotify_sync_dry_run_rate_limit_does_not_write_cooldown(tmp_path):

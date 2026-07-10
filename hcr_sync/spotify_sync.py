@@ -186,6 +186,8 @@ class SpotifySummary:
     review: int = 0
     skipped: int = 0
     rate_limited: bool = False
+    _snapshot: PlaylistSnapshot | None = None
+    _client: SpotifyClientProtocol | None = None
 
 
 def spotify_auth(config: Config, client: SpotifyClientProtocol | None = None) -> str:
@@ -638,7 +640,10 @@ def scan_spotify_playlist(config: Config, *, apply: bool, client: SpotifyClientP
             summary.skipped += 1
             return summary
         raise
-    return _import_playlist_snapshot(config, snapshot, apply=apply, event_source="spotify_scan", establish_baseline=False)
+    summary = _import_playlist_snapshot(config, snapshot, apply=apply, event_source="spotify_scan", establish_baseline=False)
+    summary._snapshot = snapshot
+    summary._client = client
+    return summary
 
 
 def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol | None = None) -> SpotifySummary:

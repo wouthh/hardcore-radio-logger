@@ -798,6 +798,48 @@ def test_spotify_sync_adds_even_when_youtube_is_review(tmp_path):
     assert youtube is not None
 
 
+def test_reconcile_skip_spotify_does_not_fetch_playlist(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    with connect(config) as con:
+        with transaction(con):
+            set_state(con, "local_baseline_complete", "true")
+
+    class ExplodingSpotify(FakeSpotify):
+        def playlist_snapshot(self, playlist_id):
+            raise AssertionError("playlist fetch should be skipped")
+
+    summary = reconcile(config, apply=True, spotify_client=ExplodingSpotify(), skip_spotify=True)
+
+    assert summary.refused == []
+
+
+def test_reconcile_reuses_provided_spotify_snapshot_without_refetch(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    with connect(config) as con:
+        with transaction(con):
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "spotify_baseline_complete", "true")
+            set_state(con, "last_spotify_playlist_count", "1")
+
+    class ExplodingSpotify(FakeSpotify):
+        def playlist_snapshot(self, playlist_id):
+            raise AssertionError("provided snapshot should be reused")
+
+    snapshot = PlaylistSnapshot(
+        playlist_id="playlist",
+        snapshot_id="snap",
+        tracks=[SpotifyTrack(uri="spotify:track:1", track_id="1", artist="Artist", title="Title")],
+        complete=True,
+    )
+    summary = reconcile(config, apply=True, spotify_client=ExplodingSpotify(), spotify_snapshot=snapshot)
+
+    assert summary.refused == []
+
+
 def test_suspected_local_delete_is_held_out_of_spotify_and_youtube_sync(tmp_path):
     config = make_config(tmp_path, HCR_SPOTIFY_ENABLED="true")
     init_db(config)

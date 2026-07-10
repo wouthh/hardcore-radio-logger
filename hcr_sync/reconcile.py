@@ -19,6 +19,7 @@ from .db import (
 )
 from .local_files import AUDIO_EXTENSIONS, audio_paths
 from .spotify_sync import (
+    PlaylistSnapshot,
     SpotifyClientProtocol,
     SpotipyClient,
     _clear_spotify_rate_limit,
@@ -300,6 +301,8 @@ def reconcile(
     force_mass_delete: bool = False,
     force_confirm_deletions: bool = False,
     spotify_client: SpotifyClientProtocol | None = None,
+    spotify_snapshot: PlaylistSnapshot | None = None,
+    skip_spotify: bool = False,
 ) -> ReconcileSummary:
     summary = ReconcileSummary()
     with connect(config) as con:
@@ -379,20 +382,22 @@ def reconcile(
                 with transaction(con):
                     _cascade_excluded_local(con, config, summary)
 
-        playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID") if spotify_enabled(config) else ""
-        snapshot = None
+        playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID") if spotify_enabled(config) and not skip_spotify else ""
+        snapshot = spotify_snapshot if playlist_id else None
         if playlist_id:
-            try:
-                client = spotify_client or SpotipyClient(config)
-                snapshot = client.playlist_snapshot(playlist_id)
-                spotify_client = client
+            if snapshot is None:
+                try:
+                    client = spotify_client or SpotipyClient(config)
+                    snapshot = client.playlist_snapshot(playlist_id)
+                    spotify_client = client
+                except Exception as exc:
+                    if apply and _is_rate_limited(exc):
+                        _remember_spotify_rate_limit(con, config, exc, event_source="reconcile")
+                    summary.refused.append(f"spotify: playlist fetch failed: {exc}")
+            if snapshot is not None:
                 if apply:
                     with transaction(con):
                         _cascade_excluded_spotify(con, config, summary, spotify_client)
-            except Exception as exc:
-                if apply and _is_rate_limited(exc):
-                    _remember_spotify_rate_limit(con, config, exc, event_source="reconcile")
-                summary.refused.append(f"spotify: playlist fetch failed: {exc}")
         if playlist_id:
             current_ids = {track.track_id for track in snapshot.tracks if track.track_id} if snapshot is not None else set()
             known_spotify = list(

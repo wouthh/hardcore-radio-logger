@@ -18,7 +18,6 @@ from .db import (
     set_state,
     transaction,
     upsert_spotify_asset,
-    wanted_tracks,
 )
 from .identity import compact_text, duplicate_title_tokens, match_confidence
 
@@ -44,6 +43,8 @@ GENERIC_VERSION_SUFFIX_RE = re.compile(
 )
 REMIX_RE = re.compile(r"\bremix\b", re.I)
 MAIN_ARTIST_SPLIT_RE = re.compile(r"\s+(?:&|\+|x|and|vs\.?|feat\.?|ft\.?|featuring)\s+|[,/|]", re.I)
+SPOTIFY_FIRST_RETRY_DAYS = 7
+SPOTIFY_STEADY_RETRY_DAYS = 14
 
 
 @dataclass(frozen=True)
@@ -384,9 +385,46 @@ def _log_spotify_cooldown_skip(con) -> None:
     )
 
 
-def _is_terminal_review_asset(asset, tentative_threshold: float) -> bool:
-    score = asset["match_confidence"]
-    return score is not None and float(score) < tentative_threshold
+def _spotify_sync_candidates(con, *, playlist_id: str):
+    return list(
+        con.execute(
+            """
+            SELECT
+                t.*,
+                s.search_last_at AS spotify_search_last_at,
+                s.search_next_at AS spotify_search_next_at
+              FROM tracks t
+              LEFT JOIN spotify_assets s
+                ON s.track_id = t.id
+               AND s.playlist_id = ?
+             WHERE t.status = 'wanted'
+             ORDER BY
+                CASE WHEN s.search_last_at IS NULL THEN 0 ELSE 1 END,
+                COALESCE(s.search_next_at, s.search_last_at, t.created_at),
+                t.id
+            """,
+            (playlist_id,),
+        )
+    )
+
+
+def _spotify_search_deferred(asset, now: datetime) -> bool:
+    next_at = _parse_utc(asset["search_next_at"] or "")
+    return bool(next_at and next_at > now)
+
+
+def _next_spotify_retry_at(searched_at: datetime, attempts: int) -> str:
+    days = SPOTIFY_FIRST_RETRY_DAYS if attempts <= 1 else SPOTIFY_STEADY_RETRY_DAYS
+    return _format_utc(searched_at + timedelta(days=days))
+
+
+def _spotify_search_attempts(asset) -> int:
+    if not asset:
+        return 0
+    try:
+        return max(0, int(asset["search_attempts"] or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _is_removed_tentative_asset(asset, match_threshold: float) -> bool:
@@ -441,6 +479,8 @@ def _mark_spotify_candidate_conflict(
     candidate: SpotifyTrack,
     score: float,
     existing_asset,
+    searched_at: str,
+    search_attempts: int,
 ) -> None:
     upsert_spotify_asset(
         con,
@@ -453,6 +493,10 @@ def _mark_spotify_candidate_conflict(
         in_playlist=False,
         match_confidence=0.0,
         status="review",
+        search_last_at=searched_at,
+        search_attempts=search_attempts,
+        search_next_at=None,
+        update_search=True,
     )
     add_event(
         con,
@@ -615,22 +659,18 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
             summary.rate_limited = True
             summary.skipped += 1
             return summary
-        tracks = wanted_tracks(con)
+        tracks = _spotify_sync_candidates(con, playlist_id=playlist_id)
         suspected_local_delete_ids = _suspected_local_delete_track_ids(con)
         candidate_conflict_ids = _spotify_candidate_conflict_track_ids(con)
-        existing = {
-            row["track_id"]
-            for row in con.execute(
-                "SELECT track_id FROM spotify_assets WHERE playlist_id = ? AND in_playlist = 1",
-                (playlist_id,),
-            )
-        }
-        review_assets = {
+        playlist_assets = {
             row["track_id"]: row
-            for row in con.execute(
-                "SELECT * FROM spotify_assets WHERE playlist_id = ? AND status = 'review' AND in_playlist = 0",
-                (playlist_id,),
-            )
+            for row in con.execute("SELECT * FROM spotify_assets WHERE playlist_id = ?", (playlist_id,))
+        }
+        existing = {track_id for track_id, row in playlist_assets.items() if row["in_playlist"]}
+        review_assets = {
+            track_id: row
+            for track_id, row in playlist_assets.items()
+            if row["status"] == "review" and not row["in_playlist"]
         }
         threshold = config.float("HCR_SPOTIFY_MATCH_THRESHOLD")
         tentative_threshold = config.float("HCR_SPOTIFY_TENTATIVE_ADD_THRESHOLD")
@@ -651,6 +691,7 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
         }
         sync_limit = config.int("HCR_SPOTIFY_SYNC_LIMIT")
         searched = 0
+        run_started_at = datetime.now(timezone.utc)
         for track in tracks:
             if track["id"] in suspected_local_delete_ids:
                 summary.skipped += 1
@@ -674,8 +715,15 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
             if track["id"] in candidate_conflict_ids:
                 summary.review += 1
                 continue
+            asset = playlist_assets.get(track["id"])
+            if asset and _spotify_search_deferred(asset, run_started_at):
+                if asset["status"] == "review":
+                    summary.review += 1
+                else:
+                    summary.skipped += 1
+                continue
             review_asset = review_assets.get(track["id"])
-            if review_asset and (not add_review_matches or _is_terminal_review_asset(review_asset, tentative_threshold)):
+            if review_asset and not add_review_matches:
                 summary.review += 1
                 continue
             if looks_like_non_track(track["display_artist"], track["display_title"]):
@@ -723,9 +771,13 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                 if score > best_score:
                     best = candidate
                     best_score = score
+            searched_at_dt = datetime.now(timezone.utc)
+            searched_at = _format_utc(searched_at_dt)
+            failed_search_attempts = _spotify_search_attempts(asset) + 1
             confident_match = best is not None and best_score >= threshold
             tentative_match = best is not None and add_review_matches and best_score >= tentative_threshold
             if not confident_match and not tentative_match:
+                next_search_at = _next_spotify_retry_at(searched_at_dt, failed_search_attempts)
                 summary.review += 1
                 if apply:
                     with transaction(con):
@@ -740,6 +792,10 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                             in_playlist=False,
                             match_confidence=best_score if best else 0.0,
                             status="review",
+                            search_last_at=searched_at,
+                            search_attempts=failed_search_attempts,
+                            search_next_at=next_search_at,
+                            update_search=True,
                         )
                         add_event(
                             con,
@@ -756,6 +812,9 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                                 "tentative_threshold": tentative_threshold,
                                 "add_review_matches": add_review_matches,
                                 "match_status": "review",
+                                "spotify_search_last_at": searched_at,
+                                "spotify_search_attempts": failed_search_attempts,
+                                "spotify_search_next_at": next_search_at,
                             },
                             dedupe_key=f"ambiguous_spotify_match:{track['id']}:{best.track_id if best else 'none'}:{best_score:.3f}",
                         )
@@ -777,6 +836,8 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                             candidate=best,
                             score=best_score,
                             existing_asset=conflicting_asset,
+                            searched_at=searched_at,
+                            search_attempts=failed_search_attempts,
                         )
                 continue
             if not apply:
@@ -817,6 +878,10 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                     match_confidence=best_score,
                     status="added" if confident_match else "review",
                     added_at=now_utc(),
+                    search_last_at=searched_at,
+                    search_attempts=0,
+                    search_next_at=None,
+                    update_search=True,
                 )
                 event_type = "spotify_added" if confident_match else "spotify_tentatively_added"
                 add_event(
@@ -832,6 +897,7 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                         "match_threshold": threshold,
                         "tentative_threshold": tentative_threshold,
                         "match_status": "added" if confident_match else "tentative_review",
+                        "spotify_search_last_at": searched_at,
                     },
                     dedupe_key=f"{event_type}:{track['id']}:{best.track_id}",
                 )

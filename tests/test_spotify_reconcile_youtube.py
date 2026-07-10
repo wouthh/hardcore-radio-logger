@@ -1,6 +1,6 @@
-import json
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import json
 
 import pytest
 
@@ -469,6 +469,78 @@ def test_spotify_sync_respects_per_run_limit(tmp_path):
     assert summary.added == 1
     assert summary.skipped == 1
     assert len(client.added) == 1
+
+
+def test_spotify_sync_prioritizes_unsearched_tracks_before_retry_due_tracks(tmp_path):
+    config = make_config(tmp_path, HCR_SPOTIFY_SYNC_LIMIT="1")
+    init_db(config)
+
+    class EchoSpotify(FakeSpotify):
+        def search_track(self, artist, title):
+            self.search_calls.append((artist, title))
+            track_id = f"{artist}-{title}".replace(" ", "-").casefold()
+            return [SpotifyTrack(uri=f"spotify:track:{track_id}", track_id=track_id, artist=artist, title=title)]
+
+    client = EchoSpotify()
+    with connect(config) as con:
+        with transaction(con):
+            old = ensure_track(con, artist="Old", title="Song", status="wanted")
+            ensure_track(con, artist="New", title="Song", status="wanted")
+            upsert_spotify_asset(
+                con,
+                track_id=old["id"],
+                playlist_id="playlist",
+                in_playlist=False,
+                match_confidence=0.0,
+                status="error",
+                search_last_at="2026-01-01T00:00:00Z",
+                search_attempts=1,
+                search_next_at="2026-01-08T00:00:00Z",
+                update_search=True,
+            )
+
+    summary = sync_spotify(config, apply=True, client=client)
+
+    assert summary.added == 1
+    assert summary.skipped == 1
+    assert client.search_calls == [("New", "Song")]
+
+
+def test_spotify_sync_schedules_failed_search_retries_then_uses_two_week_cadence(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    client = FakeSpotify(search_tracks=[])
+    with connect(config) as con:
+        with transaction(con):
+            ensure_track(con, artist="Artist", title="Missing", status="wanted")
+
+    first = sync_spotify(config, apply=True, client=client)
+    second = sync_spotify(config, apply=True, client=client)
+
+    assert first.review == 1
+    assert second.review == 1
+    assert client.search_calls == [("Artist", "Missing")]
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM spotify_assets").fetchone()
+        assert asset["search_attempts"] == 1
+        assert asset["search_last_at"] is not None
+        assert asset["search_next_at"] is not None
+        first_last = datetime.fromisoformat(asset["search_last_at"].replace("Z", "+00:00"))
+        first_next = datetime.fromisoformat(asset["search_next_at"].replace("Z", "+00:00"))
+        assert timedelta(days=6, hours=23) <= first_next - first_last <= timedelta(days=7, minutes=1)
+        con.execute("UPDATE spotify_assets SET search_next_at = ? WHERE id = ?", ("2026-01-01T00:00:00Z", asset["id"]))
+        con.commit()
+
+    third = sync_spotify(config, apply=True, client=client)
+
+    assert third.review == 1
+    assert client.search_calls == [("Artist", "Missing"), ("Artist", "Missing")]
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM spotify_assets").fetchone()
+        assert asset["search_attempts"] == 2
+        second_last = datetime.fromisoformat(asset["search_last_at"].replace("Z", "+00:00"))
+        second_next = datetime.fromisoformat(asset["search_next_at"].replace("Z", "+00:00"))
+        assert timedelta(days=13, hours=23) <= second_next - second_last <= timedelta(days=14, minutes=1)
 
 
 def test_spotify_sync_stops_cleanly_on_rate_limit(tmp_path):

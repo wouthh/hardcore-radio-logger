@@ -1,7 +1,8 @@
 from pathlib import Path
+import sqlite3
 
 from hcr_sync.config import DEFAULTS, Config, load_config, parse_env_file
-from hcr_sync.db import init_db
+from hcr_sync.db import connect, init_db
 from hcr_sync.doctor import format_doctor, run_doctor
 
 
@@ -59,3 +60,66 @@ def test_doctor_prints_config_file_and_is_non_destructive(tmp_path):
 
     assert f"Config file: {config_file}" in output
     assert not config.trash_dir.exists()
+
+
+def test_connect_migrates_existing_spotify_search_schedule_columns(tmp_path):
+    config = make_config(tmp_path)
+    con = sqlite3.connect(config.db_path)
+    con.executescript(
+        """
+        CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY,
+            applied_at TEXT NOT NULL
+        );
+        CREATE TABLE tracks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            normalized_artist TEXT NOT NULL,
+            normalized_title TEXT NOT NULL,
+            display_artist TEXT NOT NULL,
+            display_title TEXT NOT NULL,
+            canonical_key TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL CHECK (status IN ('wanted', 'excluded', 'review', 'missing', 'error')),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE spotify_assets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE RESTRICT,
+            spotify_track_uri TEXT,
+            spotify_track_id TEXT,
+            spotify_artist TEXT NOT NULL DEFAULT '',
+            spotify_title TEXT NOT NULL DEFAULT '',
+            playlist_id TEXT NOT NULL DEFAULT '',
+            in_playlist INTEGER NOT NULL DEFAULT 0,
+            match_confidence REAL,
+            status TEXT NOT NULL CHECK (status IN ('added', 'missing', 'removed', 'error', 'review')),
+            added_at TEXT,
+            last_seen_at TEXT,
+            suspected_missing_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(track_id, playlist_id),
+            UNIQUE(playlist_id, spotify_track_id)
+        );
+        INSERT INTO schema_migrations(version, applied_at) VALUES (1, '2026-01-01T00:00:00Z');
+        INSERT INTO tracks(
+            normalized_artist, normalized_title, display_artist, display_title, canonical_key, status, created_at, updated_at
+        ) VALUES ('artist', 'missing', 'Artist', 'Missing', 'artist::missing', 'wanted', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+        INSERT INTO spotify_assets(
+            track_id, playlist_id, in_playlist, match_confidence, status, created_at, updated_at
+        ) VALUES (1, 'playlist', 0, 0.1, 'review', '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z');
+        """
+    )
+    con.commit()
+    con.close()
+
+    with connect(config) as migrated:
+        columns = {row["name"] for row in migrated.execute("PRAGMA table_info(spotify_assets)")}
+        asset = migrated.execute("SELECT * FROM spotify_assets").fetchone()
+        version = migrated.execute("SELECT * FROM schema_migrations WHERE version = 2").fetchone()
+
+    assert {"search_last_at", "search_attempts", "search_next_at"} <= columns
+    assert asset["search_last_at"] == "2026-01-02T00:00:00Z"
+    assert asset["search_attempts"] == 2
+    assert asset["search_next_at"] == "2026-01-16T00:00:00Z"
+    assert version is not None

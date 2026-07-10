@@ -86,6 +86,9 @@ CREATE TABLE IF NOT EXISTS spotify_assets (
     status TEXT NOT NULL CHECK (status IN ('added', 'missing', 'removed', 'error', 'review')),
     added_at TEXT,
     last_seen_at TEXT,
+    search_last_at TEXT,
+    search_attempts INTEGER NOT NULL DEFAULT 0,
+    search_next_at TEXT,
     suspected_missing_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -124,8 +127,63 @@ CREATE INDEX IF NOT EXISTS idx_youtube_track ON youtube_assets(track_id);
 CREATE INDEX IF NOT EXISTS idx_youtube_file_exists ON youtube_assets(file_exists);
 CREATE INDEX IF NOT EXISTS idx_spotify_track ON spotify_assets(track_id);
 CREATE INDEX IF NOT EXISTS idx_spotify_playlist ON spotify_assets(playlist_id, in_playlist);
+CREATE INDEX IF NOT EXISTS idx_spotify_search_schedule ON spotify_assets(playlist_id, in_playlist, search_next_at, search_last_at);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 """
+
+
+def _table_exists(con: sqlite3.Connection, table: str) -> bool:
+    row = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _table_columns(con: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in con.execute(f"PRAGMA table_info({table})")}
+
+
+def migrate_db(con: sqlite3.Connection) -> None:
+    if not _table_exists(con, "spotify_assets"):
+        return
+
+    columns = _table_columns(con, "spotify_assets")
+    added_search_columns = False
+    migrations = [
+        ("search_last_at", "ALTER TABLE spotify_assets ADD COLUMN search_last_at TEXT"),
+        ("search_attempts", "ALTER TABLE spotify_assets ADD COLUMN search_attempts INTEGER NOT NULL DEFAULT 0"),
+        ("search_next_at", "ALTER TABLE spotify_assets ADD COLUMN search_next_at TEXT"),
+    ]
+    for column, sql in migrations:
+        if column not in columns:
+            con.execute(sql)
+            columns.add(column)
+            added_search_columns = True
+
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_spotify_search_schedule "
+        "ON spotify_assets(playlist_id, in_playlist, search_next_at, search_last_at)"
+    )
+
+    if added_search_columns:
+        con.execute(
+            """
+            UPDATE spotify_assets
+               SET search_last_at = COALESCE(updated_at, created_at, last_seen_at),
+                   search_attempts = CASE WHEN search_attempts < 2 THEN 2 ELSE search_attempts END,
+                   search_next_at = strftime('%Y-%m-%dT%H:%M:%SZ', COALESCE(updated_at, created_at, last_seen_at), '+14 days')
+             WHERE status = 'review'
+               AND in_playlist = 0
+               AND search_last_at IS NULL
+               AND match_confidence IS NOT NULL
+            """
+        )
+    if _table_exists(con, "schema_migrations"):
+        con.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            (2, now_utc()),
+        )
 
 
 def connect(config_or_path: Config | Path | str) -> sqlite3.Connection:
@@ -134,12 +192,15 @@ def connect(config_or_path: Config | Path | str) -> sqlite3.Connection:
     con = sqlite3.connect(path)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA foreign_keys = ON")
+    migrate_db(con)
+    con.commit()
     return con
 
 
 def init_db(config: Config) -> None:
     with connect(config) as con:
         con.executescript(SCHEMA)
+        migrate_db(con)
         con.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
             (1, now_utc()),
@@ -427,6 +488,10 @@ def upsert_spotify_asset(
     match_confidence: float | None,
     status: str,
     added_at: str | None = None,
+    search_last_at: str | None = None,
+    search_attempts: int | None = None,
+    search_next_at: str | None = None,
+    update_search: bool = False,
 ) -> sqlite3.Row:
     if status not in SPOTIFY_STATUSES:
         raise ValueError(f"invalid spotify status: {status}")
@@ -453,6 +518,9 @@ def upsert_spotify_asset(
                    status = ?,
                    added_at = COALESCE(?, added_at),
                    last_seen_at = ?,
+                   search_last_at = CASE WHEN ? THEN ? ELSE search_last_at END,
+                   search_attempts = CASE WHEN ? THEN ? ELSE search_attempts END,
+                   search_next_at = CASE WHEN ? THEN ? ELSE search_next_at END,
                    suspected_missing_at = CASE WHEN ? THEN NULL ELSE suspected_missing_at END,
                    updated_at = ?
              WHERE id = ?
@@ -467,6 +535,12 @@ def upsert_spotify_asset(
                 status,
                 added_at,
                 now,
+                1 if update_search else 0,
+                search_last_at,
+                1 if update_search else 0,
+                search_attempts if search_attempts is not None else 0,
+                1 if update_search else 0,
+                search_next_at,
                 1 if in_playlist else 0,
                 now,
                 existing["id"],
@@ -478,8 +552,8 @@ def upsert_spotify_asset(
         INSERT INTO spotify_assets (
             track_id, spotify_track_uri, spotify_track_id, spotify_artist, spotify_title,
             playlist_id, in_playlist, match_confidence, status, added_at,
-            last_seen_at, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            last_seen_at, search_last_at, search_attempts, search_next_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             track_id,
@@ -493,6 +567,9 @@ def upsert_spotify_asset(
             status,
             added_at,
             now,
+            search_last_at if update_search else None,
+            (search_attempts if search_attempts is not None else 0) if update_search else 0,
+            search_next_at if update_search else None,
             now,
             now,
         ),

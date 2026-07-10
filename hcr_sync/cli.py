@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import sqlite3
 import sys
+from datetime import datetime, timedelta, timezone
 
 from .config import Config, load_config
-from .db import connect, ensure_track, init_db, track_by_id, transaction, unexclude_track
+from .db import connect, ensure_track, get_state, init_db, track_by_id, transaction, unexclude_track
 from .doctor import format_doctor, run_doctor
 from .identity import canonical_key
 from .local_files import import_local_files
@@ -37,6 +39,42 @@ def print_kv(prefix: str, obj) -> None:
 
 def fatal_reconcile_refusals(refusals: list[str]) -> list[str]:
     return [refusal for refusal in refusals if not refusal.startswith("spotify:")]
+
+
+def _parse_utc(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _format_utc(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def spotify_playlist_scan_skip(config: Config, *, now: datetime | None = None) -> tuple[str, str]:
+    now = now or datetime.now(timezone.utc)
+    try:
+        with connect(config) as con:
+            source = get_state(con, "spotify_rate_limit_source", "")
+            cooldown_until = _parse_utc(get_state(con, "spotify_rate_limited_until", ""))
+            if source in {"spotify_scan", "reconcile"} and cooldown_until and cooldown_until > now:
+                return "playlist_read_cooldown", _format_utc(cooldown_until)
+
+            interval_hours = max(0, config.int("HCR_SPOTIFY_SCAN_INTERVAL_HOURS"))
+            if interval_hours == 0:
+                return "", ""
+            last_scan_at = _parse_utc(get_state(con, "last_spotify_scan_at", ""))
+    except sqlite3.OperationalError:
+        return "", ""
+    if last_scan_at is None:
+        return "", ""
+    next_scan_at = last_scan_at + timedelta(hours=interval_hours)
+    if next_scan_at > now:
+        return "scan_interval", _format_utc(next_scan_at)
+    return "", ""
 
 
 def cmd_db(args: argparse.Namespace, config: Config) -> int:
@@ -177,19 +215,37 @@ def cmd_run_once(args: argparse.Namespace, config: Config) -> int:
         print_kv("import_logger", import_summary)
         local_summary = import_local_files(config, apply=apply, establish_baseline=False)
         print_kv("scan_local", local_summary)
-        try:
-            spotify_scan_summary = scan_spotify_playlist(config, apply=apply)
-        except Exception as exc:
+        spotify_snapshot = None
+        spotify_client = None
+        skip_spotify_reconcile = False
+        scan_skip_reason, scan_next_at = spotify_playlist_scan_skip(config)
+        if scan_skip_reason:
             spotify_scan_summary = SpotifySummary(skipped=1)
             print_kv("spotify_scan", spotify_scan_summary)
-            print(f"REFUSED spotify: playlist scan failed: {exc}")
+            print(f"SKIPPED spotify_scan reason={scan_skip_reason} next_scan_at={scan_next_at}")
+            skip_spotify_reconcile = True
         else:
-            print_kv("spotify_scan", spotify_scan_summary)
+            try:
+                spotify_scan_summary = scan_spotify_playlist(config, apply=apply)
+            except Exception as exc:
+                spotify_scan_summary = SpotifySummary(skipped=1)
+                print_kv("spotify_scan", spotify_scan_summary)
+                print(f"REFUSED spotify: playlist scan failed: {exc}")
+                skip_spotify_reconcile = True
+            else:
+                print_kv("spotify_scan", spotify_scan_summary)
+                spotify_snapshot = getattr(spotify_scan_summary, "_snapshot", None)
+                spotify_client = getattr(spotify_scan_summary, "_client", None)
+                if spotify_snapshot is None:
+                    skip_spotify_reconcile = True
         rec_summary = reconcile(
             config,
             apply=apply,
             force_mass_delete=args.force_mass_delete,
             force_confirm_deletions=args.force_confirm_deletions,
+            spotify_client=spotify_client,
+            spotify_snapshot=spotify_snapshot,
+            skip_spotify=skip_spotify_reconcile,
         )
         print_kv("reconcile", rec_summary)
         for refusal in rec_summary.refused:

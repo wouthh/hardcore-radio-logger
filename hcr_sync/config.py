@@ -37,6 +37,7 @@ DEFAULTS: dict[str, str] = {
     "HCR_SPOTIFY_CLIENT_SECRET": "",
     "HCR_SPOTIFY_REDIRECT_URI": "http://127.0.0.1:9090",
     "HCR_SPOTIFY_TOKEN_CACHE": "~/.config/hcr-sync/spotipy-token-cache",
+    "HCR_SPOTIFY_SCAN_INTERVAL_HOURS": "24",
     "HCR_SPOTIFY_SYNC_LIMIT": "15",
     "HCR_SPOTIFY_REQUEST_TIMEOUT": "10",
     "HCR_SPOTIFY_REQUEST_RETRIES": "0",

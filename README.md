@@ -2,7 +2,7 @@
 
 Local-first radio discovery and library reconciliation with SQLite provenance, idempotent planning, and guarded synchronization adapters for a local music folder, YouTube, and Spotify.
 
-The database is the source of truth. Logger files, the local music folder, YouTube, and Spotify are inputs or outputs. Tracks removed from either the local folder or the Spotify playlist become excluded/tombstoned so they are not downloaded or re-added later. Mutating commands default to dry-run and require an explicit `--apply` boundary.
+The database is the source of truth. Logger files, the local music folder, YouTube, and Spotify are inputs or outputs. Tracks removed from either the local folder or the Spotify playlist become excluded/tombstoned so they are not downloaded or re-added later. Destructive synchronization operations default to dry-run and require an explicit `--apply` boundary. Setup commands such as `db init` and `spotify auth` can create local state without `--apply`.
 
 Tested with Python 3.11, 3.12, 3.13, and 3.14.
 

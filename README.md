@@ -1,8 +1,10 @@
 # Hardcore Radio Logger Sync
 
-SQLite-backed sync for Hardcore Radio track observations, a local music folder, YouTube downloads, and a Spotify playlist.
+Local-first radio discovery and library reconciliation with SQLite provenance, idempotent planning, and guarded synchronization adapters for a local music folder, YouTube, and Spotify.
 
-The database is the source of truth. Logger files, the local music folder, YouTube, and Spotify are inputs or outputs. Tracks removed from either the local folder or the Spotify playlist become excluded/tombstoned so they are not downloaded or re-added later.
+The database is the source of truth. Logger files, the local music folder, YouTube, and Spotify are inputs or outputs. Tracks removed from either the local folder or the Spotify playlist become excluded/tombstoned so they are not downloaded or re-added later. Destructive synchronization operations default to dry-run and require an explicit `--apply` boundary. Setup commands such as `db init` and `spotify auth` can create local state without `--apply`.
+
+Tested with Python 3.11, 3.12, 3.13, and 3.14.
 
 ## Installation
 
@@ -190,6 +192,8 @@ systemctl --user restart hcr-sync.service
 ## Safety Model
 
 Destructive commands default to dry-run. Use `--apply` to make changes.
+
+Use synchronization and download features only for media you are authorized to access and retain, and review the terms of each connected service. This project does not grant rights to third-party content.
 
 Local file removals default to trash mode with `HCR_DELETE_MODE=trash`. The trash folder is configured by `HCR_TRASH_DIR`.
 

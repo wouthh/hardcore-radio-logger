@@ -1,6 +1,10 @@
-# Hardcore Radio Logger Sync
+# Hardcore Radio Logger
 
-Local-first radio discovery and library reconciliation with SQLite provenance, idempotent planning, and guarded synchronization adapters for a local music folder, YouTube, and Spotify.
+Local-first radio discovery and library reconciliation with SQLite provenance, dry-run planning, and guarded synchronization.
+
+> **Maintained**
+>
+> The project is designed for an explicitly configured local library. External synchronization is optional, authorization-dependent, and guarded by dry-run and apply boundaries.
 
 The database is the source of truth. Logger files, the local music folder, YouTube, and Spotify are inputs or outputs. Tracks removed from either the local folder or the Spotify playlist become excluded/tombstoned so they are not downloaded or re-added later. Destructive synchronization operations default to dry-run and require an explicit `--apply` boundary. Setup commands such as `db init` and `spotify auth` can create local state without `--apply`.
 

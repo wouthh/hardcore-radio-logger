@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-labelledby="title description">
+  <title id="title">Hardcore Radio Logger social preview</title>
+  <desc id="description">A restrained dark title card showing observations flowing into SQLite and a guarded synchronization plan.</desc>
+  <rect width="1280" height="640" fill="#0D1117"/>
+  <g fill="none" stroke="#58A6FF" stroke-width="5">
+    <rect x="920" y="92" width="240" height="92" rx="46"/>
+    <rect x="920" y="260" width="240" height="92" rx="12"/>
+    <rect x="920" y="428" width="240" height="92" rx="12"/>
+    <path d="M1040 184v76M1040 352v76"/>
+  </g>
+  <g fill="#F0F6FC" font-family="Arial, Helvetica, sans-serif">
+    <text x="96" y="128" font-size="28" font-weight="700" letter-spacing="2">LOCAL-FIRST DATA SYSTEM</text>
+    <text x="96" y="238" font-size="60" font-weight="700">Hardcore Radio Logger</text>
+    <text x="96" y="305" font-size="30" fill="#B1BAC4">Provenance, dry-run planning, and guarded sync</text>
+    <text x="96" y="548" font-size="25" fill="#B1BAC4">github.com/wouthh/hardcore-radio-logger</text>
+  </g>
+  <g fill="#F0F6FC" font-family="Arial, Helvetica, sans-serif" font-size="20" font-weight="700" text-anchor="middle">
+    <text x="1040" y="146">OBSERVE</text>
+    <text x="1040" y="314">SQLITE</text>
+    <text x="1040" y="482">GUARDED PLAN</text>
+  </g>
+</svg>

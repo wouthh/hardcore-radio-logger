@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import re
 import json
+import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
@@ -19,7 +21,7 @@ from .db import (
     transaction,
     upsert_spotify_asset,
 )
-from .identity import compact_text, duplicate_title_tokens, match_confidence
+from .identity import canonical_key, compact_text, duplicate_title_tokens, match_confidence
 
 NON_TRACK_RE = re.compile(
     r"\b("
@@ -522,6 +524,30 @@ class SpotifyAssociationConflict(RuntimeError):
     """A snapshot cannot safely replace an existing candidate association."""
 
 
+def _validate_snapshot_associations(con, snapshot: PlaylistSnapshot) -> None:
+    # Resolve the same two identities as the importer/upsert without creating
+    # tracks. Include assignments earlier in this snapshot, even on a fresh DB.
+    assignments = {}
+    spotify_keys = {}
+    if con is not None:
+        for key, spotify_id in con.execute(
+            """SELECT t.canonical_key, a.spotify_track_id
+                 FROM spotify_assets a JOIN tracks t ON t.id = a.track_id
+                WHERE a.playlist_id = ?""",
+            (snapshot.playlist_id,),
+        ):
+            assignments[key] = spotify_id
+            if spotify_id:
+                spotify_keys[spotify_id] = key
+    for item in snapshot.tracks:
+        key = spotify_keys.get(item.track_id, canonical_key(item.artist, item.title))
+        previous_id = assignments.get(key)
+        if previous_id and previous_id != item.track_id:
+            raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
+        assignments[key] = item.track_id
+        spotify_keys[item.track_id] = key
+
+
 def _validate_playlist_snapshot(snapshot: PlaylistSnapshot) -> None:
     if not snapshot.complete or not snapshot.snapshot_id:
         raise RuntimeError("Spotify playlist snapshot was incomplete")
@@ -540,10 +566,18 @@ def _import_playlist_snapshot(
     summary = SpotifySummary()
     summary.seen = len(snapshot.tracks)
     if not apply:
+        if config.db_path.exists():
+            # The normal DB connector performs migrations. Preview validation
+            # must neither migrate nor create the configured database.
+            with closing(sqlite3.connect(config.db_path.resolve().as_uri() + "?mode=ro", uri=True)) as con:
+                _validate_snapshot_associations(con, snapshot)
+        else:
+            _validate_snapshot_associations(None, snapshot)
         summary.linked = len(snapshot.tracks)
         return summary
     with connect(config) as con:
         with transaction(con):
+            _validate_snapshot_associations(con, snapshot)
             for item in snapshot.tracks:
                 existing_asset = con.execute(
                     "SELECT * FROM spotify_assets WHERE playlist_id = ? AND spotify_track_id = ?",
@@ -559,8 +593,6 @@ def _import_playlist_snapshot(
                         "SELECT * FROM spotify_assets WHERE track_id = ? AND playlist_id = ?",
                         (track["id"], snapshot.playlist_id),
                     ).fetchone()
-                    if existing_asset and existing_asset["spotify_track_id"] and existing_asset["spotify_track_id"] != item.track_id:
-                        raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
                 # Presence establishes membership, not the correctness of an
                 # existing match. Restore membership using retained provenance.
                 confidence = existing_asset["match_confidence"] if existing_asset else 1.0

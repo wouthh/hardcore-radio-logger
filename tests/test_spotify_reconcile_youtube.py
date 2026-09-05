@@ -12,7 +12,7 @@ from hcr_sync.system import LegacyDownloaderActive, assert_legacy_downloader_saf
 from hcr_sync.youtube_sync import YouTubeCandidate, sync_youtube
 
 
-@pytest.mark.parametrize("mode", ["tentative", "confirmed", "dry-run", "review-history"])
+@pytest.mark.parametrize("mode", ["tentative", "confirmed", "dry-run", "review-history", "raised-threshold"])
 def test_observed_match_provenance_survives_full_removal_sequence(tmp_path, monkeypatch, mode):
     clock = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
 
@@ -24,6 +24,8 @@ def test_observed_match_provenance_survives_full_removal_sequence(tmp_path, monk
     monkeypatch.setattr("hcr_sync.db.datetime", ControlledDatetime)
     monkeypatch.setattr("hcr_sync.spotify_sync.datetime", ControlledDatetime)
     config = make_config(tmp_path, HCR_SPOTIFY_MATCH_THRESHOLD="0.90", HCR_SPOTIFY_TENTATIVE_ADD_THRESHOLD="0.85")
+    if mode == "raised-threshold":
+        config.values["HCR_SPOTIFY_MATCH_THRESHOLD"] = "0.86"
     init_db(config)
     config.music_dir.mkdir()
     path = config.music_dir / "Example Artist - Amber Beacon Cedar Delta.mp3"
@@ -44,7 +46,7 @@ def test_observed_match_provenance_survives_full_removal_sequence(tmp_path, monk
     clock[0] += timedelta(hours=1)
     added = sync_spotify(config, apply=True, client=spotify)
     assert spotify.added == [candidate.uri]
-    assert (added.added, added.tentative_added) == ((1, 0) if mode == "confirmed" else (1, 1))
+    assert (added.added, added.tentative_added) == ((1, 0) if mode in {"confirmed", "raised-threshold"} else (1, 1))
 
     def asset():
         with connect(config) as con:
@@ -56,6 +58,10 @@ def test_observed_match_provenance_survives_full_removal_sequence(tmp_path, monk
     if mode == "review-history":
         # A later threshold change is not a confirmation of the existing review.
         config.values["HCR_SPOTIFY_MATCH_THRESHOLD"] = "0.86"
+    if mode == "raised-threshold":
+        # Retaining membership must not bypass the existing current-threshold
+        # removal guard when the operator deliberately tightens matching policy.
+        config.values["HCR_SPOTIFY_MATCH_THRESHOLD"] = "0.90"
     observations = []
     summaries = []
     spotify.snapshot_tracks = keep + [candidate]
@@ -153,7 +159,8 @@ def test_snapshot_preserves_provenance_and_updates_membership(tmp_path, importer
 
 
 @pytest.mark.parametrize("importer", [scan_spotify_playlist, backfill_spotify])
-def test_snapshot_association_conflict_rolls_back_entire_snapshot(tmp_path, importer):
+@pytest.mark.parametrize("apply", [False, True])
+def test_snapshot_association_conflict_rolls_back_entire_snapshot(tmp_path, importer, apply):
     config = make_config(tmp_path)
     init_db(config)
     with connect(config) as con:
@@ -161,14 +168,29 @@ def test_snapshot_association_conflict_rolls_back_entire_snapshot(tmp_path, impo
             track = ensure_track(con, artist="Example", title="Song", status="wanted")
             upsert_spotify_asset(con, track_id=track["id"], playlist_id="playlist", spotify_track_id="original", spotify_track_uri="spotify:track:original", spotify_artist="Example", spotify_title="Song", in_playlist=False, match_confidence=0.8625, status="review")
         before = list(con.iterdump())
+    database_bytes = config.db_path.read_bytes()
     spotify = FakeSpotify([
         SpotifyTrack(uri="spotify:track:new", track_id="new", artist="New", title="Unrelated"),
         SpotifyTrack(uri="spotify:track:conflict", track_id="conflict", artist="Example", title="Song"),
     ])
     with pytest.raises(RuntimeError, match="association conflict"):
-        importer(config, apply=True, client=spotify)
+        importer(config, apply=apply, client=spotify)
     with connect(config) as con:
         assert list(con.iterdump()) == before
+    assert config.db_path.read_bytes() == database_bytes
+
+
+@pytest.mark.parametrize("importer", [scan_spotify_playlist, backfill_spotify])
+def test_snapshot_dry_run_checks_new_associations_without_creating_database(tmp_path, importer):
+    config = make_config(tmp_path)
+    first = SpotifyTrack(uri="spotify:track:first", track_id="first", artist="Example", title="Song")
+    spotify = FakeSpotify([first])
+    assert importer(config, apply=False, client=spotify).linked == 1
+    assert not config.db_path.exists()
+    spotify.snapshot_tracks.append(SpotifyTrack(uri="spotify:track:second", track_id="second", artist="EXAMPLE", title="SONG"))
+    with pytest.raises(RuntimeError, match="association conflict"):
+        importer(config, apply=False, client=spotify)
+    assert not config.db_path.exists()
 
 
 def test_snapshot_resolves_idless_existing_association_conservatively(tmp_path):

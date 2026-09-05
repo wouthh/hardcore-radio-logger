@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import json
 import re
 from dataclasses import dataclass
@@ -109,10 +108,9 @@ def _iter_played_tsv(path: Path):
     for line_number, line in enumerate(_source_lines(path, source), 1):
         if not line.strip():
             continue
-        try:
-            row = next(csv.reader([line], delimiter="\t", strict=True))
-        except csv.Error:
-            raise _input_error(source, line_number, "malformed TSV record") from None
+        # The poller writes literal tab-separated text, not CSV-escaped fields.
+        # A quote at the start of a title is ordinary track text.
+        row = line.split("\t")
         if first_record:
             first_record = False
             columns = [column.strip().casefold() for column in row]

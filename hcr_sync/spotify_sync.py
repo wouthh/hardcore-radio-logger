@@ -518,6 +518,10 @@ def _mark_spotify_candidate_conflict(
     )
 
 
+class SpotifyAssociationConflict(RuntimeError):
+    """A snapshot cannot safely replace an existing candidate association."""
+
+
 def _validate_playlist_snapshot(snapshot: PlaylistSnapshot) -> None:
     if not snapshot.complete or not snapshot.snapshot_id:
         raise RuntimeError("Spotify playlist snapshot was incomplete")
@@ -556,14 +560,14 @@ def _import_playlist_snapshot(
                         (track["id"], snapshot.playlist_id),
                     ).fetchone()
                     if existing_asset and existing_asset["spotify_track_id"] and existing_asset["spotify_track_id"] != item.track_id:
-                        raise RuntimeError("Spotify playlist snapshot association conflict")
+                        raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
                 # Presence establishes membership, not the correctness of an
                 # existing match. Restore membership using retained provenance.
                 confidence = existing_asset["match_confidence"] if existing_asset else 1.0
                 tentative = existing_asset is not None and (
                     existing_asset["status"] == "review"
                     or confidence is None
-                    or confidence < config.float("HCR_SPOTIFY_MATCH_THRESHOLD")
+                    or (existing_asset["status"] != "added" and confidence < config.float("HCR_SPOTIFY_MATCH_THRESHOLD"))
                 )
                 if existing_asset is not None and existing_asset["status"] == "removed" and not tentative:
                     # Removal replaces status='review'. Its existing event keeps

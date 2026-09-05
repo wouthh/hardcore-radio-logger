@@ -126,7 +126,7 @@ def test_logger_tsv_maps_named_columns_and_preserves_timestamp(tmp_path, header)
         assert con.execute("SELECT display_title FROM tracks").fetchone()[0] == "Song"
 
 
-@pytest.mark.parametrize("text", ["track\ttitle\ttimestamp\nExample\tSong\t2026-01-01T00:00:00Z\n", "timestamp\ttime\ttrack\n", "track\tother\n", "timestamp\ttrack\n2026-01-01T00:00:00Z\n", '2026-01-01T00:00:00Z\t"unterminated\n'])
+@pytest.mark.parametrize("text", ["track\ttitle\ttimestamp\nExample\tSong\t2026-01-01T00:00:00Z\n", "timestamp\ttime\ttrack\n", "track\tother\n", "timestamp\ttrack\n2026-01-01T00:00:00Z\n", "2026-01-01T00:00:00Z\tExample\textra column\n"])
 def test_logger_rejects_ambiguous_headers_and_malformed_tsv(tmp_path, text):
     config = make_config(tmp_path)
     config.played_tracks_path.write_text(text, encoding="utf-8")
@@ -143,6 +143,20 @@ def test_logger_valid_dry_run_validates_without_creating_database(tmp_path):
     assert summary.files_read == 2 and summary.rows_seen == 2
     assert summary.observations_added == 0
     assert not config.db_path.exists()
+
+
+def test_logger_imports_literal_quotes_written_by_real_poller(tmp_path, monkeypatch, import_clock):
+    config = make_config(tmp_path, HCR_LOGGER_LOCK_FILE=str(tmp_path / ".logger.lock"))
+    init_db(config)
+    title = '"Synthetic Beacon" (Live)'
+    monkeypatch.setattr("hcr_sync.poller.fetch_status", lambda _url: {"icestats": {"source": {"title": title}}})
+    assert poll_radio(config, apply=True) == (True, title)
+    assert import_logger(config, apply=True).observations_added == 2
+    import_clock[0] += timedelta(days=1)
+    assert import_logger(config, apply=True).observations_added == 0
+    with connect(config) as con:
+        assert con.execute("SELECT COUNT(*) FROM tracks").fetchone()[0] == 1
+        assert con.execute("SELECT display_title FROM tracks").fetchone()[0] == title
 
 
 def make_config(tmp_path: Path, **overrides: str) -> Config:

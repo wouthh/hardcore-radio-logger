@@ -185,6 +185,25 @@ def test_snapshot_resolves_idless_existing_association_conservatively(tmp_path):
         assert asset["match_confidence"] is None and asset["status"] == "review"
 
 
+@pytest.mark.parametrize("importer", [scan_spotify_playlist, backfill_spotify])
+def test_snapshot_does_not_reclassify_confirmed_match_after_threshold_change(tmp_path, importer):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Example", title="Song", status="wanted")
+            upsert_spotify_asset(con, track_id=track["id"], playlist_id="playlist", spotify_track_id="confirmed", spotify_track_uri="spotify:track:confirmed", in_playlist=True, match_confidence=0.95, status="added")
+    spotify = FakeSpotify([SpotifyTrack(uri="spotify:track:confirmed", track_id="confirmed", artist="Example", title="Song")])
+    states = []
+    for threshold in ["0.98", "0.90"]:
+        config.values["HCR_SPOTIFY_MATCH_THRESHOLD"] = threshold
+        importer(config, apply=True, client=spotify)
+        with connect(config) as con:
+            row = con.execute("SELECT match_confidence, status FROM spotify_assets").fetchone()
+            states.append(tuple(row))
+    assert states == [(0.95, "added"), (0.95, "added")]
+
+
 def make_config(tmp_path: Path, **overrides: str) -> Config:
     values = dict(DEFAULTS)
     values.update(

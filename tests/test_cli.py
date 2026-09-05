@@ -12,6 +12,48 @@ from hcr_sync.spotify_sync import SpotifySummary
 from hcr_sync.system import LegacyDownloaderActive
 
 
+def test_run_once_stops_after_real_spotify_association_conflict(tmp_path, monkeypatch, capsys):
+    from hcr_sync.cli import main
+    from hcr_sync.db import ensure_track, transaction, upsert_spotify_asset
+    from hcr_sync.spotify_sync import PlaylistSnapshot, SpotifyTrack
+
+    config = make_config(tmp_path, HCR_RUN_POLLER="false", HCR_SEEN_TRACKS_JSONL=str(tmp_path / "absent.jsonl"), HCR_PLAYED_TRACKS_TSV=str(tmp_path / "absent.tsv"))
+    init_db(config)
+    config.music_dir.mkdir()
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Example", title="Song", status="wanted")
+            upsert_spotify_asset(con, track_id=track["id"], playlist_id="playlist", spotify_track_id="old", spotify_track_uri="spotify:track:old", spotify_artist="Example", spotify_title="Song", in_playlist=False, match_confidence=0.8625, status="review")
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "0")
+    candidate = SpotifyTrack(uri="spotify:track:new", track_id="new", artist="Example", title="Song")
+
+    class FakeSpotify:
+        added = []
+
+        def playlist_snapshot(self, playlist_id):
+            return PlaylistSnapshot(playlist_id=playlist_id, snapshot_id="synthetic", tracks=[candidate], complete=True)
+
+        def search_track(self, artist, title):
+            return [candidate]
+
+        def add_tracks(self, playlist_id, uris):
+            self.added.extend(uris)
+
+    spotify = FakeSpotify()
+    monkeypatch.setattr("hcr_sync.spotify_sync.SpotipyClient", lambda _config: spotify)
+    monkeypatch.setattr("hcr_sync.cli.load_config", lambda _path: config)
+    monkeypatch.setattr("hcr_sync.cli.assert_legacy_downloader_safe", lambda _config: None)
+    monkeypatch.setattr("hcr_sync.cli.sync_youtube", lambda *_args, **_kwargs: SimpleNamespace(downloaded=0))
+    result = main(["run-once", "--apply"])
+    with connect(config) as con:
+        asset = dict(con.execute("SELECT * FROM spotify_assets").fetchone())
+    assert result == 1, {"added": spotify.added, "asset": asset}
+    assert spotify.added == []
+    assert (asset["spotify_track_id"], asset["match_confidence"], asset["status"], asset["in_playlist"]) == ("old", 0.8625, "review", 0)
+    assert capsys.readouterr().err == "error: Spotify playlist snapshot association conflict\n"
+
+
 @pytest.mark.parametrize("command", ["import-logger", "run-once"])
 @pytest.mark.parametrize("mode", ["--apply", "--dry-run"])
 def test_logger_input_error_is_redacted_and_stops_later_stages(tmp_path, monkeypatch, capsys, command, mode):

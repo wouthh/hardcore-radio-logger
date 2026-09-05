@@ -59,6 +59,16 @@ python -m hcr_sync import-logger --apply
 
 Excluded tracks are never reactivated by logger input. Observations remain append-only in SQLite.
 
+Supported input is the format written by the shipped poller:
+
+- JSONL: one JSON object per nonblank line, with a nonempty string `track` and a string `first_seen_at`.
+- TSV: exactly two columns, timestamp then track; alternatively, a named header with exactly one timestamp column (`timestamp`, `time`, or `played_at`) and one track column (`track`, `title`, `name`, `artist_title`, `song`, or `query`). Header order may vary and other named columns are ignored; data rows must match the header width. Fields are literal tab-separated text as written by the poller: quotation marks in a title are preserved, not interpreted as CSV escaping.
+- Source timestamps require a valid date, time including seconds, and `Z` or a numeric timezone offset, for example `2026-01-01T12:34:56Z` or `2026-01-01T12:34:56.123+02:30`. Fractional seconds are accepted. Timestamp spelling is preserved after trimming; ingestion time remains separate in `imported_at`.
+
+Blank lines are ignored. Both configured files are validated before any import writes. A malformed nonblank record, missing/invalid timestamp, or ambiguous header rejects the entire invocation, including valid rows in the other file. The CLI returns exit status 1 and a fixed source label, line number, and reason without echoing row contents or configured paths (line 0 denotes an unreadable file). Dry-run performs the same validation without importing records. In `run-once`, an import error stops the later synchronization stages; optional polling happens before import.
+
+Bare lines and timestamp-less historical records that were previously accepted now require correction from a trustworthy source before import. The importer does not invent an observation time or convert those records automatically.
+
 ## Backfilling An Existing Music Folder
 
 ```bash
@@ -110,6 +120,10 @@ python -m hcr_sync spotify scan --apply
 Spotify sync uses conservative matching and does not auto-add source rows or candidates that look like full mixes, DJ sets, podcasts, radio shows, compilations, full albums, trailers, interviews, or other non-track items. Those are left for review instead.
 
 When `HCR_SPOTIFY_ADD_REVIEW_MATCHES=true`, matches below `HCR_SPOTIFY_MATCH_THRESHOLD` but at or above `HCR_SPOTIFY_TENTATIVE_ADD_THRESHOLD` are added to Spotify as tentative review assets. If a tentative Spotify asset is removed later, only that Spotify candidate is marked removed; the track is not tombstoned and local audio is not moved to trash.
+
+Playlist scans and backfill establish membership, not match correctness. Existing associations retain their confidence and review classification; uncertain or unknown-confidence matches remain under review when they reappear. Presence still refreshes provider metadata and last-seen time and clears missing suspicion. Removal safety continues to use the configured confidence threshold: raising it above an asset's retained score keeps removal candidate-only, even when its membership status is `added`. Excluded parents remain excluded. If a different Spotify ID would replace an existing track/playlist association, the snapshot import is rejected transactionally as an association conflict. Dry-run checks the same associations without creating or migrating the database. In `run-once`, that conflict returns exit status 1 before reconciliation or either external sync stage, so later matching cannot bypass the refused snapshot.
+
+These maintenance safeguards prevent future provenance changes and unstable timestamp-less imports. They do not reconstruct confidence already overwritten in an existing database or undo earlier exclusions, duplicate observations, or file movement. No automatic repair or library recovery is performed; any existing-state recovery needs a separate, evidence-based decision.
 
 When Spotify returns a rate limit, sync stores a cooldown in the database and skips Spotify add-sync until that time. If the API client does not expose an exact `Retry-After`, `HCR_SPOTIFY_RATE_LIMIT_FALLBACK_SECONDS` is used.
 

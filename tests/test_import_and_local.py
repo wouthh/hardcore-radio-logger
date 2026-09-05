@@ -1,5 +1,8 @@
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 from hcr_sync.config import DEFAULTS, Config
 from hcr_sync.db import connect, init_db, mark_excluded, transaction, upsert_youtube_asset
@@ -7,6 +10,139 @@ from hcr_sync.identity import parse_artist_title
 from hcr_sync.local_files import import_local_files, inspect_audio_file
 from hcr_sync.logger_importer import import_logger
 from hcr_sync.poller import poll_radio
+
+
+@pytest.fixture
+def import_clock(monkeypatch):
+    clock = [datetime(2026, 2, 1, tzinfo=timezone.utc)]
+
+    class ControlledDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0].astimezone(tz)
+
+    monkeypatch.setattr("hcr_sync.db.datetime", ControlledDatetime)
+    return clock
+
+
+def _logger_input(config, source, timestamps):
+    if source == "jsonl":
+        path = config.seen_tracks_path
+        lines = [json.dumps({"track": "Example Artist - Synthetic Song", **({"first_seen_at": timestamp} if timestamp is not None else {})}) for timestamp in timestamps]
+    else:
+        path = config.played_tracks_path
+        lines = [(timestamp + "\t" if timestamp is not None else "") + "Example Artist - Synthetic Song" for timestamp in timestamps]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+@pytest.mark.parametrize("source", ["jsonl", "tsv"])
+@pytest.mark.parametrize("apply", [False, True])
+def test_logger_rejects_timestamp_less_replays_without_partial_state(tmp_path, import_clock, source, apply):
+    config = make_config(tmp_path, HCR_AUDIT_VERBOSE="true")
+    init_db(config)
+    _logger_input(config, source, [None])
+    with connect(config) as con:
+        before = list(con.iterdump())
+    errors = []
+    for _ in range(2):
+        with pytest.raises(ValueError) as error:
+            import_logger(config, apply=apply)
+        errors.append(str(error.value))
+        with connect(config) as con:
+            assert list(con.iterdump()) == before
+        import_clock[0] += timedelta(days=1)
+    assert errors[0] == errors[1]
+    assert "line 1" in errors[0] and "timestamp" in errors[0]
+    assert str(tmp_path) not in errors[0] and "Example Artist" not in errors[0]
+
+
+@pytest.mark.parametrize("source", ["jsonl", "tsv"])
+def test_logger_timestamped_events_keep_identity_and_distinct_history(tmp_path, import_clock, source):
+    config = make_config(tmp_path)
+    init_db(config)
+    timestamps = ["2026-01-01T00:00:00Z", "2026-01-02T01:02:03.123+02:30"]
+    _logger_input(config, source, timestamps)
+    assert import_logger(config, apply=True).observations_added == 2
+    with connect(config) as con:
+        before = [dict(row) for row in con.execute("SELECT * FROM radio_observations ORDER BY id")]
+    import_clock[0] += timedelta(days=1)
+    assert import_logger(config, apply=True).observations_added == 0
+    with connect(config) as con:
+        assert [dict(row) for row in con.execute("SELECT * FROM radio_observations ORDER BY id")] == before
+        assert con.execute("SELECT COUNT(*) FROM tracks").fetchone()[0] == 1
+    assert [row["observed_at"] for row in before] == timestamps
+    assert all(row["imported_at"] != row["observed_at"] for row in before)
+
+
+@pytest.mark.parametrize("source", ["jsonl", "tsv"])
+@pytest.mark.parametrize("apply", [False, True])
+@pytest.mark.parametrize("second_file", [False, True])
+def test_logger_invalid_row_rejects_whole_invocation(tmp_path, source, apply, second_file):
+    config = make_config(tmp_path, HCR_AUDIT_VERBOSE="true")
+    init_db(config)
+    if second_file:
+        _logger_input(config, "jsonl", ["2026-01-01T00:00:00Z"])
+        _logger_input(config, "tsv", [None])
+    else:
+        _logger_input(config, source, ["2026-01-01T00:00:00Z", None])
+    with connect(config) as con:
+        before = list(con.iterdump())
+    with pytest.raises(ValueError):
+        import_logger(config, apply=apply)
+    with connect(config) as con:
+        assert list(con.iterdump()) == before
+
+
+@pytest.mark.parametrize("source", ["jsonl", "tsv"])
+@pytest.mark.parametrize("timestamp", ["", "2026-01-01", "2026-01-01T01:02Z", "2026-01-01T01:02:03", "2026-02-30T01:02:03Z", "2026-01-01T25:00:00Z", "2026-01-01T01:02:03+24:00", "2026-01-01T01:02:03+01:60", "not a timestamp"])
+def test_logger_rejects_unusable_timestamps_before_opening_database(tmp_path, source, timestamp):
+    config = make_config(tmp_path)
+    _logger_input(config, source, [timestamp])
+    with pytest.raises(ValueError):
+        import_logger(config, apply=True)
+    assert not config.db_path.exists()
+
+
+@pytest.mark.parametrize("record", ['bare legacy text', '[]', 'null', '{"track": "Example", "first_seen_at": 123}', '{"track": "", "first_seen_at": "2026-01-01T00:00:00Z"}', '{"track": 123, "first_seen_at": "2026-01-01T00:00:00Z"}'])
+def test_logger_rejects_malformed_jsonl_contract(tmp_path, record):
+    config = make_config(tmp_path)
+    config.seen_tracks_path.write_text(record + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="seen-tracks.jsonl line 1:"):
+        import_logger(config, apply=True)
+    assert not config.db_path.exists()
+
+
+@pytest.mark.parametrize("header", ["track\ttimestamp", "artist_title\tplayed_at", "query\ttime", "name\ttimestamp", "song\ttime", "title\tplayed_at"])
+def test_logger_tsv_maps_named_columns_and_preserves_timestamp(tmp_path, header):
+    config = make_config(tmp_path)
+    init_db(config)
+    timestamp = "2026-01-01T01:02:03.120-03:00"
+    config.played_tracks_path.write_text("\n" + header + "\nExample - Song\t " + timestamp + " \n\n", encoding="utf-8")
+    summary = import_logger(config, apply=True)
+    assert summary.rows_seen == 1 and summary.observations_added == 1
+    with connect(config) as con:
+        assert con.execute("SELECT observed_at FROM radio_observations").fetchone()[0] == timestamp
+        assert con.execute("SELECT display_title FROM tracks").fetchone()[0] == "Song"
+
+
+@pytest.mark.parametrize("text", ["track\ttitle\ttimestamp\nExample\tSong\t2026-01-01T00:00:00Z\n", "timestamp\ttime\ttrack\n", "track\tother\n", "timestamp\ttrack\n2026-01-01T00:00:00Z\n", '2026-01-01T00:00:00Z\t"unterminated\n'])
+def test_logger_rejects_ambiguous_headers_and_malformed_tsv(tmp_path, text):
+    config = make_config(tmp_path)
+    config.played_tracks_path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="played-tracks.tsv line "):
+        import_logger(config, apply=True)
+    assert not config.db_path.exists()
+
+
+def test_logger_valid_dry_run_validates_without_creating_database(tmp_path):
+    config = make_config(tmp_path)
+    for source in ["jsonl", "tsv"]:
+        _logger_input(config, source, ["2026-01-01T00:00:00Z"])
+    summary = import_logger(config, apply=False)
+    assert summary.files_read == 2 and summary.rows_seen == 2
+    assert summary.observations_added == 0
+    assert not config.db_path.exists()
 
 
 def make_config(tmp_path: Path, **overrides: str) -> Config:

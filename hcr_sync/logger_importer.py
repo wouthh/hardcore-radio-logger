@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import csv
 import json
-import os
+import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from .config import Config
-from .db import add_event, add_observation, connect, ensure_track_from_raw, now_utc, set_state, transaction
+from .db import add_event, add_observation, connect, ensure_track_from_raw, set_state, transaction
 from .identity import compact_text, parse_artist_title
 
 
@@ -44,71 +45,98 @@ def _remember_file_state(con, prefix: str, path: Path) -> None:
     set_state(con, f"last_{prefix}_mtime", state.get("mtime", ""))
 
 
+def _input_error(source: str, line_number: int, reason: str) -> ValueError:
+    # Only fixed labels/reasons and line numbers belong in CLI errors.
+    return ValueError(f"{source} line {line_number}: {reason}")
+
+
+def _source_lines(path: Path, source: str) -> list[str]:
+    try:
+        return path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        raise _input_error(source, 0, "cannot read UTF-8 input") from None
+
+
+def _source_timestamp(value: object, source: str, line_number: int) -> str:
+    timestamp = value.strip() if isinstance(value, str) else ""
+    if not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)",
+        timestamp,
+    ):
+        raise _input_error(source, line_number, "usable source timestamp required")
+    try:
+        datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except ValueError:
+        raise _input_error(source, line_number, "invalid source timestamp") from None
+    # Do not normalize spelling: existing observation identities include it.
+    return timestamp
+
+
 def _iter_seen_jsonl(path: Path):
     if not path.exists():
         return
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    source = "seen-tracks.jsonl"
+    for line_number, line in enumerate(_source_lines(path, source), 1):
         stripped = line.strip()
         if not stripped:
             continue
         try:
             record = json.loads(stripped)
         except json.JSONDecodeError:
-            raw_track = stripped
-            observed_at = ""
-        else:
-            raw_track = compact_text(record.get("track") if isinstance(record, dict) else stripped)
-            observed_at = compact_text(record.get("first_seen_at") if isinstance(record, dict) else "")
-        if raw_track:
-            yield {
-                "observed_at": observed_at or now_utc(),
-                "raw_track": raw_track,
-                "raw_line": stripped,
-                "source": "seen-tracks.jsonl",
-                "line_number": line_number,
-            }
+            raise _input_error(source, line_number, "JSON object required") from None
+        if not isinstance(record, dict):
+            raise _input_error(source, line_number, "JSON object required")
+        raw_track = record.get("track")
+        if not isinstance(raw_track, str) or not compact_text(raw_track):
+            raise _input_error(source, line_number, "nonempty track string required")
+        yield {
+            "observed_at": _source_timestamp(record.get("first_seen_at"), source, line_number),
+            "raw_track": compact_text(raw_track),
+            "raw_line": stripped,
+            "source": source,
+            "line_number": line_number,
+        }
 
 
 def _iter_played_tsv(path: Path):
     if not path.exists():
         return
-    lines = path.read_text(encoding="utf-8").splitlines()
-    if not lines:
-        return
-    header: list[str] | None = None
-    data_lines = lines
-    first = [col.strip().casefold() for col in lines[0].split("\t")]
-    if {"track", "title", "name", "song", "query"} & set(first) or {"timestamp", "time", "played_at"} & set(first):
-        header = first
-        data_lines = lines[1:]
-    track_index = None
-    if header:
-        for index, column in enumerate(header):
-            if column in {"track", "title", "name", "artist_title", "song", "query"}:
-                track_index = index
-                break
-    for offset, line in enumerate(data_lines, 1 + (1 if header else 0)):
+    source = "played-tracks.tsv"
+    timestamp_aliases = {"timestamp", "time", "played_at"}
+    track_aliases = {"track", "title", "name", "artist_title", "song", "query"}
+    first_record = True
+    timestamp_index, track_index, width = 0, 1, 2
+    for line_number, line in enumerate(_source_lines(path, source), 1):
         if not line.strip():
             continue
-        row = next(csv.reader([line], delimiter="\t"))
-        if track_index is not None and track_index < len(row):
-            raw_track = row[track_index]
-            observed_at = row[0] if row else ""
-        elif len(row) >= 2 and row[0].startswith("20"):
-            observed_at = row[0]
-            raw_track = " ".join(row[1:])
-        else:
-            observed_at = ""
-            raw_track = " ".join(row)
-        raw_track = compact_text(raw_track)
-        if raw_track:
-            yield {
-                "observed_at": compact_text(observed_at) or now_utc(),
-                "raw_track": raw_track,
-                "raw_line": line,
-                "source": "played-tracks.tsv",
-                "line_number": offset,
-            }
+        try:
+            row = next(csv.reader([line], delimiter="\t", strict=True))
+        except csv.Error:
+            raise _input_error(source, line_number, "malformed TSV record") from None
+        if first_record:
+            first_record = False
+            columns = [column.strip().casefold() for column in row]
+            # A timestamp-first data row can itself have a track named "Song".
+            if not re.match(r"\d{4}-", row[0].strip()) and (timestamp_aliases | track_aliases) & set(columns):
+                times = [i for i, column in enumerate(columns) if column in timestamp_aliases]
+                tracks = [i for i, column in enumerate(columns) if column in track_aliases]
+                if len(times) != 1 or len(tracks) != 1:
+                    raise _input_error(source, line_number, "unambiguous timestamp and track headers required")
+                timestamp_index, track_index, width = times[0], tracks[0], len(columns)
+                continue
+        if len(row) != width:
+            raise _input_error(source, line_number, "timestamp and track columns required")
+        observed_at = _source_timestamp(row[timestamp_index], source, line_number)
+        raw_track = compact_text(row[track_index])
+        if not raw_track:
+            raise _input_error(source, line_number, "nonempty track string required")
+        yield {
+            "observed_at": observed_at,
+            "raw_track": raw_track,
+            "raw_line": line,
+            "source": source,
+            "line_number": line_number,
+        }
 
 
 def _import_entry(con, config: Config, entry: dict[str, object], summary: ImportSummary, apply: bool) -> None:
@@ -167,15 +195,19 @@ def import_logger(config: Config, *, apply: bool) -> ImportSummary:
         ("seen_tracks_jsonl", config.seen_tracks_path, _iter_seen_jsonl),
         ("played_tracks_tsv", config.played_tracks_path, _iter_played_tsv),
     ]
+    # Validate both files before opening the database or recording any progress.
+    # A malformed second file must not partially import the first one.
+    inputs = [(prefix, path, list(iterator(path))) for prefix, path, iterator in paths]
+    summary.files_read = sum(path.exists() for _, path, _ in inputs)
+    if not apply:
+        summary.rows_seen = sum(len(entries) for _, _, entries in inputs)
+        return summary
     with connect(config) as con:
         with transaction(con):
-            for prefix, path, iterator in paths:
-                if path.exists():
-                    summary.files_read += 1
-                for entry in iterator(path) or []:
+            for prefix, path, entries in inputs:
+                for entry in entries:
                     _import_entry(con, config, entry, summary, apply)
-                if apply:
-                    _remember_file_state(con, prefix, path)
+                _remember_file_state(con, prefix, path)
     return summary
 
 

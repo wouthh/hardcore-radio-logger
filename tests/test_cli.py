@@ -12,6 +12,34 @@ from hcr_sync.spotify_sync import SpotifySummary
 from hcr_sync.system import LegacyDownloaderActive
 
 
+@pytest.mark.parametrize("command", ["import-logger", "run-once"])
+@pytest.mark.parametrize("mode", ["--apply", "--dry-run"])
+def test_logger_input_error_is_redacted_and_stops_later_stages(tmp_path, monkeypatch, capsys, command, mode):
+    from hcr_sync.cli import main
+
+    config = make_config(tmp_path, HCR_RUN_POLLER="false", HCR_SEEN_TRACKS_JSONL=str(tmp_path / "private-input.jsonl"), HCR_PLAYED_TRACKS_TSV=str(tmp_path / "absent.tsv"))
+    init_db(config)
+    config.seen_tracks_path.write_text('{"track": "Synthetic private title"}\n', encoding="utf-8")
+    monkeypatch.setattr("hcr_sync.cli.load_config", lambda _path: config)
+    monkeypatch.setattr("hcr_sync.cli.assert_legacy_downloader_safe", lambda _config: None)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("later stage ran after invalid logger input")
+
+    for stage in ["poll_radio", "import_local_files", "scan_spotify_playlist", "reconcile", "sync_youtube", "sync_spotify"]:
+        monkeypatch.setattr("hcr_sync.cli." + stage, unexpected)
+    with connect(config) as con:
+        before = list(con.iterdump())
+    assert main([command, mode]) == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert output.err.startswith("error: seen-tracks.jsonl line 1:")
+    assert "timestamp" in output.err
+    assert "Synthetic" not in output.err and str(tmp_path) not in output.err and "private-input" not in output.err
+    with connect(config) as con:
+        assert list(con.iterdump()) == before
+
+
 def make_config(tmp_path: Path, **overrides: str) -> Config:
     values = dict(DEFAULTS)
     values.update(

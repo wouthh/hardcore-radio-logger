@@ -549,20 +549,43 @@ def _import_playlist_snapshot(
                     track = con.execute("SELECT * FROM tracks WHERE id = ?", (existing_asset["track_id"],)).fetchone()
                 else:
                     track = ensure_track(con, artist=item.artist, title=item.title, status="wanted")
+                    # The upsert also resolves by track/playlist. Do not overwrite
+                    # another candidate or transfer its evidence to a new ID.
+                    existing_asset = con.execute(
+                        "SELECT * FROM spotify_assets WHERE track_id = ? AND playlist_id = ?",
+                        (track["id"], snapshot.playlist_id),
+                    ).fetchone()
+                    if existing_asset and existing_asset["spotify_track_id"] and existing_asset["spotify_track_id"] != item.track_id:
+                        raise RuntimeError("Spotify playlist snapshot association conflict")
+                # Presence establishes membership, not the correctness of an
+                # existing match. Restore membership using retained provenance.
+                confidence = existing_asset["match_confidence"] if existing_asset else 1.0
+                tentative = existing_asset is not None and (
+                    existing_asset["status"] == "review"
+                    or confidence is None
+                    or confidence < config.float("HCR_SPOTIFY_MATCH_THRESHOLD")
+                )
+                if existing_asset is not None and existing_asset["status"] == "removed" and not tentative:
+                    # Removal replaces status='review'. Its existing event keeps
+                    # that evidence even if the configured threshold later falls.
+                    tentative = con.execute(
+                        "SELECT 1 FROM events WHERE event_type = 'spotify_tentative_removed_by_user' AND dedupe_key = ?",
+                        (f"spotify_tentative_removed_by_user:{track['id']}:{existing_asset['id']}",),
+                    ).fetchone() is not None
+                upsert_spotify_asset(
+                    con,
+                    track_id=track["id"],
+                    playlist_id=snapshot.playlist_id,
+                    spotify_track_uri=item.uri,
+                    spotify_track_id=item.track_id,
+                    spotify_artist=item.artist,
+                    spotify_title=item.title,
+                    in_playlist=True,
+                    match_confidence=confidence,
+                    status="review" if tentative else "added",
+                    added_at=None,
+                )
                 if track["status"] == "excluded":
-                    upsert_spotify_asset(
-                        con,
-                        track_id=track["id"],
-                        playlist_id=snapshot.playlist_id,
-                        spotify_track_uri=item.uri,
-                        spotify_track_id=item.track_id,
-                        spotify_artist=item.artist,
-                        spotify_title=item.title,
-                        in_playlist=True,
-                        match_confidence=1.0,
-                        status="added",
-                        added_at=None,
-                    )
                     add_event(
                         con,
                         track["id"],
@@ -573,19 +596,6 @@ def _import_playlist_snapshot(
                     )
                     summary.skipped += 1
                     continue
-                upsert_spotify_asset(
-                    con,
-                    track_id=track["id"],
-                    playlist_id=snapshot.playlist_id,
-                    spotify_track_uri=item.uri,
-                    spotify_track_id=item.track_id,
-                    spotify_artist=item.artist,
-                    spotify_title=item.title,
-                    in_playlist=True,
-                    match_confidence=1.0,
-                    status="added",
-                    added_at=None,
-                )
                 add_event(
                     con,
                     track["id"],

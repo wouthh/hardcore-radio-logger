@@ -12,6 +12,179 @@ from hcr_sync.system import LegacyDownloaderActive, assert_legacy_downloader_saf
 from hcr_sync.youtube_sync import YouTubeCandidate, sync_youtube
 
 
+@pytest.mark.parametrize("mode", ["tentative", "confirmed", "dry-run", "review-history"])
+def test_observed_match_provenance_survives_full_removal_sequence(tmp_path, monkeypatch, mode):
+    clock = [datetime(2026, 1, 1, tzinfo=timezone.utc)]
+
+    class ControlledDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock[0].astimezone(tz)
+
+    monkeypatch.setattr("hcr_sync.db.datetime", ControlledDatetime)
+    monkeypatch.setattr("hcr_sync.spotify_sync.datetime", ControlledDatetime)
+    config = make_config(tmp_path, HCR_SPOTIFY_MATCH_THRESHOLD="0.90", HCR_SPOTIFY_TENTATIVE_ADD_THRESHOLD="0.85")
+    init_db(config)
+    config.music_dir.mkdir()
+    path = config.music_dir / "Example Artist - Amber Beacon Cedar Delta.mp3"
+    original_bytes = b"disposable synthetic audio\x00\x01"
+    path.write_bytes(original_bytes)
+    keep = [SpotifyTrack(uri=f"spotify:track:keep{i}", track_id=f"keep{i}", artist=f"Other {i}", title=f"Unrelated {i}") for i in range(3)]
+    spotify = FakeSpotify(snapshot_tracks=keep)
+    backfill_spotify(config, apply=True, client=spotify)
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Example Artist", title="Amber Beacon Cedar Delta", status="wanted")
+            track_id = track["id"]
+            upsert_youtube_asset(con, track_id=track_id, file_path=str(path), file_exists=True, match_confidence=1.0, status="downloaded")
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "1")
+    candidate = SpotifyTrack(uri="spotify:track:candidate", track_id="candidate", artist="Example Artist", title="Amber Beacon Cedar Delta" if mode == "confirmed" else "Amber Beacon Cedar")
+    spotify.search_tracks = [candidate]
+    clock[0] += timedelta(hours=1)
+    added = sync_spotify(config, apply=True, client=spotify)
+    assert spotify.added == [candidate.uri]
+    assert (added.added, added.tentative_added) == ((1, 0) if mode == "confirmed" else (1, 1))
+
+    def asset():
+        with connect(config) as con:
+            return dict(con.execute("SELECT * FROM spotify_assets WHERE track_id = ?", (track_id,)).fetchone())
+
+    initial = asset()
+    expected_confidence = 1.0 if mode == "confirmed" else 0.8625
+    assert initial["match_confidence"] == pytest.approx(expected_confidence)
+    if mode == "review-history":
+        # A later threshold change is not a confirmation of the existing review.
+        config.values["HCR_SPOTIFY_MATCH_THRESHOLD"] = "0.86"
+    observations = []
+    summaries = []
+    spotify.snapshot_tracks = keep + [candidate]
+    for _ in range(2):
+        clock[0] += timedelta(hours=1)
+        scan = scan_spotify_playlist(config, apply=True, client=spotify)
+        assert scan.linked == 4 and not scan.skipped
+        observations.append(asset())
+        summaries.append(reconcile(config, apply=True, spotify_client=spotify, spotify_snapshot=scan._snapshot))
+    spotify.snapshot_tracks = keep
+    dry_run = mode == "dry-run"
+    with connect(config) as con:
+        before_absence = list(con.iterdump())
+    missing = []
+    for _ in range(2):
+        clock[0] += timedelta(hours=1)
+        scan = scan_spotify_playlist(config, apply=not dry_run, client=spotify)
+        summaries.append(reconcile(config, apply=not dry_run, spotify_client=spotify, spotify_snapshot=scan._snapshot))
+        missing.append(asset())
+    # Finish the real sequence before checking provenance: baseline promotion must
+    # expose its downstream exclusion/file effects, not just an early mismatch.
+    with connect(config) as con:
+        parent = con.execute("SELECT status FROM tracks WHERE id = ?", (track_id,)).fetchone()["status"]
+        exclusions = con.execute("SELECT COUNT(*) FROM exclusions").fetchone()[0]
+        after_absence = list(con.iterdump())
+        remaining = con.execute("SELECT COUNT(*) FROM spotify_assets WHERE in_playlist = 1").fetchone()[0]
+    trace = {"observed": [(a["match_confidence"], a["status"]) for a in observations], "parent": parent, "exclusions": exclusions, "file_exists": path.exists(), "last_pass": vars(summaries[-1])}
+    assert all(not summary.refused for summary in summaries), trace
+    assert all(a["match_confidence"] == pytest.approx(expected_confidence) and a["status"] == initial["status"] for a in observations), trace
+    if dry_run:
+        assert before_absence == after_absence
+        assert all(any(action.reason == "spotify_removed" for action in summary.planned) for summary in summaries[-2:])
+    else:
+        assert summaries[-2].suspected_spotify == 1
+        assert missing[0]["suspected_missing_at"] is not None
+        assert missing[1]["suspected_missing_at"] is None
+        assert missing[1]["status"] == "removed" and not missing[1]["in_playlist"]
+        assert remaining == 3
+    if mode == "confirmed":
+        assert summaries[-1].excluded_spotify == 1
+        assert summaries[-1].local_trashed == 1
+        assert parent == "excluded" and exclusions == 1 and not path.exists()
+        assert [p.read_bytes() for p in config.trash_dir.rglob("*.mp3")] == [original_bytes]
+    else:
+        assert summaries[-1].tentative_spotify_removed == (0 if dry_run else 1)
+        assert parent == "wanted" and exclusions == 0
+        assert path.read_bytes() == original_bytes
+        assert not config.trash_dir.exists()
+        assert all(summary.local_trashed == 0 and summary.excluded_spotify == 0 for summary in summaries)
+    assert spotify.removed == []
+    if mode in {"tentative", "review-history"}:
+        clock[0] += timedelta(hours=1)
+        spotify.snapshot_tracks = keep + [candidate]
+        scan_spotify_playlist(config, apply=True, client=spotify)
+        reappeared = asset()
+        assert reappeared["in_playlist"] == 1 and reappeared["suspected_missing_at"] is None
+        assert reappeared["match_confidence"] == pytest.approx(0.8625)
+        assert reappeared["status"] == "review"
+
+
+@pytest.mark.parametrize("importer", [scan_spotify_playlist, backfill_spotify])
+@pytest.mark.parametrize("excluded", [False, True])
+@pytest.mark.parametrize("status,confidence,present,expected", [
+    ("review", 0.8625, True, "review"),
+    ("review", 0.95, True, "review"),
+    ("added", 0.95, True, "added"),
+    ("removed", 0.8625, False, "review"),
+    ("removed", 0.95, False, "added"),
+    ("removed", None, False, "review"),
+])
+def test_snapshot_preserves_provenance_and_updates_membership(tmp_path, importer, excluded, status, confidence, present, expected):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Example", title="Song", status="wanted")
+            upsert_spotify_asset(con, track_id=track["id"], playlist_id="playlist", spotify_track_id="candidate", spotify_track_uri="spotify:track:candidate", spotify_artist="Example", spotify_title="Song", in_playlist=present, match_confidence=confidence, status=status, added_at="2026-01-01T00:00:00Z", search_attempts=2, search_last_at="2026-01-01T00:00:00Z", search_next_at="2026-01-02T00:00:00Z", update_search=True)
+            con.execute("UPDATE spotify_assets SET suspected_missing_at = '2026-01-02T00:00:00Z', last_seen_at = '2026-01-01T00:00:00Z'")
+            if excluded:
+                mark_excluded(con, track_id=track["id"], source="manual", reason="synthetic exclusion")
+            tombstones = [dict(row) for row in con.execute("SELECT * FROM exclusions")]
+    spotify = FakeSpotify([SpotifyTrack(uri="spotify:track:candidate", track_id="candidate", artist="Example", title="Song - Original Mix")])
+    importer(config, apply=True, client=spotify)
+    with connect(config) as con:
+        row = con.execute("SELECT * FROM spotify_assets").fetchone()
+        assert row["match_confidence"] == confidence
+        assert row["status"] == expected
+        assert row["in_playlist"] == 1 and row["suspected_missing_at"] is None
+        assert row["last_seen_at"] != "2026-01-01T00:00:00Z"
+        assert row["spotify_title"] == "Song - Original Mix"
+        assert row["added_at"] == "2026-01-01T00:00:00Z"
+        assert row["search_attempts"] == 2 and row["search_next_at"] == "2026-01-02T00:00:00Z"
+        assert con.execute("SELECT status FROM tracks").fetchone()[0] == ("excluded" if excluded else "wanted")
+        assert [dict(row) for row in con.execute("SELECT * FROM exclusions")] == tombstones
+
+
+@pytest.mark.parametrize("importer", [scan_spotify_playlist, backfill_spotify])
+def test_snapshot_association_conflict_rolls_back_entire_snapshot(tmp_path, importer):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Example", title="Song", status="wanted")
+            upsert_spotify_asset(con, track_id=track["id"], playlist_id="playlist", spotify_track_id="original", spotify_track_uri="spotify:track:original", spotify_artist="Example", spotify_title="Song", in_playlist=False, match_confidence=0.8625, status="review")
+        before = list(con.iterdump())
+    spotify = FakeSpotify([
+        SpotifyTrack(uri="spotify:track:new", track_id="new", artist="New", title="Unrelated"),
+        SpotifyTrack(uri="spotify:track:conflict", track_id="conflict", artist="Example", title="Song"),
+    ])
+    with pytest.raises(RuntimeError, match="association conflict"):
+        importer(config, apply=True, client=spotify)
+    with connect(config) as con:
+        assert list(con.iterdump()) == before
+
+
+def test_snapshot_resolves_idless_existing_association_conservatively(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Example", title="Song", status="wanted")
+            upsert_spotify_asset(con, track_id=track["id"], playlist_id="playlist", in_playlist=False, match_confidence=None, status="review")
+    scan_spotify_playlist(config, apply=True, client=FakeSpotify([SpotifyTrack(uri="spotify:track:new", track_id="new", artist="Example", title="Song")]))
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM spotify_assets").fetchone()
+        assert asset["spotify_track_id"] == "new" and asset["in_playlist"] == 1
+        assert asset["match_confidence"] is None and asset["status"] == "review"
+
+
 def make_config(tmp_path: Path, **overrides: str) -> Config:
     values = dict(DEFAULTS)
     values.update(

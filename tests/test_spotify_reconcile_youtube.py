@@ -5,7 +5,17 @@ import json
 import pytest
 
 from hcr_sync.config import DEFAULTS, Config
-from hcr_sync.db import connect, ensure_track, init_db, mark_excluded, set_state, transaction, upsert_spotify_asset, upsert_youtube_asset
+from hcr_sync.db import (
+    connect,
+    ensure_track,
+    init_db,
+    mark_excluded,
+    set_state,
+    transaction,
+    upsert_spotify_asset,
+    upsert_spotify_playlist_recording,
+    upsert_youtube_asset,
+)
 from hcr_sync.reconcile import manual_exclude, reconcile
 from hcr_sync.spotify_sync import PlaylistSnapshot, SpotifyTrack, _spotify_search_queries, _spotify_track_from_playlist_item, backfill_spotify, scan_spotify_playlist, sync_spotify
 from hcr_sync.system import LegacyDownloaderActive, assert_legacy_downloader_safe
@@ -332,6 +342,74 @@ def test_spotify_backfill_and_sync_with_fake_client(tmp_path):
         assert payload["spotify_track_id"] == "2"
         assert payload["match_status"] == "added"
         assert payload["match_threshold"] == 0.9
+
+
+def test_spotify_sync_promotes_confident_candidate_over_inactive_search_candidate(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    client = FakeSpotify(
+        search_tracks=[
+            SpotifyTrack(
+                uri="spotify:track:candidate-b",
+                track_id="candidate-b",
+                artist="Artist",
+                title="Song",
+            )
+        ]
+    )
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Song", status="wanted")
+            upsert_spotify_asset(
+                con,
+                track_id=track["id"],
+                playlist_id="playlist",
+                spotify_track_uri="spotify:track:candidate-a",
+                spotify_track_id="candidate-a",
+                spotify_artist="Artist",
+                spotify_title="Song",
+                in_playlist=False,
+                match_confidence=0.55,
+                status="review",
+                search_attempts=1,
+                search_last_at="2026-01-01T00:00:00Z",
+                search_next_at="2026-01-01T00:00:00Z",
+                update_search=True,
+            )
+            # This inactive review row models the legacy migration of a
+            # failed-search candidate. It must not become a playlist owner.
+            upsert_spotify_playlist_recording(
+                con,
+                playlist_id="playlist",
+                spotify_track_id="candidate-a",
+                spotify_track_uri="spotify:track:candidate-a",
+                spotify_artist="Artist",
+                spotify_title="Song",
+                track_id=track["id"],
+                in_playlist=False,
+                status="review",
+            )
+
+    summary = sync_spotify(config, apply=True, client=client)
+
+    assert summary.added == 1
+    assert client.added == ["spotify:track:candidate-b"]
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM spotify_assets WHERE track_id = 1").fetchone()
+        stale = con.execute(
+            "SELECT * FROM spotify_playlist_recordings WHERE spotify_track_id = 'candidate-a'"
+        ).fetchone()
+        promoted = con.execute(
+            "SELECT * FROM spotify_playlist_recordings WHERE spotify_track_id = 'candidate-b'"
+        ).fetchone()
+        assert asset["spotify_track_id"] == "candidate-b"
+        assert asset["in_playlist"] == 1
+        assert asset["match_confidence"] == pytest.approx(1.0)
+        assert asset["status"] == "added"
+        assert stale["in_playlist"] == 0
+        assert promoted["track_id"] == asset["track_id"]
+        assert promoted["in_playlist"] == 1
+        assert promoted["status"] == "added"
 
 
 def test_spotify_scan_imports_playlist_addition_for_youtube_sync(tmp_path):

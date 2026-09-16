@@ -459,6 +459,35 @@ def _is_removed_tentative_asset(asset, match_threshold: float) -> bool:
     return score is not None and float(score) < match_threshold
 
 
+def _spotify_asset_has_primary_history(con, asset) -> bool:
+    """Return whether an inactive asset is an established playlist primary."""
+    if asset is None:
+        return False
+    if asset["in_playlist"]:
+        return True
+    # A prior add or removal is evidence that this was once a playlist
+    # recording. An inactive review candidate with no add timestamp is only a
+    # search result and must yield primary ownership to a later confident add.
+    if asset["added_at"] or asset["status"] in {"added", "missing", "removed"}:
+        return True
+    spotify_track_id = asset["spotify_track_id"] or ""
+    if not spotify_track_id:
+        return False
+    if not con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spotify_playlist_recordings'"
+    ).fetchone():
+        return False
+    recording = con.execute(
+        """
+        SELECT in_playlist, status
+          FROM spotify_playlist_recordings
+         WHERE playlist_id = ? AND spotify_track_id = ?
+        """,
+        (asset["playlist_id"], spotify_track_id),
+    ).fetchone()
+    return bool(recording and (recording["in_playlist"] or recording["status"] in {"added", "missing", "removed"}))
+
+
 def _suspected_local_delete_track_ids(con) -> set[int]:
     return {
         row["track_id"]
@@ -1383,7 +1412,12 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                     in_playlist=True,
                     status="added" if confident_match else "review",
                 )
-                if existing_asset is None or not existing_asset["spotify_track_id"] or existing_asset["spotify_track_id"] == best.track_id:
+                if (
+                    existing_asset is None
+                    or not existing_asset["spotify_track_id"]
+                    or existing_asset["spotify_track_id"] == best.track_id
+                    or not _spotify_asset_has_primary_history(con, existing_asset)
+                ):
                     upsert_spotify_asset(
                         con,
                         track_id=track["id"],

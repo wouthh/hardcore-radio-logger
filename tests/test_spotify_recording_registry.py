@@ -305,6 +305,50 @@ def test_dry_run_preserves_registry_database_bytes(tmp_path):
         assert list(con.iterdump()) == before_dump
 
 
+def test_reconcile_mass_removal_guard_uses_logical_snapshot_count(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    config.music_dir.mkdir()
+    many_recordings = [recording(f"many-{index:02d}") for index in range(20)]
+    missing_logical_tracks = [
+        recording(
+            f"missing-{index:02d}",
+            artist=f"Missing Artist {index}",
+            title="Song",
+            artist_ids=(f"missing-artist-id-{index}",),
+        )
+        for index in range(19)
+    ]
+    initial_snapshot = many_recordings + missing_logical_tracks
+    assert scan_spotify_playlist(config, apply=True, client=FakeSpotify(initial_snapshot)).linked == 39
+    with connect(config) as con:
+        with transaction(con):
+            set_state(con, "local_baseline_complete", "true")
+            set_state(con, "last_local_scan_count", "0")
+            set_state(con, "spotify_baseline_complete", "true")
+            # The old state stored physical provider rows. The guard must
+            # compare the current logical owner count with the registry's
+            # logical baseline rather than making 20 recordings look healthy.
+            set_state(con, "last_spotify_playlist_count", "39")
+            set_state(con, "last_spotify_scan_at", "2026-01-01T00:00:00Z")
+            con.execute(
+                "UPDATE spotify_playlist_recordings SET first_seen_at = '2026-01-01T00:00:00Z'"
+            )
+
+    summary = reconcile(config, apply=True, spotify_client=FakeSpotify(many_recordings))
+
+    assert summary.refused == [
+        "spotify: spotify playlist count is suspiciously low compared to DB playlist assets"
+    ]
+    assert summary.suspected_spotify == 0
+    assert summary.excluded_spotify == 0
+    with connect(config) as con:
+        assert con.execute("SELECT COUNT(*) FROM tracks WHERE status = 'excluded'").fetchone()[0] == 0
+        assert con.execute(
+            "SELECT COUNT(*) FROM spotify_playlist_recordings WHERE in_playlist = 1"
+        ).fetchone()[0] == 39
+
+
 def test_recording_migration_is_repeatable_and_transactional(tmp_path):
     path = tmp_path / "legacy.db"
     con = sqlite3.connect(path)

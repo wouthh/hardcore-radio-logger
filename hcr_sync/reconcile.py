@@ -20,11 +20,13 @@ from .db import (
 from .local_files import AUDIO_EXTENSIONS, audio_paths
 from .spotify_sync import (
     PlaylistSnapshot,
+    SpotifyAssociationConflict,
     SpotifyClientProtocol,
     SpotipyClient,
     _clear_spotify_rate_limit,
     _is_rate_limited,
     _remember_spotify_rate_limit,
+    _snapshot_association_plan,
     spotify_enabled,
 )
 
@@ -105,20 +107,45 @@ def _spotify_guard(config: Config, con, snapshot, *, missing_known_count: int, f
         ).fetchone()
         known_logical = known_row["count"]
     known = known_row["count"]
-    previous = int(get_state(con, "last_spotify_playlist_count", "0") or "0")
-    # A single logical song can now have several Spotify recordings. Compare
-    # safety ratios against logical membership when registry rows are present,
-    # so removing one recording does not look like a playlist-wide outage.
-    effective_previous = min(previous, known_logical) if known_logical else previous
-    if effective_previous and len(snapshot.tracks) < effective_previous * config.float("HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO"):
-        return "spotify playlist count is suspiciously low"
     if known and len(snapshot.tracks) == 0:
         return "spotify playlist snapshot is empty while DB has known playlist assets"
-    if known_logical and len(snapshot.tracks) < known_logical * config.float("HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO"):
-        return "spotify playlist count is suspiciously low compared to DB playlist assets"
+    if _spotify_recordings_table_exists(con):
+        try:
+            current_logical = _spotify_snapshot_logical_count(con, snapshot)
+        except SpotifyAssociationConflict:
+            return "spotify playlist snapshot associations could not be resolved safely"
+        # Registry rows describe the previous logical membership. Resolve the
+        # current snapshot with the same recording-aware planner before
+        # comparing the safety ratio; raw provider rows are not comparable
+        # when one logical track has several recordings.
+        if known_logical and current_logical < known_logical * config.float("HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO"):
+            return "spotify playlist count is suspiciously low compared to DB playlist assets"
+    else:
+        previous = int(get_state(con, "last_spotify_playlist_count", "0") or "0")
+        if previous and len(snapshot.tracks) < previous * config.float("HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO"):
+            return "spotify playlist count is suspiciously low"
+        if known and len(snapshot.tracks) < known * config.float("HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO"):
+            return "spotify playlist count is suspiciously low compared to DB playlist assets"
     if missing_known_count > config.int("HCR_RECONCILE_MAX_EXCLUSIONS") and not force_mass_delete:
         return "too many spotify exclusions would be detected without --force-mass-delete"
     return ""
+
+
+def _spotify_snapshot_logical_count(con, snapshot) -> int:
+    """Resolve a provider snapshot to logical owners for safety checks."""
+    resolutions = _snapshot_association_plan(con, snapshot)
+    owners_by_key = {
+        resolution.canonical_key: resolution.track_id
+        for resolution in resolutions
+        if resolution.track_id is not None
+    }
+    owners = set(owners_by_key.values())
+    unresolved_keys = {
+        resolution.canonical_key
+        for resolution in resolutions
+        if resolution.track_id is None and resolution.canonical_key not in owners_by_key
+    }
+    return len(owners) + len(unresolved_keys)
 
 
 def _is_recent_self_added_spotify_asset(asset, previous_scan_at: str) -> bool:

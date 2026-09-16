@@ -160,7 +160,7 @@ def test_snapshot_preserves_provenance_and_updates_membership(tmp_path, importer
 
 @pytest.mark.parametrize("importer", [scan_spotify_playlist, backfill_spotify])
 @pytest.mark.parametrize("apply", [False, True])
-def test_snapshot_association_conflict_rolls_back_entire_snapshot(tmp_path, importer, apply):
+def test_snapshot_records_ambiguous_recording_and_continues_other_tracks(tmp_path, importer, apply):
     config = make_config(tmp_path)
     init_db(config)
     with connect(config) as con:
@@ -173,11 +173,28 @@ def test_snapshot_association_conflict_rolls_back_entire_snapshot(tmp_path, impo
         SpotifyTrack(uri="spotify:track:new", track_id="new", artist="New", title="Unrelated"),
         SpotifyTrack(uri="spotify:track:conflict", track_id="conflict", artist="Example", title="Song"),
     ])
-    with pytest.raises(RuntimeError, match="association conflict"):
-        importer(config, apply=apply, client=spotify)
+    summary = importer(config, apply=apply, client=spotify)
+    if not apply:
+        assert summary.linked == 1 and summary.ambiguous == 1
+        with connect(config) as con:
+            assert list(con.iterdump()) == before
+        assert config.db_path.read_bytes() == database_bytes
+        return
+    assert summary.linked == 1 and summary.ambiguous == 1
     with connect(config) as con:
-        assert list(con.iterdump()) == before
-    assert config.db_path.read_bytes() == database_bytes
+        recording = con.execute(
+            "SELECT * FROM spotify_playlist_recordings WHERE spotify_track_id = 'conflict'"
+        ).fetchone()
+        original = con.execute(
+            "SELECT * FROM spotify_assets WHERE spotify_track_id = 'original'"
+        ).fetchone()
+        unrelated = con.execute(
+            "SELECT * FROM spotify_assets WHERE spotify_track_id = 'new'"
+        ).fetchone()
+        assert recording["track_id"] is None
+        assert recording["association_status"] == "ambiguous"
+        assert original["track_id"] == 1 and original["in_playlist"] == 0
+        assert unrelated is not None and unrelated["in_playlist"] == 1
 
 
 @pytest.mark.parametrize("importer", [scan_spotify_playlist, backfill_spotify])
@@ -188,8 +205,8 @@ def test_snapshot_dry_run_checks_new_associations_without_creating_database(tmp_
     assert importer(config, apply=False, client=spotify).linked == 1
     assert not config.db_path.exists()
     spotify.snapshot_tracks.append(SpotifyTrack(uri="spotify:track:second", track_id="second", artist="EXAMPLE", title="SONG"))
-    with pytest.raises(RuntimeError, match="association conflict"):
-        importer(config, apply=False, client=spotify)
+    summary = importer(config, apply=False, client=spotify)
+    assert summary.linked == 1 and summary.ambiguous == 1
     assert not config.db_path.exists()
 
 
@@ -947,6 +964,8 @@ def test_spotify_sync_reviews_candidate_track_id_linked_to_other_track_without_a
         assert rows[1]["spotify_track_id"] is None
         assert rows[1]["match_confidence"] == 0.0
         assert event is not None
+        event_payload = json.loads(event["payload_json"])
+        assert "spotify_artist" not in event_payload and "spotify_title" not in event_payload
 
     next_client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:same", track_id="same", artist="Artist", title="Title")])
     next_summary = sync_spotify(config, apply=True, client=next_client)

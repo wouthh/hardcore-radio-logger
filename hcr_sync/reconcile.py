@@ -86,16 +86,35 @@ def _spotify_guard(config: Config, con, snapshot, *, missing_known_count: int, f
         return "spotify playlist snapshot id is missing"
     if snapshot.tracks and not any(track.track_id for track in snapshot.tracks):
         return "spotify playlist snapshot has no usable track identities"
+    playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID")
+    if _spotify_recordings_table_exists(con):
+        known_row = con.execute(
+            """
+            SELECT COUNT(*) AS count,
+                   COUNT(DISTINCT track_id) AS logical_count
+              FROM spotify_playlist_recordings
+             WHERE playlist_id = ? AND in_playlist = 1
+            """,
+            (playlist_id,),
+        ).fetchone()
+        known_logical = known_row["logical_count"]
+    else:
+        known_row = con.execute(
+            "SELECT COUNT(*) AS count FROM spotify_assets WHERE playlist_id = ? AND in_playlist = 1",
+            (playlist_id,),
+        ).fetchone()
+        known_logical = known_row["count"]
+    known = known_row["count"]
     previous = int(get_state(con, "last_spotify_playlist_count", "0") or "0")
-    if previous and len(snapshot.tracks) < previous * config.float("HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO"):
+    # A single logical song can now have several Spotify recordings. Compare
+    # safety ratios against logical membership when registry rows are present,
+    # so removing one recording does not look like a playlist-wide outage.
+    effective_previous = min(previous, known_logical) if known_logical else previous
+    if effective_previous and len(snapshot.tracks) < effective_previous * config.float("HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO"):
         return "spotify playlist count is suspiciously low"
-    known = con.execute(
-        "SELECT COUNT(*) AS count FROM spotify_assets WHERE playlist_id = ? AND in_playlist = 1",
-        (config.get("HCR_SPOTIFY_PLAYLIST_ID"),),
-    ).fetchone()["count"]
     if known and len(snapshot.tracks) == 0:
         return "spotify playlist snapshot is empty while DB has known playlist assets"
-    if known and len(snapshot.tracks) < known * config.float("HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO"):
+    if known_logical and len(snapshot.tracks) < known_logical * config.float("HCR_RECONCILE_MIN_LOCAL_SCAN_RATIO"):
         return "spotify playlist count is suspiciously low compared to DB playlist assets"
     if missing_known_count > config.int("HCR_RECONCILE_MAX_EXCLUSIONS") and not force_mass_delete:
         return "too many spotify exclusions would be detected without --force-mass-delete"
@@ -109,11 +128,49 @@ def _is_recent_self_added_spotify_asset(asset, previous_scan_at: str) -> bool:
     return not previous_scan_at or added_at > previous_scan_at
 
 
+def _is_recent_self_added_spotify_recording(recording, previous_scan_at: str) -> bool:
+    first_seen_at = recording["first_seen_at"]
+    if not first_seen_at:
+        return False
+    return not previous_scan_at or first_seen_at > previous_scan_at
+
+
 def _is_tentative_spotify_asset(config: Config, asset) -> bool:
     if asset["status"] == "review":
         return True
     score = asset["match_confidence"]
     return score is not None and float(score) < config.float("HCR_SPOTIFY_MATCH_THRESHOLD")
+
+
+def _spotify_recordings_table_exists(con) -> bool:
+    return bool(
+        con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spotify_playlist_recordings'"
+        ).fetchone()
+    )
+
+
+def _active_spotify_recordings(con, *, playlist_id: str, track_id: int | None = None):
+    if not _spotify_recordings_table_exists(con):
+        return []
+    params: list[object] = [playlist_id]
+    where = "playlist_id = ? AND in_playlist = 1"
+    if track_id is not None:
+        where += " AND track_id = ?"
+        params.append(track_id)
+    return list(
+        con.execute(
+            f"SELECT * FROM spotify_playlist_recordings WHERE {where} ORDER BY id",
+            params,
+        )
+    )
+
+
+def _spotify_asset_for_track(con, *, playlist_id: str, track_id: int):
+    return con.execute(
+        "SELECT * FROM spotify_assets WHERE playlist_id = ? AND track_id = ?",
+        (playlist_id, track_id),
+    ).fetchone()
 
 
 def _path_is_inside(path: Path, directory: Path) -> bool:
@@ -191,7 +248,8 @@ def _cascade_local(con, config: Config, track_id: int, summary: ReconcileSummary
 
 def _cascade_spotify(con, config: Config, track_id: int, summary: ReconcileSummary, client: SpotifyClientProtocol | None) -> None:
     playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID")
-    rows = list(
+    recording_rows = _active_spotify_recordings(con, playlist_id=playlist_id, track_id=track_id)
+    rows = recording_rows or list(
         con.execute(
             "SELECT * FROM spotify_assets WHERE track_id = ? AND playlist_id = ? AND in_playlist = 1",
             (track_id, playlist_id),
@@ -214,23 +272,47 @@ def _cascade_spotify(con, config: Config, track_id: int, summary: ReconcileSumma
             )
         return
     if client and uris:
-        client.remove_tracks(playlist_id, uris)
-        summary.spotify_removed += len(uris)
+        unique_uris = list(dict.fromkeys(uris))
+        client.remove_tracks(playlist_id, unique_uris)
+        summary.spotify_removed += len(unique_uris)
     for row in rows:
-        con.execute(
-            """
-            UPDATE spotify_assets
-               SET in_playlist = 0, status = 'removed', updated_at = ?, suspected_missing_at = NULL
-             WHERE id = ?
-            """,
-            (now_utc(), row["id"]),
-        )
+        if recording_rows:
+            con.execute(
+                """
+                UPDATE spotify_playlist_recordings
+                   SET in_playlist = 0, status = 'removed', updated_at = ?, suspected_missing_at = NULL
+                 WHERE id = ?
+                """,
+                (now_utc(), row["id"]),
+            )
+        else:
+            con.execute(
+                """
+                UPDATE spotify_assets
+                   SET in_playlist = 0, status = 'removed', updated_at = ?, suspected_missing_at = NULL
+                 WHERE id = ?
+                """,
+                (now_utc(), row["id"]),
+            )
         add_event(
             con,
             track_id,
             "removed_from_spotify_due_to_exclusion",
             "reconcile",
-            {"playlist_id": playlist_id, "spotify_track_id": row["spotify_track_id"], "reason": "local/global exclusion cascade"},
+            {
+                "playlist_id": playlist_id,
+                "spotify_track_id": row["spotify_track_id"],
+                "reason": "local/global exclusion cascade",
+            },
+        )
+    if recording_rows:
+        con.execute(
+            """
+            UPDATE spotify_assets
+               SET in_playlist = 0, status = 'removed', updated_at = ?, suspected_missing_at = NULL
+             WHERE track_id = ? AND playlist_id = ?
+            """,
+            (now_utc(), track_id, playlist_id),
         )
 
 
@@ -245,8 +327,15 @@ def _cascade_excluded_spotify(con, config: Config, summary: ReconcileSummary, cl
              WHERE t.status = 'excluded'
                AND s.playlist_id = ?
                AND s.in_playlist = 1
+            UNION
+            SELECT DISTINCT t.id AS track_id
+              FROM tracks t
+              JOIN spotify_playlist_recordings r ON r.track_id = t.id
+             WHERE t.status = 'excluded'
+               AND r.playlist_id = ?
+               AND r.in_playlist = 1
             """,
-            (playlist_id,),
+            (playlist_id, playlist_id),
         )
     )
     for row in rows:
@@ -394,19 +483,34 @@ def reconcile(
                     if apply and _is_rate_limited(exc):
                         _remember_spotify_rate_limit(con, config, exc, event_source="reconcile")
                     summary.refused.append(f"spotify: playlist fetch failed: {exc}")
-            if snapshot is not None:
-                if apply:
-                    with transaction(con):
-                        _cascade_excluded_spotify(con, config, summary, spotify_client)
         if playlist_id:
             current_ids = {track.track_id for track in snapshot.tracks if track.track_id} if snapshot is not None else set()
-            known_spotify = list(
-                con.execute(
-                    "SELECT * FROM spotify_assets WHERE playlist_id = ? AND in_playlist = 1 AND spotify_track_id IS NOT NULL",
-                    (playlist_id,),
+            registry_available = _spotify_recordings_table_exists(con)
+            if registry_available:
+                known_spotify = list(
+                    con.execute(
+                        """
+                        SELECT * FROM spotify_playlist_recordings
+                         WHERE playlist_id = ? AND in_playlist = 1 AND spotify_track_id <> ''
+                         ORDER BY id
+                        """,
+                        (playlist_id,),
+                    )
                 )
+            else:
+                known_spotify = list(
+                    con.execute(
+                        "SELECT * FROM spotify_assets WHERE playlist_id = ? AND in_playlist = 1 AND spotify_track_id IS NOT NULL",
+                        (playlist_id,),
+                    )
+                )
+            missing_known_spotify_count = len(
+                {
+                    asset["track_id"]
+                    for asset in known_spotify
+                    if asset["spotify_track_id"] not in current_ids and asset["track_id"] is not None
+                }
             )
-            missing_known_spotify_count = sum(1 for asset in known_spotify if asset["spotify_track_id"] not in current_ids)
             spotify_refusal = _spotify_guard(
                 config,
                 con,
@@ -417,35 +521,64 @@ def reconcile(
             if spotify_refusal:
                 summary.refused.append(f"spotify: {spotify_refusal}")
             elif snapshot is not None:
+                if apply:
+                    with transaction(con):
+                        _cascade_excluded_spotify(con, config, summary, spotify_client)
                 previous_spotify_scan_at = get_state(con, "last_spotify_scan_at", "")
-                for asset in known_spotify:
-                    if asset["spotify_track_id"] in current_ids:
-                        if apply and asset["suspected_missing_at"]:
+                for recording in known_spotify:
+                    if recording["spotify_track_id"] in current_ids:
+                        if apply and (recording["suspected_missing_at"] or registry_available):
                             with transaction(con):
-                                con.execute(
-                                    "UPDATE spotify_assets SET suspected_missing_at = NULL, updated_at = ? WHERE id = ?",
-                                    (now_utc(), asset["id"]),
-                                )
-                                add_event(
+                                if recording["suspected_missing_at"]:
+                                    con.execute(
+                                        "UPDATE spotify_playlist_recordings SET suspected_missing_at = NULL, updated_at = ? WHERE id = ?",
+                                        (now_utc(), recording["id"]),
+                                    )
+                                    add_event(
+                                        con,
+                                        recording["track_id"],
+                                        "spotify_removal_suspicion_cleared",
+                                        "reconcile",
+                                        {"spotify_track_id": recording["spotify_track_id"]},
+                                        dedupe_key=f"spotify_removal_suspicion_cleared:{recording['track_id']}:{recording['id']}:{snapshot.snapshot_id}",
+                                    )
+                                asset = _spotify_asset_for_track(
                                     con,
-                                    asset["track_id"],
-                                    "spotify_removal_suspicion_cleared",
-                                    "reconcile",
-                                    {"spotify_track_id": asset["spotify_track_id"]},
-                                    dedupe_key=f"spotify_removal_suspicion_cleared:{asset['track_id']}:{asset['id']}:{snapshot.snapshot_id}",
+                                    playlist_id=playlist_id,
+                                    track_id=recording["track_id"],
                                 )
+                                if asset is not None and asset["suspected_missing_at"]:
+                                    con.execute(
+                                        "UPDATE spotify_assets SET suspected_missing_at = NULL, updated_at = ? WHERE id = ?",
+                                        (now_utc(), asset["id"]),
+                                    )
+                                    add_event(
+                                        con,
+                                        recording["track_id"],
+                                        "spotify_removal_suspicion_cleared",
+                                        "reconcile",
+                                        {"spotify_track_id": recording["spotify_track_id"]},
+                                        dedupe_key=f"spotify_asset_removal_suspicion_cleared:{recording['track_id']}:{asset['id']}:{snapshot.snapshot_id}",
+                                    )
                         continue
-                    if _is_recent_self_added_spotify_asset(asset, previous_spotify_scan_at):
+                    if (
+                        _is_recent_self_added_spotify_recording(recording, previous_spotify_scan_at)
+                        if registry_available
+                        else _is_recent_self_added_spotify_asset(recording, previous_spotify_scan_at)
+                    ):
                         continue
-                    summary.planned.append(PlannedAction(asset["track_id"], "spotify_removed", asset["spotify_track_id"]))
+                    summary.planned.append(
+                        PlannedAction(recording["track_id"], "spotify_removed", recording["spotify_track_id"])
+                    )
                     if not apply:
                         continue
                     with transaction(con):
+                        table = "spotify_playlist_recordings" if registry_available else "spotify_assets"
                         confirmed = _confirm_or_suspect(
                             con,
-                            table="spotify_assets",
-                            asset_id=asset["id"],
-                            track_id=asset["track_id"],
+                            table=table,
+                            asset_id=recording["id"],
+                            track_id=recording["track_id"],
                             event_type="suspected_spotify_remove",
                             source="spotify_removed",
                             require_two_passes=config.bool("HCR_RECONCILE_REQUIRE_TWO_PASSES"),
@@ -453,7 +586,60 @@ def reconcile(
                             apply=apply,
                         )
                         if not confirmed:
+                            if registry_available:
+                                other_active = _active_spotify_recordings(
+                                    con,
+                                    playlist_id=playlist_id,
+                                    track_id=recording["track_id"],
+                                )
+                                if len(other_active) == 1 and other_active[0]["id"] == recording["id"]:
+                                    con.execute(
+                                        "UPDATE spotify_assets SET suspected_missing_at = ?, updated_at = ? WHERE track_id = ? AND playlist_id = ?",
+                                        (now_utc(), now_utc(), recording["track_id"], playlist_id),
+                                    )
                             summary.suspected_spotify += 1
+                            continue
+                        if registry_available:
+                            con.execute(
+                                """
+                                UPDATE spotify_playlist_recordings
+                                   SET in_playlist = 0, status = 'removed', suspected_missing_at = NULL, updated_at = ?
+                                 WHERE id = ?
+                                """,
+                                (now_utc(), recording["id"]),
+                            )
+                            add_event(
+                                con,
+                                recording["track_id"],
+                                "spotify_recording_removed_by_user",
+                                "spotify_removed",
+                                {"spotify_track_id": recording["spotify_track_id"]},
+                                dedupe_key=f"spotify_recording_removed_by_user:{recording['track_id']}:{recording['id']}",
+                            )
+                            asset = _spotify_asset_for_track(
+                                con,
+                                playlist_id=playlist_id,
+                                track_id=recording["track_id"],
+                            )
+                            other_active = _active_spotify_recordings(
+                                con,
+                                playlist_id=playlist_id,
+                                track_id=recording["track_id"],
+                            )
+                            if other_active:
+                                # One recording disappearing does not change
+                                # the logical playlist membership or trigger a
+                                # tombstone while another recording remains.
+                                if asset is not None:
+                                    con.execute(
+                                        "UPDATE spotify_assets SET in_playlist = 1, suspected_missing_at = NULL, updated_at = ? WHERE id = ?",
+                                        (now_utc(), asset["id"]),
+                                    )
+                                continue
+                        else:
+                            asset = recording
+                            other_active = []
+                        if asset is None:
                             continue
                         if _is_tentative_spotify_asset(config, asset):
                             add_event(

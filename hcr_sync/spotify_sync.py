@@ -867,6 +867,11 @@ def _snapshot_association_plan(con, snapshot: PlaylistSnapshot) -> list[_Snapsho
                 raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
         if existing_track_id is not None:
             if known_owners and known_owners != {existing_track_id}:
+                known_owner_established = len(known_owners) == 1 and _spotify_track_has_established_history(
+                    con,
+                    playlist_id=snapshot.playlist_id,
+                    track_id=next(iter(known_owners)),
+                )
                 if (
                     len(known_owners) != 1
                     or _spotify_track_has_established_history(
@@ -874,6 +879,7 @@ def _snapshot_association_plan(con, snapshot: PlaylistSnapshot) -> list[_Snapsho
                         playlist_id=snapshot.playlist_id,
                         track_id=existing_track_id,
                     )
+                    or not known_owner_established
                 ):
                     raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
                 # A duplicate local canonical label is only a source row when

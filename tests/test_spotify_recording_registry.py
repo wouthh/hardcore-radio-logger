@@ -309,6 +309,49 @@ def test_dry_run_uses_provider_metadata_when_local_owner_title_differs(tmp_path)
         assert duplicate["status"] == "excluded"
 
 
+def test_unestablished_known_owner_does_not_override_canonical_duplicate(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            owner = ensure_track(con, artist="Drokz", title="The Mind", status="wanted")
+            ensure_track(
+                con,
+                artist="Drokz",
+                title="The Mind (Signs Of Life)",
+                status="wanted",
+            )
+            upsert_spotify_asset(
+                con,
+                track_id=owner["id"],
+                playlist_id="playlist",
+                spotify_track_id="tentative-recording",
+                spotify_track_uri="spotify:track:tentative-recording",
+                spotify_artist="Drokz",
+                spotify_title="The Mind (Signs Of Life)",
+                in_playlist=False,
+                match_confidence=0.0,
+                status="review",
+            )
+        before_bytes = config.db_path.read_bytes()
+
+    client = FakeSpotify(
+        [
+            recording(
+                "tentative-recording",
+                artist="Drokz",
+                title="The Mind (Signs Of Life)",
+                artist_ids=("drokz-id",),
+            )
+        ]
+    )
+    with pytest.raises(SpotifyAssociationConflict, match="^Spotify playlist snapshot association conflict$"):
+        scan_spotify_playlist(config, apply=False, client=client)
+
+    assert config.db_path.read_bytes() == before_bytes
+    assert client.removed == []
+
+
 def test_canonical_duplicate_with_established_history_stays_fail_closed(tmp_path):
     config = make_config(tmp_path)
     init_db(config)

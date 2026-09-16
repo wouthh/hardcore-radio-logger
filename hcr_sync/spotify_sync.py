@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import re
 import json
+import re
 import sqlite3
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
 
@@ -20,8 +20,16 @@ from .db import (
     set_state,
     transaction,
     upsert_spotify_asset,
+    upsert_spotify_playlist_recording,
 )
-from .identity import canonical_key, compact_text, duplicate_title_tokens, match_confidence
+from .identity import (
+    canonical_key,
+    compact_text,
+    duplicate_title_tokens,
+    likely_same_recording,
+    match_confidence,
+    normalize_for_match,
+)
 
 NON_TRACK_RE = re.compile(
     r"\b("
@@ -56,6 +64,10 @@ class SpotifyTrack:
     artist: str
     title: str
     duration_ms: int | None = None
+    artist_ids: tuple[str, ...] = ()
+    album: str = ""
+    isrc: str = ""
+    metadata_ambiguous: bool = False
 
 
 @dataclass(frozen=True)
@@ -112,7 +124,7 @@ class SpotipyClient:
                 playlist_id,
                 offset=offset,
                 limit=100,
-                fields="items(track(id,uri,name,duration_ms,artists(name),type),item(id,uri,name,duration_ms,artists(name),type)),next,total",
+                fields="items(track(id,uri,name,duration_ms,artists(id,name),album(name),external_ids(isrc),type),item(id,uri,name,duration_ms,artists(id,name),album(name),external_ids(isrc),type)),next,total",
             )
             items = page.get("items") or []
             for item in items:
@@ -147,6 +159,13 @@ class SpotipyClient:
                         artist=", ".join(str(artist.get("name") or "") for artist in artists),
                         title=name,
                         duration_ms=item.get("duration_ms"),
+                        artist_ids=tuple(
+                            str(artist.get("id") or "")
+                            for artist in artists
+                            if artist.get("id")
+                        ),
+                        album=str((item.get("album") or {}).get("name") or ""),
+                        isrc=str((item.get("external_ids") or {}).get("isrc") or ""),
                     )
                 )
         return tracks
@@ -176,6 +195,9 @@ def _spotify_track_from_playlist_item(item: dict) -> SpotifyTrack | None:
         artist=", ".join(str(artist.get("name") or "") for artist in artists),
         title=title,
         duration_ms=track.get("duration_ms"),
+        artist_ids=tuple(str(artist.get("id") or "") for artist in artists if artist.get("id")),
+        album=str((track.get("album") or {}).get("name") or ""),
+        isrc=str((track.get("external_ids") or {}).get("isrc") or ""),
     )
 
 
@@ -187,6 +209,7 @@ class SpotifySummary:
     tentative_added: int = 0
     review: int = 0
     skipped: int = 0
+    ambiguous: int = 0
     rate_limited: bool = False
     _snapshot: PlaylistSnapshot | None = None
     _client: SpotifyClientProtocol | None = None
@@ -436,6 +459,35 @@ def _is_removed_tentative_asset(asset, match_threshold: float) -> bool:
     return score is not None and float(score) < match_threshold
 
 
+def _spotify_asset_has_primary_history(con, asset) -> bool:
+    """Return whether an inactive asset is an established playlist primary."""
+    if asset is None:
+        return False
+    if asset["in_playlist"]:
+        return True
+    # A prior add or removal is evidence that this was once a playlist
+    # recording. An inactive review candidate with no add timestamp is only a
+    # search result and must yield primary ownership to a later confident add.
+    if asset["added_at"] or asset["status"] in {"added", "missing", "removed"}:
+        return True
+    spotify_track_id = asset["spotify_track_id"] or ""
+    if not spotify_track_id:
+        return False
+    if not con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spotify_playlist_recordings'"
+    ).fetchone():
+        return False
+    recording = con.execute(
+        """
+        SELECT in_playlist, status
+          FROM spotify_playlist_recordings
+         WHERE playlist_id = ? AND spotify_track_id = ?
+        """,
+        (asset["playlist_id"], spotify_track_id),
+    ).fetchone()
+    return bool(recording and (recording["in_playlist"] or recording["status"] in {"added", "missing", "removed"}))
+
+
 def _suspected_local_delete_track_ids(con) -> set[int]:
     return {
         row["track_id"]
@@ -462,7 +514,7 @@ def _spotify_candidate_conflict_track_ids(con) -> set[int]:
 def _spotify_candidate_used_by_other_track(con, *, playlist_id: str, track_id: int, spotify_track_id: str):
     if not spotify_track_id:
         return None
-    return con.execute(
+    asset = con.execute(
         """
         SELECT *
           FROM spotify_assets
@@ -473,6 +525,51 @@ def _spotify_candidate_used_by_other_track(con, *, playlist_id: str, track_id: i
         """,
         (playlist_id, spotify_track_id, track_id),
     ).fetchone()
+    if asset:
+        return asset
+    if con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spotify_playlist_recordings'"
+    ).fetchone():
+        return con.execute(
+            """
+            SELECT *
+             FROM spotify_playlist_recordings
+             WHERE playlist_id = ?
+               AND spotify_track_id = ?
+               AND (track_id IS NULL OR track_id != ?)
+             LIMIT 1
+            """,
+            (playlist_id, spotify_track_id, track_id),
+        ).fetchone()
+    return None
+
+
+def _track_has_ambiguous_spotify_recording(con, *, playlist_id: str, track) -> bool:
+    """Do not search/add a source row while its playlist recording is unresolved."""
+    if not con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spotify_playlist_recordings'"
+    ).fetchone():
+        return False
+    source_key = canonical_key(track["display_artist"], track["display_title"])
+    for row in con.execute(
+        """
+        SELECT spotify_artist, spotify_title
+          FROM spotify_playlist_recordings
+         WHERE playlist_id = ? AND in_playlist = 1
+           AND track_id IS NULL AND association_status = 'ambiguous'
+        """,
+        (playlist_id,),
+    ):
+        if canonical_key(row["spotify_artist"], row["spotify_title"]) == source_key:
+            return True
+        if likely_same_recording(
+            artist=track["display_artist"],
+            title=track["display_title"],
+            other_artist=row["spotify_artist"],
+            other_title=row["spotify_title"],
+        ):
+            return True
+    return False
 
 
 def _mark_spotify_candidate_conflict(
@@ -509,12 +606,10 @@ def _mark_spotify_candidate_conflict(
         "spotify_sync",
         {
             "spotify_track_id": candidate.track_id,
-            "spotify_artist": candidate.artist,
-            "spotify_title": candidate.title,
             "score": score,
             "existing_track_id": existing_asset["track_id"],
             "existing_asset_id": existing_asset["id"],
-            "reason": "candidate Spotify track is already linked to another DB track",
+            "reason": "candidate Spotify recording is already represented in the playlist registry",
         },
         dedupe_key=f"spotify_candidate_already_linked:{track['id']}:{candidate.track_id}:{existing_asset['id']}",
     )
@@ -524,35 +619,292 @@ class SpotifyAssociationConflict(RuntimeError):
     """A snapshot cannot safely replace an existing candidate association."""
 
 
-def _validate_snapshot_associations(con, snapshot: PlaylistSnapshot) -> None:
-    # Resolve the same two identities as the importer/upsert without creating
-    # tracks. Include assignments earlier in this snapshot, even on a fresh DB.
-    assignments = {}
-    spotify_keys = {}
+def _recording_artist_ids(value) -> frozenset[str]:
+    if isinstance(value, SpotifyTrack):
+        values = value.artist_ids
+    elif isinstance(value, (tuple, list, set, frozenset)):
+        values = value
+    else:
+        try:
+            values = json.loads(value or "[]")
+        except (TypeError, json.JSONDecodeError):
+            values = []
+    if not isinstance(values, (tuple, list, set, frozenset)):
+        return frozenset()
+    return frozenset(str(item) for item in values if str(item))
+
+
+def _recording_title_key(value) -> str:
+    title = value.title if isinstance(value, SpotifyTrack) else value["spotify_title"]
+    return normalize_for_match(title)
+
+
+def _owner_identity_key(track) -> str:
+    """Use the source title's generic version-free identity for owner checks."""
+    return canonical_key(track["display_artist"], _core_spotify_title(track["display_title"]))
+
+
+def _recording_identity_key(item: SpotifyTrack) -> str:
+    return canonical_key(item.artist, _core_spotify_title(item.title))
+
+
+def _recording_metadata_key(item: SpotifyTrack) -> tuple[object, ...]:
+    return (
+        str(item.uri or ""),
+        canonical_key(str(item.artist or ""), str(item.title or "")),
+        tuple(sorted(_recording_artist_ids(item))),
+        str(item.album or ""),
+        str(item.isrc or ""),
+        "" if item.duration_ms is None else str(item.duration_ms),
+    )
+
+
+def _snapshot_recordings(snapshot: PlaylistSnapshot) -> list[SpotifyTrack]:
+    """Return one deterministic item per recording, retaining ambiguity markers."""
+    by_id: dict[str, SpotifyTrack] = {}
+    for item in snapshot.tracks:
+        if not item.track_id or not item.uri or not item.title:
+            raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
+        previous = by_id.get(item.track_id)
+        if previous is None:
+            by_id[item.track_id] = item
+            continue
+        if _recording_metadata_key(previous) == _recording_metadata_key(item):
+            continue
+        # Keep one row so the snapshot remains processable, but make the
+        # recording ineligible for automatic association. Choose the stable
+        # lexical representation so response order cannot change diagnostics.
+        chosen = min((previous, item), key=_recording_metadata_key)
+        by_id[item.track_id] = replace(chosen, metadata_ambiguous=True)
+    return sorted(
+        by_id.values(),
+        key=lambda item: (canonical_key(item.artist, item.title), item.track_id, item.uri),
+    )
+
+
+@dataclass(frozen=True)
+class _SnapshotResolution:
+    item: SpotifyTrack
+    canonical_key: str
+    track_id: int | None = None
+    create_track: bool = False
+    ambiguous_reason: str = ""
+
+
+def _recording_anchor_matches(anchor, item: SpotifyTrack) -> bool:
+    anchor_ids = _recording_artist_ids(anchor)
+    candidate_ids = _recording_artist_ids(item)
+    return bool(anchor_ids and candidate_ids and anchor_ids == candidate_ids and _recording_title_key(anchor) == _recording_title_key(item))
+
+
+def _snapshot_association_plan(con, snapshot: PlaylistSnapshot) -> list[_SnapshotResolution]:
+    """Plan stable recording ownership before any apply-mode write."""
+    recordings = _snapshot_recordings(snapshot)
+    existing_tracks: dict[str, int] = {}
+    registry_rows: dict[str, object] = {}
+    asset_owners: dict[str, int] = {}
+    owner_identity: dict[int, str] = {}
+    owner_labels: dict[int, tuple[str, str]] = {}
+    anchors: dict[int, list[object]] = {}
+    primary_ids: dict[int, str] = {}
+    table_exists = False
     if con is not None:
-        for key, spotify_id in con.execute(
-            """SELECT t.canonical_key, a.spotify_track_id
-                 FROM spotify_assets a JOIN tracks t ON t.id = a.track_id
-                WHERE a.playlist_id = ?""",
+        existing_tracks = {
+            row["canonical_key"]: int(row["id"])
+            for row in con.execute("SELECT id, canonical_key FROM tracks")
+        }
+        owner_identity = {
+            int(row["id"]): _owner_identity_key(row)
+            for row in con.execute("SELECT id, display_artist, display_title FROM tracks")
+        }
+        owner_labels = {
+            int(row["id"]): (row["display_artist"], row["display_title"])
+            for row in con.execute("SELECT id, display_artist, display_title FROM tracks")
+        }
+        primary_ids = {
+            int(row["track_id"]): str(row["spotify_track_id"] or "")
+            for row in con.execute(
+                "SELECT track_id, spotify_track_id FROM spotify_assets WHERE playlist_id = ?",
+                (snapshot.playlist_id,),
+            )
+        }
+        table_exists = bool(
+            con.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spotify_playlist_recordings'"
+            ).fetchone()
+        )
+        if table_exists:
+            for row in con.execute(
+                """
+                SELECT * FROM spotify_playlist_recordings
+                 WHERE playlist_id = ? AND track_id IS NOT NULL
+                """,
+                (snapshot.playlist_id,),
+            ):
+                registry_rows[row["spotify_track_id"]] = row
+                if row["association_status"] == "linked" and _recording_artist_ids(row):
+                    anchors.setdefault(int(row["track_id"]), []).append(row)
+        for row in con.execute(
+            """
+            SELECT spotify_track_id, track_id, spotify_artist, spotify_title
+              FROM spotify_assets
+             WHERE playlist_id = ? AND spotify_track_id IS NOT NULL AND spotify_track_id <> ''
+            """,
             (snapshot.playlist_id,),
         ):
-            assignments[key] = spotify_id
-            if spotify_id:
-                spotify_keys[spotify_id] = key
-    for item in snapshot.tracks:
-        key = spotify_keys.get(item.track_id, canonical_key(item.artist, item.title))
-        previous_id = assignments.get(key)
-        if previous_id and previous_id != item.track_id:
+            asset_owners[row["spotify_track_id"]] = int(row["track_id"])
+
+    for track_id, rows in anchors.items():
+        primary_id = primary_ids.get(track_id, "")
+        rows.sort(key=lambda row: (0 if row["spotify_track_id"] == primary_id else 1, row["spotify_track_id"]))
+
+    grouped: dict[str, list[SpotifyTrack]] = {}
+    for item in recordings:
+        grouped.setdefault(canonical_key(item.artist, item.title), []).append(item)
+
+    resolutions: dict[str, _SnapshotResolution] = {}
+    ambiguous_reason = "ambiguous Spotify recording metadata"
+    for key, items in grouped.items():
+        known_owners = {
+            int(registry_rows[item.track_id]["track_id"])
+            for item in items
+            if item.track_id in registry_rows and registry_rows[item.track_id]["track_id"] is not None
+        }
+        known_owners.update(asset_owners[item.track_id] for item in items if item.track_id in asset_owners)
+        existing_track_id = existing_tracks.get(key)
+        for owner_id in known_owners:
+            owner_artist, owner_title = owner_labels.get(owner_id, ("", ""))
+            same_recording = owner_id in owner_labels and likely_same_recording(
+                artist=owner_artist,
+                title=owner_title,
+                other_artist=items[0].artist,
+                other_title=items[0].title,
+            )
+            if (
+                owner_id in owner_identity
+                and owner_identity[owner_id] != _recording_identity_key(items[0])
+                and not same_recording
+            ):
+                raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
+        if existing_track_id is not None:
+            if known_owners and known_owners != {existing_track_id}:
+                raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
+            target_track_id = next(iter(known_owners), existing_track_id)
+        elif len(known_owners) > 1:
             raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
-        assignments[key] = item.track_id
-        spotify_keys[item.track_id] = key
+        else:
+            target_track_id = next(iter(known_owners), None)
+
+        anchor_rows = list(anchors.get(target_track_id, [])) if target_track_id is not None else []
+        owner_items = {
+            item.track_id
+            for item in items
+            if item.track_id in registry_rows and registry_rows[item.track_id]["track_id"] == target_track_id
+        }
+        owner_items.update(item.track_id for item in items if asset_owners.get(item.track_id) == target_track_id)
+        anchor_rows.extend(
+            item
+            for item in items
+            if item.track_id in owner_items and _recording_artist_ids(item) and not item.metadata_ambiguous
+        )
+        def _anchor_sort_key(row):
+            if isinstance(row, SpotifyTrack):
+                return (0, row.track_id)
+            return (0 if row["spotify_track_id"] == primary_ids.get(target_track_id, "") else 1, row["spotify_track_id"])
+
+        anchor_rows.sort(key=_anchor_sort_key)
+        anchor_item = None
+        if target_track_id is not None and not anchor_rows and not primary_ids.get(target_track_id, ""):
+            # A track that predates the registry (or has an id-less legacy
+            # primary) still needs a deterministic first anchor. Once that
+            # anchor carries Spotify artist IDs, later recordings must satisfy
+            # the normal recording identity check before they are linked.
+            eligible = [item for item in items if _recording_artist_ids(item) and not item.metadata_ambiguous]
+            if eligible:
+                anchor_item = eligible[0]
+            elif len(items) == 1 and not items[0].metadata_ambiguous:
+                # Preserve the historical single-recording import for old
+                # fixtures/databases whose provider payload had no artist IDs.
+                anchor_item = items[0]
+            if anchor_item is not None:
+                anchor_rows = [anchor_item]
+        if target_track_id is None:
+            # A new logical track needs one deterministic anchor. Prefer a
+            # recording with a nonempty artist-ID set; otherwise retain the
+            # historical single-recording behaviour and leave extras under
+            # review because they cannot be distinguished safely.
+            eligible = [item for item in items if _recording_artist_ids(item) and not item.metadata_ambiguous]
+            anchor_item = (eligible or items[:1])[0] if items else None
+            if anchor_item is None:
+                continue
+            target_track_id = -1
+            anchor_rows = [anchor_item]
+            owner_items = set()
+        for item in items:
+            if item.metadata_ambiguous:
+                resolutions[item.track_id] = _SnapshotResolution(item, key, ambiguous_reason=ambiguous_reason)
+                continue
+            owned = item.track_id in owner_items
+            matches_anchor = (
+                owned
+                or (anchor_item is not None and item.track_id == anchor_item.track_id)
+                or any(_recording_anchor_matches(anchor, item) for anchor in anchor_rows)
+            )
+            if target_track_id == -1:
+                if item.track_id == anchor_item.track_id:
+                    resolutions[item.track_id] = _SnapshotResolution(item, key, create_track=True)
+                elif matches_anchor:
+                    resolutions[item.track_id] = _SnapshotResolution(item, key)
+                else:
+                    resolutions[item.track_id] = _SnapshotResolution(item, key, ambiguous_reason=ambiguous_reason)
+            elif matches_anchor:
+                resolutions[item.track_id] = _SnapshotResolution(item, key, track_id=target_track_id)
+            else:
+                resolutions[item.track_id] = _SnapshotResolution(item, key, ambiguous_reason=ambiguous_reason)
+    return [resolutions[item.track_id] for item in recordings]
+
+
+def _validate_snapshot_associations(con, snapshot: PlaylistSnapshot) -> None:
+    """Validate the same ownership plan used by apply-mode imports."""
+    _snapshot_association_plan(con, snapshot)
 
 
 def _validate_playlist_snapshot(snapshot: PlaylistSnapshot) -> None:
     if not snapshot.complete or not snapshot.snapshot_id:
         raise RuntimeError("Spotify playlist snapshot was incomplete")
-    if snapshot.tracks and not any(track.track_id for track in snapshot.tracks):
-        raise RuntimeError("Spotify playlist snapshot had no usable track identities")
+    if snapshot.tracks:
+        if not any(track.track_id for track in snapshot.tracks):
+            raise RuntimeError("Spotify playlist snapshot had no usable track identities")
+        _snapshot_recordings(snapshot)
+
+
+def _spotify_presence_status(config: Config, asset, con=None) -> str:
+    if asset is None:
+        return "added"
+    if con is not None and asset["status"] == "removed":
+        if con.execute(
+            "SELECT 1 FROM events WHERE event_type = 'spotify_tentative_removed_by_user' AND dedupe_key = ?",
+            (f"spotify_tentative_removed_by_user:{asset['track_id']}:{asset['id']}",),
+        ).fetchone():
+            return "review"
+    confidence = asset["match_confidence"]
+    if (
+        asset["status"] == "review"
+        or confidence is None
+        or (
+            asset["status"] != "added"
+            and confidence < config.float("HCR_SPOTIFY_MATCH_THRESHOLD")
+        )
+    ):
+        return "review"
+    return "added"
+
+
+def _spotify_asset_for_recording_owner(con, *, playlist_id: str, track_id: int):
+    return con.execute(
+        "SELECT * FROM spotify_assets WHERE playlist_id = ? AND track_id = ?",
+        (playlist_id, track_id),
+    ).fetchone()
 
 
 def _import_playlist_snapshot(
@@ -565,62 +917,185 @@ def _import_playlist_snapshot(
 ) -> SpotifySummary:
     summary = SpotifySummary()
     summary.seen = len(snapshot.tracks)
+    recordings = _snapshot_recordings(snapshot)
     if not apply:
         if config.db_path.exists():
             # The normal DB connector performs migrations. Preview validation
             # must neither migrate nor create the configured database.
             with closing(sqlite3.connect(config.db_path.resolve().as_uri() + "?mode=ro", uri=True)) as con:
-                _validate_snapshot_associations(con, snapshot)
+                con.row_factory = sqlite3.Row
+                resolutions = _snapshot_association_plan(con, snapshot)
         else:
-            _validate_snapshot_associations(None, snapshot)
-        summary.linked = len(snapshot.tracks)
+            resolutions = _snapshot_association_plan(None, snapshot)
+        summary.linked = sum(1 for resolution in resolutions if not resolution.ambiguous_reason)
+        summary.ambiguous = len(resolutions) - summary.linked
         return summary
     with connect(config) as con:
         with transaction(con):
-            _validate_snapshot_associations(con, snapshot)
-            for item in snapshot.tracks:
-                existing_asset = con.execute(
-                    "SELECT * FROM spotify_assets WHERE playlist_id = ? AND spotify_track_id = ?",
+            resolutions = _snapshot_association_plan(con, snapshot)
+            created_tracks: dict[str, int] = {}
+            for resolution in resolutions:
+                item = resolution.item
+                existing_recording = con.execute(
+                    """
+                    SELECT * FROM spotify_playlist_recordings
+                     WHERE playlist_id = ? AND spotify_track_id = ?
+                    """,
                     (snapshot.playlist_id, item.track_id),
                 ).fetchone()
-                if existing_asset:
-                    track = con.execute("SELECT * FROM tracks WHERE id = ?", (existing_asset["track_id"],)).fetchone()
-                else:
+                if resolution.ambiguous_reason and resolution.track_id is None:
+                    if existing_recording is not None and existing_recording["track_id"] is not None:
+                        # A duplicate provider row may disagree with itself,
+                        # but it must never overwrite an already-owned
+                        # recording's metadata or association. Record only
+                        # presence and a redacted diagnostic.
+                        con.execute(
+                            """
+                            UPDATE spotify_playlist_recordings
+                               SET in_playlist = 1,
+                                   status = CASE WHEN status = 'review' THEN 'review' ELSE 'added' END,
+                                   last_seen_at = ?, suspected_missing_at = NULL, updated_at = ?
+                             WHERE id = ?
+                            """,
+                            (now_utc(), now_utc(), existing_recording["id"]),
+                        )
+                        asset = _spotify_asset_for_recording_owner(
+                            con,
+                            playlist_id=snapshot.playlist_id,
+                            track_id=existing_recording["track_id"],
+                        )
+                        if asset is not None:
+                            upsert_spotify_asset(
+                                con,
+                                track_id=asset["track_id"],
+                                playlist_id=snapshot.playlist_id,
+                                in_playlist=True,
+                                match_confidence=asset["match_confidence"],
+                                status=_spotify_presence_status(config, asset, con),
+                            )
+                        add_event(
+                            con,
+                            existing_recording["track_id"],
+                            "ambiguous_spotify_recording",
+                            event_source,
+                            {"spotify_track_id": item.track_id, "reason": resolution.ambiguous_reason},
+                            dedupe_key=f"ambiguous_spotify_recording:{snapshot.playlist_id}:{item.track_id}:{resolution.ambiguous_reason}",
+                        )
+                        summary.ambiguous += 1
+                        continue
+                    upsert_spotify_playlist_recording(
+                        con,
+                        playlist_id=snapshot.playlist_id,
+                        spotify_track_id=item.track_id,
+                        spotify_track_uri=item.uri,
+                        spotify_artist=item.artist,
+                        spotify_title=item.title,
+                        artist_ids=item.artist_ids,
+                        album=item.album,
+                        isrc=item.isrc,
+                        duration_ms=item.duration_ms,
+                        track_id=None,
+                        in_playlist=True,
+                        status="review",
+                        association_status="ambiguous",
+                        association_reason=resolution.ambiguous_reason,
+                    )
+                    add_event(
+                        con,
+                        None,
+                        "ambiguous_spotify_recording",
+                        event_source,
+                        {
+                            "spotify_track_id": item.track_id,
+                            "reason": resolution.ambiguous_reason,
+                        },
+                        dedupe_key=f"ambiguous_spotify_recording:{snapshot.playlist_id}:{item.track_id}:{resolution.ambiguous_reason}",
+                    )
+                    summary.ambiguous += 1
+                    continue
+                track_id = resolution.track_id
+                if track_id is None:
+                    track_id = created_tracks.get(resolution.canonical_key)
+                if track_id is None and resolution.create_track:
                     track = ensure_track(con, artist=item.artist, title=item.title, status="wanted")
-                    # The upsert also resolves by track/playlist. Do not overwrite
-                    # another candidate or transfer its evidence to a new ID.
-                    existing_asset = con.execute(
-                        "SELECT * FROM spotify_assets WHERE track_id = ? AND playlist_id = ?",
-                        (track["id"], snapshot.playlist_id),
-                    ).fetchone()
-                # Presence establishes membership, not the correctness of an
-                # existing match. Restore membership using retained provenance.
-                confidence = existing_asset["match_confidence"] if existing_asset else 1.0
-                tentative = existing_asset is not None and (
-                    existing_asset["status"] == "review"
-                    or confidence is None
-                    or (existing_asset["status"] != "added" and confidence < config.float("HCR_SPOTIFY_MATCH_THRESHOLD"))
-                )
-                if existing_asset is not None and existing_asset["status"] == "removed" and not tentative:
-                    # Removal replaces status='review'. Its existing event keeps
-                    # that evidence even if the configured threshold later falls.
-                    tentative = con.execute(
-                        "SELECT 1 FROM events WHERE event_type = 'spotify_tentative_removed_by_user' AND dedupe_key = ?",
-                        (f"spotify_tentative_removed_by_user:{track['id']}:{existing_asset['id']}",),
-                    ).fetchone() is not None
-                upsert_spotify_asset(
+                    track_id = int(track["id"])
+                    created_tracks[resolution.canonical_key] = track_id
+                if track_id is None:
+                    # A matching secondary appeared before its new anchor only
+                    # if the snapshot was malformed; keep the refusal generic.
+                    raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
+                track = con.execute("SELECT * FROM tracks WHERE id = ?", (track_id,)).fetchone()
+                if track is None:
+                    raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
+                existing_asset = con.execute(
+                    "SELECT * FROM spotify_assets WHERE track_id = ? AND playlist_id = ?",
+                    (track["id"], snapshot.playlist_id),
+                ).fetchone()
+                existing_recording_status = existing_recording["status"] if existing_recording is not None else None
+                upsert_spotify_playlist_recording(
                     con,
-                    track_id=track["id"],
                     playlist_id=snapshot.playlist_id,
-                    spotify_track_uri=item.uri,
                     spotify_track_id=item.track_id,
+                    spotify_track_uri=item.uri,
                     spotify_artist=item.artist,
                     spotify_title=item.title,
+                    artist_ids=item.artist_ids,
+                    album=item.album,
+                    isrc=item.isrc,
+                    duration_ms=item.duration_ms,
+                    track_id=track["id"],
                     in_playlist=True,
-                    match_confidence=confidence,
-                    status="review" if tentative else "added",
-                    added_at=None,
+                    status="review" if existing_recording_status == "review" else "added",
+                    association_status="linked",
+                    association_reason=resolution.ambiguous_reason,
                 )
+                if existing_asset is None:
+                    # A new logical track gets a deterministic primary: the
+                    # recordings list is sorted by canonical identity and ID.
+                    upsert_spotify_asset(
+                        con,
+                        track_id=track["id"],
+                        playlist_id=snapshot.playlist_id,
+                        spotify_track_uri=item.uri,
+                        spotify_track_id=item.track_id,
+                        spotify_artist=item.artist,
+                        spotify_title=item.title,
+                        in_playlist=True,
+                        match_confidence=1.0,
+                        status="added",
+                        added_at=None,
+                    )
+                elif not existing_asset["spotify_track_id"] or existing_asset["spotify_track_id"] == item.track_id:
+                    # This is the primary recording (or a legacy id-less
+                    # association). Refresh provider metadata while retaining
+                    # its stored confidence, classification, and timestamps.
+                    upsert_spotify_asset(
+                        con,
+                        track_id=track["id"],
+                        playlist_id=snapshot.playlist_id,
+                        spotify_track_uri=item.uri,
+                        spotify_track_id=item.track_id,
+                        spotify_artist=item.artist,
+                        spotify_title=item.title,
+                        in_playlist=True,
+                        match_confidence=existing_asset["match_confidence"],
+                        status=_spotify_presence_status(config, existing_asset, con),
+                        added_at=None,
+                    )
+                else:
+                    # A secondary recording establishes logical membership but
+                    # must never replace the primary's provenance.
+                    con.execute(
+                        """
+                        UPDATE spotify_assets
+                           SET in_playlist = 1,
+                               status = ?,
+                               suspected_missing_at = NULL,
+                               updated_at = ?
+                         WHERE id = ?
+                        """,
+                        (_spotify_presence_status(config, existing_asset, con), now_utc(), existing_asset["id"]),
+                    )
                 if track["status"] == "excluded":
                     add_event(
                         con,
@@ -760,6 +1235,9 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
             if track["id"] in existing:
                 summary.skipped += 1
                 continue
+            if _track_has_ambiguous_spotify_recording(con, playlist_id=playlist_id, track=track):
+                summary.review += 1
+                continue
             if track["id"] in removed_tentative_ids:
                 summary.review += 1
                 continue
@@ -857,8 +1335,6 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                                 "reason": "below tentative threshold or not found",
                                 "score": best_score,
                                 "spotify_track_id": best.track_id if best else "",
-                                "spotify_artist": best.artist if best else "",
-                                "spotify_title": best.title if best else "",
                                 "match_threshold": threshold,
                                 "tentative_threshold": tentative_threshold,
                                 "add_review_matches": add_review_matches,
@@ -917,23 +1393,61 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                     client.remove_tracks(playlist_id, [best.uri])
                     summary.skipped += 1
                     continue
-                upsert_spotify_asset(
+                existing_asset = con.execute(
+                    "SELECT * FROM spotify_assets WHERE track_id = ? AND playlist_id = ?",
+                    (track["id"], playlist_id),
+                ).fetchone()
+                upsert_spotify_playlist_recording(
                     con,
-                    track_id=track["id"],
                     playlist_id=playlist_id,
-                    spotify_track_uri=best.uri,
                     spotify_track_id=best.track_id,
+                    spotify_track_uri=best.uri,
                     spotify_artist=best.artist,
                     spotify_title=best.title,
+                    artist_ids=best.artist_ids,
+                    album=best.album,
+                    isrc=best.isrc,
+                    duration_ms=best.duration_ms,
+                    track_id=track["id"],
                     in_playlist=True,
-                    match_confidence=best_score,
                     status="added" if confident_match else "review",
-                    added_at=now_utc(),
-                    search_last_at=searched_at,
-                    search_attempts=0,
-                    search_next_at=None,
-                    update_search=True,
                 )
+                if (
+                    existing_asset is None
+                    or not existing_asset["spotify_track_id"]
+                    or existing_asset["spotify_track_id"] == best.track_id
+                    or not _spotify_asset_has_primary_history(con, existing_asset)
+                ):
+                    upsert_spotify_asset(
+                        con,
+                        track_id=track["id"],
+                        playlist_id=playlist_id,
+                        spotify_track_uri=best.uri,
+                        spotify_track_id=best.track_id,
+                        spotify_artist=best.artist,
+                        spotify_title=best.title,
+                        in_playlist=True,
+                        match_confidence=best_score,
+                        status="added" if confident_match else "review",
+                        added_at=now_utc(),
+                        search_last_at=searched_at,
+                        search_attempts=0,
+                        search_next_at=None,
+                        update_search=True,
+                    )
+                else:
+                    # Keep the established primary recording and its
+                    # provenance. The newly added recording lives in the
+                    # registry and establishes membership for the logical
+                    # track.
+                    con.execute(
+                        """
+                        UPDATE spotify_assets
+                           SET in_playlist = 1, updated_at = ?, suspected_missing_at = NULL
+                         WHERE id = ?
+                        """,
+                        (now_utc(), existing_asset["id"]),
+                    )
                 event_type = "spotify_added" if confident_match else "spotify_tentatively_added"
                 add_event(
                     con,

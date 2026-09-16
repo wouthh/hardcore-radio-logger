@@ -96,6 +96,30 @@ CREATE TABLE IF NOT EXISTS spotify_assets (
     UNIQUE(playlist_id, spotify_track_id)
 );
 
+CREATE TABLE IF NOT EXISTS spotify_playlist_recordings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    playlist_id TEXT NOT NULL,
+    spotify_track_id TEXT NOT NULL,
+    spotify_track_uri TEXT NOT NULL DEFAULT '',
+    spotify_artist TEXT NOT NULL DEFAULT '',
+    spotify_title TEXT NOT NULL DEFAULT '',
+    spotify_artist_ids TEXT NOT NULL DEFAULT '[]',
+    spotify_album TEXT NOT NULL DEFAULT '',
+    spotify_isrc TEXT NOT NULL DEFAULT '',
+    duration_ms INTEGER,
+    track_id INTEGER REFERENCES tracks(id) ON DELETE RESTRICT,
+    in_playlist INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL CHECK (status IN ('added', 'missing', 'removed', 'error', 'review')),
+    association_status TEXT NOT NULL DEFAULT 'linked' CHECK (association_status IN ('linked', 'ambiguous')),
+    association_reason TEXT NOT NULL DEFAULT '',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    suspected_missing_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(playlist_id, spotify_track_id)
+);
+
 CREATE TABLE IF NOT EXISTS exclusions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE RESTRICT,
@@ -128,6 +152,8 @@ CREATE INDEX IF NOT EXISTS idx_youtube_file_exists ON youtube_assets(file_exists
 CREATE INDEX IF NOT EXISTS idx_spotify_track ON spotify_assets(track_id);
 CREATE INDEX IF NOT EXISTS idx_spotify_playlist ON spotify_assets(playlist_id, in_playlist);
 CREATE INDEX IF NOT EXISTS idx_spotify_search_schedule ON spotify_assets(playlist_id, in_playlist, search_next_at, search_last_at);
+CREATE INDEX IF NOT EXISTS idx_spotify_recordings_track ON spotify_playlist_recordings(track_id, in_playlist);
+CREATE INDEX IF NOT EXISTS idx_spotify_recordings_playlist ON spotify_playlist_recordings(playlist_id, in_playlist);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 """
 
@@ -141,7 +167,10 @@ def _table_exists(con: sqlite3.Connection, table: str) -> bool:
 
 
 def _table_columns(con: sqlite3.Connection, table: str) -> set[str]:
-    return {row["name"] for row in con.execute(f"PRAGMA table_info({table})")}
+    return {
+        row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        for row in con.execute(f"PRAGMA table_info({table})")
+    }
 
 
 def migrate_db(con: sqlite3.Connection) -> None:
@@ -161,6 +190,12 @@ def migrate_db(con: sqlite3.Connection) -> None:
             columns.add(column)
             added_search_columns = True
 
+    recordings_table_exists = _table_exists(con, "spotify_playlist_recordings")
+    recordings_migration_applied = bool(
+        recordings_table_exists
+        and _table_exists(con, "schema_migrations")
+        and con.execute("SELECT 1 FROM schema_migrations WHERE version = 3").fetchone()
+    )
     con.execute(
         "CREATE INDEX IF NOT EXISTS idx_spotify_search_schedule "
         "ON spotify_assets(playlist_id, in_playlist, search_next_at, search_last_at)"
@@ -183,6 +218,119 @@ def migrate_db(con: sqlite3.Connection) -> None:
         con.execute(
             "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
             (2, now_utc()),
+        )
+
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS spotify_playlist_recordings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            playlist_id TEXT NOT NULL,
+            spotify_track_id TEXT NOT NULL,
+            spotify_track_uri TEXT NOT NULL DEFAULT '',
+            spotify_artist TEXT NOT NULL DEFAULT '',
+            spotify_title TEXT NOT NULL DEFAULT '',
+            spotify_artist_ids TEXT NOT NULL DEFAULT '[]',
+            spotify_album TEXT NOT NULL DEFAULT '',
+            spotify_isrc TEXT NOT NULL DEFAULT '',
+            duration_ms INTEGER,
+            track_id INTEGER REFERENCES tracks(id) ON DELETE RESTRICT,
+            in_playlist INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL CHECK (status IN ('added', 'missing', 'removed', 'error', 'review')),
+            association_status TEXT NOT NULL DEFAULT 'linked' CHECK (association_status IN ('linked', 'ambiguous')),
+            association_reason TEXT NOT NULL DEFAULT '',
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            suspected_missing_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(playlist_id, spotify_track_id)
+        )
+        """
+    )
+    # A development snapshot may have created the registry before the final
+    # metadata columns landed. Add those columns in place before the
+    # idempotent backfill; SQLite permits these additive defaults without
+    # rewriting existing rows.
+    recording_columns = _table_columns(con, "spotify_playlist_recordings")
+    recording_additions = (
+        ("spotify_track_uri", "TEXT NOT NULL DEFAULT ''"),
+        ("spotify_artist", "TEXT NOT NULL DEFAULT ''"),
+        ("spotify_title", "TEXT NOT NULL DEFAULT ''"),
+        ("spotify_artist_ids", "TEXT NOT NULL DEFAULT '[]'"),
+        ("spotify_album", "TEXT NOT NULL DEFAULT ''"),
+        ("spotify_isrc", "TEXT NOT NULL DEFAULT ''"),
+        ("duration_ms", "INTEGER"),
+        ("association_status", "TEXT NOT NULL DEFAULT 'linked'"),
+        ("association_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("suspected_missing_at", "TEXT"),
+    )
+    if recordings_table_exists:
+        for column, definition in recording_additions:
+            if column not in recording_columns:
+                con.execute(f"ALTER TABLE spotify_playlist_recordings ADD COLUMN {column} {definition}")
+                recording_columns.add(column)
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_spotify_recordings_track "
+        "ON spotify_playlist_recordings(track_id, in_playlist)"
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_spotify_recordings_playlist "
+        "ON spotify_playlist_recordings(playlist_id, in_playlist)"
+    )
+    # Legacy spotify_assets represented the only known recording for a
+    # logical track. Preserve that history before new snapshot imports can
+    # add more recordings. The NOT EXISTS guard keeps the migration
+    # repeatable without advancing SQLite's AUTOINCREMENT sequence on
+    # no-op runs, while leaving existing primary provenance alone. Once the
+    # migration marker exists, only active legacy rows are eligible: an
+    # inactive row may be a search candidate rather than a playlist recording.
+    legacy_row_filter = "" if not recordings_migration_applied else "AND a.in_playlist = 1"
+    migration_now = now_utc()
+    con.execute(
+        f"""
+            INSERT INTO spotify_playlist_recordings(
+                playlist_id, spotify_track_id, spotify_track_uri, spotify_artist,
+                spotify_title, track_id, in_playlist, status, association_status,
+                association_reason, first_seen_at, last_seen_at,
+                suspected_missing_at, created_at, updated_at
+            )
+            SELECT
+                a.playlist_id,
+                a.spotify_track_id,
+                COALESCE(a.spotify_track_uri, ''),
+                COALESCE(a.spotify_artist, ''),
+                COALESCE(a.spotify_title, ''),
+                a.track_id,
+                a.in_playlist,
+                CASE
+                    WHEN a.in_playlist = 1 AND a.status = 'review' THEN 'review'
+                    WHEN a.in_playlist = 1 THEN 'added'
+                    ELSE a.status
+                END,
+                'linked',
+                '',
+                COALESCE(a.added_at, a.last_seen_at, a.created_at, ?),
+                COALESCE(a.last_seen_at, a.added_at, a.created_at, ?),
+                a.suspected_missing_at,
+                COALESCE(a.created_at, ?),
+                COALESCE(a.updated_at, a.created_at, ?)
+              FROM spotify_assets a
+             WHERE a.spotify_track_id IS NOT NULL
+               AND a.spotify_track_id <> ''
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM spotify_playlist_recordings r
+                    WHERE r.playlist_id = a.playlist_id
+                      AND r.spotify_track_id = a.spotify_track_id
+               )
+               {legacy_row_filter}
+            """,
+            (migration_now, migration_now, migration_now, migration_now),
+        )
+    if not recordings_migration_applied and _table_exists(con, "schema_migrations"):
+        con.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            (3, now_utc()),
         )
 
 
@@ -546,7 +694,21 @@ def upsert_spotify_asset(
                 existing["id"],
             ),
         )
-        return con.execute("SELECT * FROM spotify_assets WHERE id = ?", (existing["id"],)).fetchone()
+        row = con.execute("SELECT * FROM spotify_assets WHERE id = ?", (existing["id"],)).fetchone()
+        if in_playlist and spotify_track_id and _table_exists(con, "spotify_playlist_recordings"):
+            upsert_spotify_playlist_recording(
+                con,
+                playlist_id=playlist_id,
+                spotify_track_id=spotify_track_id,
+                spotify_track_uri=spotify_track_uri,
+                spotify_artist=spotify_artist,
+                spotify_title=spotify_title,
+                track_id=track_id,
+                in_playlist=True,
+                status="review" if status == "review" else "added",
+                first_seen_at=added_at or row["added_at"] or row["created_at"],
+            )
+        return row
     con.execute(
         """
         INSERT INTO spotify_assets (
@@ -574,7 +736,149 @@ def upsert_spotify_asset(
             now,
         ),
     )
-    return con.execute("SELECT * FROM spotify_assets WHERE id = last_insert_rowid()").fetchone()
+    row = con.execute("SELECT * FROM spotify_assets WHERE id = last_insert_rowid()").fetchone()
+    if in_playlist and spotify_track_id and _table_exists(con, "spotify_playlist_recordings"):
+        upsert_spotify_playlist_recording(
+            con,
+            playlist_id=playlist_id,
+            spotify_track_id=spotify_track_id,
+            spotify_track_uri=spotify_track_uri,
+            spotify_artist=spotify_artist,
+            spotify_title=spotify_title,
+            track_id=track_id,
+            in_playlist=True,
+            status="review" if status == "review" else "added",
+            first_seen_at=added_at or row["added_at"] or row["created_at"],
+        )
+    return row
+
+
+def upsert_spotify_playlist_recording(
+    con: sqlite3.Connection,
+    *,
+    playlist_id: str,
+    spotify_track_id: str,
+    spotify_track_uri: str = "",
+    spotify_artist: str = "",
+    spotify_title: str = "",
+    artist_ids: tuple[str, ...] | list[str] = (),
+    album: str = "",
+    isrc: str = "",
+    duration_ms: int | None = None,
+    track_id: int | None,
+    in_playlist: bool,
+    status: str = "added",
+    association_status: str | None = None,
+    association_reason: str = "",
+    first_seen_at: str | None = None,
+) -> sqlite3.Row:
+    """Record one Spotify recording without changing the logical primary asset."""
+    if not spotify_track_id:
+        raise ValueError("spotify recording id is required")
+    if status not in SPOTIFY_STATUSES:
+        raise ValueError(f"invalid spotify recording status: {status}")
+    if association_status is None:
+        association_status = "linked" if track_id is not None else "ambiguous"
+    if association_status not in {"linked", "ambiguous"}:
+        raise ValueError(f"invalid spotify recording association status: {association_status}")
+    if track_id is None and association_status == "linked":
+        raise ValueError("linked Spotify recording requires a track")
+    artist_ids_json = json.dumps(sorted({str(value) for value in artist_ids if str(value)}))
+    now = now_utc()
+    first_seen_at = first_seen_at or now
+    existing = con.execute(
+        """
+        SELECT * FROM spotify_playlist_recordings
+         WHERE playlist_id = ? AND spotify_track_id = ?
+        """,
+        (playlist_id, spotify_track_id),
+    ).fetchone()
+    if existing:
+        if existing["track_id"] is not None and track_id is not None and existing["track_id"] != track_id:
+            raise ValueError("spotify recording is already owned by another track")
+        con.execute(
+            """
+            UPDATE spotify_playlist_recordings
+               SET track_id = COALESCE(?, track_id),
+                   spotify_track_uri = CASE WHEN ? <> '' THEN ? ELSE spotify_track_uri END,
+                   spotify_artist = CASE WHEN ? <> '' THEN ? ELSE spotify_artist END,
+                   spotify_title = CASE WHEN ? <> '' THEN ? ELSE spotify_title END,
+                   spotify_artist_ids = CASE WHEN ? <> '[]' THEN ? ELSE spotify_artist_ids END,
+                   spotify_album = CASE WHEN ? <> '' THEN ? ELSE spotify_album END,
+                   spotify_isrc = CASE WHEN ? <> '' THEN ? ELSE spotify_isrc END,
+                   duration_ms = COALESCE(?, duration_ms),
+                   in_playlist = ?,
+                   status = ?,
+                   association_status = ?,
+                   association_reason = ?,
+                   last_seen_at = CASE WHEN ? THEN ? ELSE last_seen_at END,
+                   suspected_missing_at = CASE WHEN ? THEN NULL ELSE suspected_missing_at END,
+                   updated_at = ?
+             WHERE id = ?
+            """,
+            (
+                track_id,
+                spotify_track_uri,
+                spotify_track_uri,
+                spotify_artist,
+                spotify_artist,
+                spotify_title,
+                spotify_title,
+                artist_ids_json,
+                artist_ids_json,
+                album,
+                album,
+                isrc,
+                isrc,
+                duration_ms,
+                1 if in_playlist else 0,
+                status,
+                association_status,
+                association_reason,
+                1 if in_playlist else 0,
+                now,
+                1 if in_playlist else 0,
+                now,
+                existing["id"],
+            ),
+        )
+        return con.execute(
+            "SELECT * FROM spotify_playlist_recordings WHERE id = ?", (existing["id"],)
+        ).fetchone()
+    con.execute(
+        """
+        INSERT INTO spotify_playlist_recordings(
+            playlist_id, spotify_track_id, spotify_track_uri, spotify_artist,
+            spotify_title, spotify_artist_ids, spotify_album, spotify_isrc,
+            duration_ms, track_id, in_playlist, status, association_status,
+            association_reason, first_seen_at, last_seen_at, suspected_missing_at,
+            created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+        """,
+        (
+            playlist_id,
+            spotify_track_id,
+            spotify_track_uri,
+            spotify_artist,
+            spotify_title,
+            artist_ids_json,
+            album,
+            isrc,
+            duration_ms,
+            track_id,
+            1 if in_playlist else 0,
+            status,
+            association_status,
+            association_reason,
+            first_seen_at,
+            now,
+            now,
+            now,
+        ),
+    )
+    return con.execute(
+        "SELECT * FROM spotify_playlist_recordings WHERE id = last_insert_rowid()"
+    ).fetchone()
 
 
 def wanted_tracks(con: sqlite3.Connection) -> list[sqlite3.Row]:

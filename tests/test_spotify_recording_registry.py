@@ -9,7 +9,16 @@ from pathlib import Path
 import pytest
 
 from hcr_sync.config import DEFAULTS, Config
-from hcr_sync.db import connect, ensure_track, init_db, migrate_db, set_state, transaction, upsert_spotify_asset
+from hcr_sync.db import (
+    connect,
+    ensure_track,
+    init_db,
+    mark_excluded,
+    migrate_db,
+    set_state,
+    transaction,
+    upsert_spotify_asset,
+)
 from hcr_sync.reconcile import reconcile
 from hcr_sync.spotify_sync import (
     PlaylistSnapshot,
@@ -188,6 +197,116 @@ def test_recording_ownership_conflict_rolls_back_and_is_redacted(tmp_path):
     with connect(config) as con:
         assert list(con.iterdump()) == before
     assert config.db_path.read_bytes() == before_bytes
+
+
+def test_dry_run_prefers_known_owner_over_unestablished_canonical_duplicate(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            owner = ensure_track(con, artist="Drokz", title="The Mind", status="wanted")
+            duplicate = ensure_track(
+                con,
+                artist="Drokz",
+                title="The Mind (Signs Of Life)",
+                status="wanted",
+            )
+            upsert_spotify_asset(
+                con,
+                track_id=owner["id"],
+                playlist_id="playlist",
+                spotify_track_id="known-recording",
+                spotify_track_uri="spotify:track:known-recording",
+                spotify_artist="Drokz",
+                spotify_title="The Mind",
+                in_playlist=True,
+                match_confidence=1.0,
+                status="added",
+            )
+            mark_excluded(con, track_id=duplicate["id"], source="manual", reason="duplicate local label")
+        before_bytes = config.db_path.read_bytes()
+        before_dump = list(con.iterdump())
+
+    client = FakeSpotify(
+        [
+            recording(
+                "known-recording",
+                artist="Drokz",
+                title="The Mind (Signs Of Life)",
+                artist_ids=("drokz-id",),
+            )
+        ]
+    )
+    summary = scan_spotify_playlist(config, apply=False, client=client)
+
+    assert summary.linked == 1 and summary.ambiguous == 0
+    assert client.removed == []
+    assert config.db_path.read_bytes() == before_bytes
+    with connect(config) as con:
+        assert list(con.iterdump()) == before_dump
+        owner = con.execute(
+            "SELECT * FROM tracks WHERE canonical_key = 'drokz::the mind'"
+        ).fetchone()
+        duplicate = con.execute(
+            "SELECT * FROM tracks WHERE canonical_key = 'drokz::the mind signs of life'"
+        ).fetchone()
+        assert owner["status"] == "wanted"
+        assert duplicate["status"] == "excluded"
+
+
+def test_canonical_duplicate_with_established_history_stays_fail_closed(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    with connect(config) as con:
+        with transaction(con):
+            owner = ensure_track(con, artist="Drokz", title="The Mind", status="wanted")
+            duplicate = ensure_track(
+                con,
+                artist="Drokz",
+                title="The Mind (Signs Of Life)",
+                status="wanted",
+            )
+            upsert_spotify_asset(
+                con,
+                track_id=owner["id"],
+                playlist_id="playlist",
+                spotify_track_id="known-recording",
+                spotify_track_uri="spotify:track:known-recording",
+                spotify_artist="Drokz",
+                spotify_title="The Mind",
+                in_playlist=True,
+                match_confidence=1.0,
+                status="added",
+            )
+            upsert_spotify_asset(
+                con,
+                track_id=duplicate["id"],
+                playlist_id="playlist",
+                spotify_track_id="duplicate-recording",
+                spotify_track_uri="spotify:track:duplicate-recording",
+                spotify_artist="Drokz",
+                spotify_title="The Mind (Signs Of Life)",
+                in_playlist=False,
+                match_confidence=1.0,
+                status="removed",
+            )
+        before_bytes = config.db_path.read_bytes()
+
+    client = FakeSpotify(
+        [
+            recording(
+                "known-recording",
+                artist="Drokz",
+                title="The Mind (Signs Of Life)",
+                artist_ids=("drokz-id",),
+            )
+        ]
+    )
+    with pytest.raises(SpotifyAssociationConflict, match="^Spotify playlist snapshot association conflict$"):
+        scan_spotify_playlist(config, apply=False, client=client)
+
+    assert config.db_path.read_bytes() == before_bytes
+    assert client.removed == []
 
 
 def test_remove_one_recording_keeps_song_and_remove_all_then_reappearance(tmp_path):

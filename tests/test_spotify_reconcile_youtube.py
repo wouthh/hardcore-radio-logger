@@ -5,7 +5,17 @@ import json
 import pytest
 
 from hcr_sync.config import DEFAULTS, Config
-from hcr_sync.db import connect, ensure_track, init_db, mark_excluded, set_state, transaction, upsert_spotify_asset, upsert_youtube_asset
+from hcr_sync.db import (
+    connect,
+    ensure_track,
+    init_db,
+    mark_excluded,
+    set_state,
+    transaction,
+    upsert_spotify_asset,
+    upsert_spotify_playlist_recording,
+    upsert_youtube_asset,
+)
 from hcr_sync.reconcile import manual_exclude, reconcile
 from hcr_sync.spotify_sync import PlaylistSnapshot, SpotifyTrack, _spotify_search_queries, _spotify_track_from_playlist_item, backfill_spotify, scan_spotify_playlist, sync_spotify
 from hcr_sync.system import LegacyDownloaderActive, assert_legacy_downloader_safe
@@ -160,7 +170,7 @@ def test_snapshot_preserves_provenance_and_updates_membership(tmp_path, importer
 
 @pytest.mark.parametrize("importer", [scan_spotify_playlist, backfill_spotify])
 @pytest.mark.parametrize("apply", [False, True])
-def test_snapshot_association_conflict_rolls_back_entire_snapshot(tmp_path, importer, apply):
+def test_snapshot_records_ambiguous_recording_and_continues_other_tracks(tmp_path, importer, apply):
     config = make_config(tmp_path)
     init_db(config)
     with connect(config) as con:
@@ -173,11 +183,28 @@ def test_snapshot_association_conflict_rolls_back_entire_snapshot(tmp_path, impo
         SpotifyTrack(uri="spotify:track:new", track_id="new", artist="New", title="Unrelated"),
         SpotifyTrack(uri="spotify:track:conflict", track_id="conflict", artist="Example", title="Song"),
     ])
-    with pytest.raises(RuntimeError, match="association conflict"):
-        importer(config, apply=apply, client=spotify)
+    summary = importer(config, apply=apply, client=spotify)
+    if not apply:
+        assert summary.linked == 1 and summary.ambiguous == 1
+        with connect(config) as con:
+            assert list(con.iterdump()) == before
+        assert config.db_path.read_bytes() == database_bytes
+        return
+    assert summary.linked == 1 and summary.ambiguous == 1
     with connect(config) as con:
-        assert list(con.iterdump()) == before
-    assert config.db_path.read_bytes() == database_bytes
+        recording = con.execute(
+            "SELECT * FROM spotify_playlist_recordings WHERE spotify_track_id = 'conflict'"
+        ).fetchone()
+        original = con.execute(
+            "SELECT * FROM spotify_assets WHERE spotify_track_id = 'original'"
+        ).fetchone()
+        unrelated = con.execute(
+            "SELECT * FROM spotify_assets WHERE spotify_track_id = 'new'"
+        ).fetchone()
+        assert recording["track_id"] is None
+        assert recording["association_status"] == "ambiguous"
+        assert original["track_id"] == 1 and original["in_playlist"] == 0
+        assert unrelated is not None and unrelated["in_playlist"] == 1
 
 
 @pytest.mark.parametrize("importer", [scan_spotify_playlist, backfill_spotify])
@@ -188,8 +215,8 @@ def test_snapshot_dry_run_checks_new_associations_without_creating_database(tmp_
     assert importer(config, apply=False, client=spotify).linked == 1
     assert not config.db_path.exists()
     spotify.snapshot_tracks.append(SpotifyTrack(uri="spotify:track:second", track_id="second", artist="EXAMPLE", title="SONG"))
-    with pytest.raises(RuntimeError, match="association conflict"):
-        importer(config, apply=False, client=spotify)
+    summary = importer(config, apply=False, client=spotify)
+    assert summary.linked == 1 and summary.ambiguous == 1
     assert not config.db_path.exists()
 
 
@@ -315,6 +342,74 @@ def test_spotify_backfill_and_sync_with_fake_client(tmp_path):
         assert payload["spotify_track_id"] == "2"
         assert payload["match_status"] == "added"
         assert payload["match_threshold"] == 0.9
+
+
+def test_spotify_sync_promotes_confident_candidate_over_inactive_search_candidate(tmp_path):
+    config = make_config(tmp_path)
+    init_db(config)
+    client = FakeSpotify(
+        search_tracks=[
+            SpotifyTrack(
+                uri="spotify:track:candidate-b",
+                track_id="candidate-b",
+                artist="Artist",
+                title="Song",
+            )
+        ]
+    )
+    with connect(config) as con:
+        with transaction(con):
+            track = ensure_track(con, artist="Artist", title="Song", status="wanted")
+            upsert_spotify_asset(
+                con,
+                track_id=track["id"],
+                playlist_id="playlist",
+                spotify_track_uri="spotify:track:candidate-a",
+                spotify_track_id="candidate-a",
+                spotify_artist="Artist",
+                spotify_title="Song",
+                in_playlist=False,
+                match_confidence=0.55,
+                status="review",
+                search_attempts=1,
+                search_last_at="2026-01-01T00:00:00Z",
+                search_next_at="2026-01-01T00:00:00Z",
+                update_search=True,
+            )
+            # This inactive review row models the legacy migration of a
+            # failed-search candidate. It must not become a playlist owner.
+            upsert_spotify_playlist_recording(
+                con,
+                playlist_id="playlist",
+                spotify_track_id="candidate-a",
+                spotify_track_uri="spotify:track:candidate-a",
+                spotify_artist="Artist",
+                spotify_title="Song",
+                track_id=track["id"],
+                in_playlist=False,
+                status="review",
+            )
+
+    summary = sync_spotify(config, apply=True, client=client)
+
+    assert summary.added == 1
+    assert client.added == ["spotify:track:candidate-b"]
+    with connect(config) as con:
+        asset = con.execute("SELECT * FROM spotify_assets WHERE track_id = 1").fetchone()
+        stale = con.execute(
+            "SELECT * FROM spotify_playlist_recordings WHERE spotify_track_id = 'candidate-a'"
+        ).fetchone()
+        promoted = con.execute(
+            "SELECT * FROM spotify_playlist_recordings WHERE spotify_track_id = 'candidate-b'"
+        ).fetchone()
+        assert asset["spotify_track_id"] == "candidate-b"
+        assert asset["in_playlist"] == 1
+        assert asset["match_confidence"] == pytest.approx(1.0)
+        assert asset["status"] == "added"
+        assert stale["in_playlist"] == 0
+        assert promoted["track_id"] == asset["track_id"]
+        assert promoted["in_playlist"] == 1
+        assert promoted["status"] == "added"
 
 
 def test_spotify_scan_imports_playlist_addition_for_youtube_sync(tmp_path):
@@ -947,6 +1042,8 @@ def test_spotify_sync_reviews_candidate_track_id_linked_to_other_track_without_a
         assert rows[1]["spotify_track_id"] is None
         assert rows[1]["match_confidence"] == 0.0
         assert event is not None
+        event_payload = json.loads(event["payload_json"])
+        assert "spotify_artist" not in event_payload and "spotify_title" not in event_payload
 
     next_client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:same", track_id="same", artist="Artist", title="Title")])
     next_summary = sync_spotify(config, apply=True, client=next_client)

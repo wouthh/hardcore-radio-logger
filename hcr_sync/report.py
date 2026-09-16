@@ -60,13 +60,18 @@ def build_report(config: Config) -> Report:
             "SELECT COUNT(*) AS count FROM youtube_assets WHERE status = 'review'"
         ).fetchone()["count"]
         report.ambiguous_spotify = con.execute(
-            "SELECT COUNT(*) AS count FROM spotify_assets WHERE status = 'review'"
+            """
+            SELECT
+              (SELECT COUNT(*) FROM spotify_assets WHERE status = 'review') +
+              (SELECT COUNT(*) FROM spotify_playlist_recordings
+                WHERE in_playlist = 1 AND association_status = 'ambiguous') AS count
+            """
         ).fetchone()["count"]
         report.pending_suspicions = con.execute(
             """
             SELECT
               (SELECT COUNT(*) FROM youtube_assets WHERE suspected_missing_at IS NOT NULL) +
-              (SELECT COUNT(*) FROM spotify_assets WHERE suspected_missing_at IS NOT NULL) AS count
+              (SELECT COUNT(*) FROM spotify_playlist_recordings WHERE suspected_missing_at IS NOT NULL) AS count
             """
         ).fetchone()["count"]
     return report

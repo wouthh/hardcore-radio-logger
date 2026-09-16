@@ -12,7 +12,7 @@ from hcr_sync.spotify_sync import SpotifySummary
 from hcr_sync.system import LegacyDownloaderActive
 
 
-def test_run_once_stops_after_real_spotify_association_conflict(tmp_path, monkeypatch, capsys):
+def test_run_once_preserves_ambiguous_spotify_recording_without_adding(tmp_path, monkeypatch, capsys):
     from hcr_sync.cli import main
     from hcr_sync.db import ensure_track, transaction, upsert_spotify_asset
     from hcr_sync.spotify_sync import PlaylistSnapshot, SpotifyTrack
@@ -48,10 +48,14 @@ def test_run_once_stops_after_real_spotify_association_conflict(tmp_path, monkey
     result = main(["run-once", "--apply"])
     with connect(config) as con:
         asset = dict(con.execute("SELECT * FROM spotify_assets").fetchone())
-    assert result == 1, {"added": spotify.added, "asset": asset}
+    assert result == 0, {"added": spotify.added, "asset": asset}
     assert spotify.added == []
     assert (asset["spotify_track_id"], asset["match_confidence"], asset["status"], asset["in_playlist"]) == ("old", 0.8625, "review", 0)
-    assert capsys.readouterr().err == "error: Spotify playlist snapshot association conflict\n"
+    assert capsys.readouterr().err == ""
+    with connect(config) as con:
+        recording = con.execute("SELECT * FROM spotify_playlist_recordings").fetchone()
+        assert recording["track_id"] is None
+        assert recording["association_status"] == "ambiguous"
 
 
 @pytest.mark.parametrize("command", ["import-logger", "run-once"])

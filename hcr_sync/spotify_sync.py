@@ -697,11 +697,87 @@ def _recording_anchor_matches(anchor, item: SpotifyTrack) -> bool:
     return bool(anchor_ids and candidate_ids and anchor_ids == candidate_ids and _recording_title_key(anchor) == _recording_title_key(item))
 
 
+def _stored_spotify_metadata_matches(row, item: SpotifyTrack) -> bool:
+    """Check a known provider row before comparing its local owner label."""
+    stored_artist = str(row["spotify_artist"] or "")
+    stored_title = str(row["spotify_title"] or "")
+    if not stored_artist or not stored_title:
+        return False
+
+    row_keys = row.keys() if hasattr(row, "keys") else ()
+    stored_artist_ids = (
+        _recording_artist_ids(row["spotify_artist_ids"])
+        if "spotify_artist_ids" in row_keys
+        else frozenset()
+    )
+    item_artist_ids = _recording_artist_ids(item)
+    if stored_artist_ids and item_artist_ids and stored_artist_ids != item_artist_ids:
+        return False
+
+    stored_isrc = str(row["spotify_isrc"] or "") if "spotify_isrc" in row_keys else ""
+    if stored_isrc and item.isrc and stored_isrc.casefold() != item.isrc.casefold():
+        return False
+
+    stored_duration = row["duration_ms"] if "duration_ms" in row_keys else None
+    if stored_duration is not None and item.duration_ms is not None:
+        try:
+            if abs(int(stored_duration) - int(item.duration_ms)) > 20_000:
+                return False
+        except (TypeError, ValueError):
+            return False
+
+    return canonical_key(stored_artist, stored_title) == canonical_key(item.artist, item.title) or likely_same_recording(
+        artist=stored_artist,
+        title=stored_title,
+        other_artist=item.artist,
+        other_title=item.title,
+    )
+
+
+def _known_spotify_metadata_matches(
+    provider_rows: dict[str, list[object]], item: SpotifyTrack
+) -> bool:
+    """Use stored provider metadata when a local owner label is a variant."""
+    return any(
+        _stored_spotify_metadata_matches(row, item)
+        for row in provider_rows.get(item.track_id, [])
+    )
+
+
+def _spotify_track_has_established_history(con, *, playlist_id: str, track_id: int) -> bool:
+    """Check whether a canonical duplicate already owns playlist history."""
+    assets = list(
+        con.execute(
+            "SELECT * FROM spotify_assets WHERE playlist_id = ? AND track_id = ?",
+            (playlist_id, track_id),
+        )
+    )
+    if any(_spotify_asset_has_primary_history(con, asset) for asset in assets):
+        return True
+    if not con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'spotify_playlist_recordings'"
+    ).fetchone():
+        return False
+    return bool(
+        con.execute(
+            """
+            SELECT 1
+              FROM spotify_playlist_recordings
+             WHERE playlist_id = ? AND track_id = ?
+               AND (in_playlist = 1 OR status IN ('added', 'missing', 'removed'))
+             LIMIT 1
+            """,
+            (playlist_id, track_id),
+        ).fetchone()
+    )
+
+
 def _snapshot_association_plan(con, snapshot: PlaylistSnapshot) -> list[_SnapshotResolution]:
     """Plan stable recording ownership before any apply-mode write."""
     recordings = _snapshot_recordings(snapshot)
     existing_tracks: dict[str, int] = {}
     registry_rows: dict[str, object] = {}
+    provider_rows: dict[str, list[object]] = {}
     asset_owners: dict[str, int] = {}
     owner_identity: dict[int, str] = {}
     owner_labels: dict[int, tuple[str, str]] = {}
@@ -742,16 +818,18 @@ def _snapshot_association_plan(con, snapshot: PlaylistSnapshot) -> list[_Snapsho
                 (snapshot.playlist_id,),
             ):
                 registry_rows[row["spotify_track_id"]] = row
+                provider_rows.setdefault(row["spotify_track_id"], []).append(row)
                 if row["association_status"] == "linked" and _recording_artist_ids(row):
                     anchors.setdefault(int(row["track_id"]), []).append(row)
         for row in con.execute(
             """
-            SELECT spotify_track_id, track_id, spotify_artist, spotify_title
+            SELECT *
               FROM spotify_assets
              WHERE playlist_id = ? AND spotify_track_id IS NOT NULL AND spotify_track_id <> ''
             """,
             (snapshot.playlist_id,),
         ):
+            provider_rows.setdefault(row["spotify_track_id"], []).append(row)
             asset_owners[row["spotify_track_id"]] = int(row["track_id"])
 
     for track_id, rows in anchors.items():
@@ -784,12 +862,32 @@ def _snapshot_association_plan(con, snapshot: PlaylistSnapshot) -> list[_Snapsho
                 owner_id in owner_identity
                 and owner_identity[owner_id] != _recording_identity_key(items[0])
                 and not same_recording
+                and not _known_spotify_metadata_matches(provider_rows, items[0])
             ):
                 raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
         if existing_track_id is not None:
             if known_owners and known_owners != {existing_track_id}:
-                raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
-            target_track_id = next(iter(known_owners), existing_track_id)
+                known_owner_established = len(known_owners) == 1 and _spotify_track_has_established_history(
+                    con,
+                    playlist_id=snapshot.playlist_id,
+                    track_id=next(iter(known_owners)),
+                )
+                if (
+                    len(known_owners) != 1
+                    or _spotify_track_has_established_history(
+                        con,
+                        playlist_id=snapshot.playlist_id,
+                        track_id=existing_track_id,
+                    )
+                    or not known_owner_established
+                ):
+                    raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
+                # A duplicate local canonical label is only a source row when
+                # it has no established Spotify membership/history. Keep the
+                # known provider-ID owner and leave the duplicate untouched.
+                target_track_id = next(iter(known_owners))
+            else:
+                target_track_id = next(iter(known_owners), existing_track_id)
         elif len(known_owners) > 1:
             raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
         else:

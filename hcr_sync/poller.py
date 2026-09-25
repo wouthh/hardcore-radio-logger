@@ -374,6 +374,24 @@ def _fetch_track_metadata(config: Config) -> _TrackMetadata:
     return _TrackMetadata(track, "icecast", _canonical_source_url(status_url))
 
 
+def record_poll_unavailable(config: Config, failure: PollSourcesUnavailable, *, apply: bool) -> None:
+    if not apply or not config.bool("HCR_AUDIT_VERBOSE"):
+        return
+    with connect(config) as con:
+        with transaction(con):
+            add_event(
+                con,
+                None,
+                "radio_poll_unavailable",
+                "poll_radio",
+                {
+                    "observed_at": now_utc(),
+                    "icecast_reason": failure.icecast_reason,
+                    "player_page_reason": failure.player_page_reason,
+                },
+            )
+
+
 def _seen_fingerprints(seen_path: Path) -> set[str]:
     if not seen_path.exists():
         return set()

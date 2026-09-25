@@ -298,7 +298,7 @@ def test_run_once_continues_all_stages_when_both_radio_sources_are_unavailable(m
     from hcr_sync.poller import PollSourcesUnavailable
 
     config = make_config(tmp_path, HCR_RUN_POLLER="true")
-    args = SimpleNamespace(apply=False, force_mass_delete=False, force_confirm_deletions=False, complete_idless_local=None)
+    args = SimpleNamespace(apply=True, force_mass_delete=False, force_confirm_deletions=False, complete_idless_local=None)
     calls = []
 
     def stage(name, result):
@@ -311,7 +311,9 @@ def test_run_once_continues_all_stages_when_both_radio_sources_are_unavailable(m
     def unavailable(*_args, **_kwargs):
         raise PollSourcesUnavailable("connection_refused", "timeout")
 
+    monkeypatch.setattr("hcr_sync.cli.assert_legacy_downloader_safe", lambda _config: None)
     monkeypatch.setattr("hcr_sync.cli.poll_radio", unavailable)
+    monkeypatch.setattr("hcr_sync.cli.record_poll_unavailable", stage("poll_audit", None))
     monkeypatch.setattr("hcr_sync.cli.import_logger", stage("import_logger", SimpleNamespace(files_read=0)))
     monkeypatch.setattr("hcr_sync.cli.import_local_files", stage("scan_local", SimpleNamespace(files_seen=0)))
     monkeypatch.setattr("hcr_sync.cli.spotify_playlist_scan_skip", lambda _config: ("", ""))
@@ -325,7 +327,7 @@ def test_run_once_continues_all_stages_when_both_radio_sources_are_unavailable(m
     result = cmd_run_once(args, config)
 
     assert result == 0
-    assert calls == ["import_logger", "scan_local", "spotify_scan", "reconcile", "youtube_sync", "spotify_sync"]
+    assert calls == ["poll_audit", "import_logger", "scan_local", "spotify_scan", "reconcile", "youtube_sync", "spotify_sync"]
     output = capsys.readouterr().out
     assert "WARNING poll_radio unavailable (icecast=connection_refused; player_page=timeout)" in output
     assert "continuing run-once without a new radio observation" in output

@@ -20,6 +20,7 @@ from hcr_sync.poller import (
     fetch_player_track,
     fetch_status,
     poll_radio,
+    record_poll_unavailable,
     track_from_player_page,
 )
 
@@ -338,6 +339,32 @@ def test_no_previous_track_is_replayed_when_both_sources_fail(monkeypatch, tmp_p
     assert error.value.player_page_reason == "timeout"
     assert len(config.seen_tracks_path.read_text(encoding="utf-8").splitlines()) == 1
     assert config.played_tracks_path.read_text(encoding="utf-8").count("Artist & Co - Synthetic Song") == 1
+
+
+def test_unavailable_poll_audit_is_optional_and_contains_only_sanitized_reasons(tmp_path):
+    config = make_config(tmp_path, HCR_AUDIT_VERBOSE="true")
+    init_db(config)
+    failure = PollSourcesUnavailable("connection_refused", "timeout")
+
+    record_poll_unavailable(config, failure, apply=True)
+
+    with connect(config) as con:
+        row = con.execute("SELECT event_type, event_source, payload_json FROM events").fetchone()
+    payload = json.loads(row["payload_json"])
+    assert (row["event_type"], row["event_source"]) == ("radio_poll_unavailable", "poll_radio")
+    assert payload["icecast_reason"] == "connection_refused"
+    assert payload["player_page_reason"] == "timeout"
+    assert payload["observed_at"]
+    assert set(payload) == {"observed_at", "icecast_reason", "player_page_reason"}
+
+
+def test_unavailable_poll_audit_does_not_write_during_dry_run(tmp_path):
+    config = make_config(tmp_path, HCR_AUDIT_VERBOSE="true")
+    failure = PollSourcesUnavailable("connection_refused", "timeout")
+
+    record_poll_unavailable(config, failure, apply=False)
+
+    assert not config.db_path.exists()
 
 
 def test_fallback_logger_import_does_not_reactivate_excluded_track(monkeypatch, tmp_path):

@@ -13,7 +13,7 @@ from .doctor import format_doctor, run_doctor
 from .identity import canonical_key
 from .local_files import import_local_files
 from .logger_importer import import_logger
-from .poller import PollSourcesUnavailable, poll_radio
+from .poller import PollSourcesUnavailable, poll_radio, record_poll_unavailable
 from .reconcile import manual_exclude, reconcile
 from .report import build_report, format_report
 from .spotify_sync import SpotifyAssociationConflict, SpotifySummary, backfill_spotify, scan_spotify_playlist, spotify_auth, sync_spotify
@@ -212,6 +212,7 @@ def cmd_run_once(args: argparse.Namespace, config: Config) -> int:
             try:
                 changed, track = poll_radio(config, apply=apply)
             except PollSourcesUnavailable as exc:
+                record_poll_unavailable(config, exc, apply=apply)
                 print(f"WARNING poll_radio unavailable ({exc}); continuing run-once without a new radio observation")
             else:
                 print(f"poll_radio changed={changed} track={track}")

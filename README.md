@@ -138,6 +138,8 @@ python -m hcr_sync youtube sync --apply --complete-idless-local
 
 If `HCR_RUN_POLLER=true`, `run-once` polls Hardcore Radio itself before importing logger files. The poller only writes observations. It does not download audio and does not touch Spotify.
 
+The poller requests the configured Icecast status endpoint first and falls back to the official player webpage when Icecast is unavailable or has no usable track metadata. Each run starts with Icecast again. Every HTTP attempt uses a unique request URL and no-cache/no-store headers, so the client does not reuse a previous response; the broadcaster may itself serve an older webpage track. Poll timestamps mean **observed at**; they do not establish when the broadcaster first played or published the track. If neither source provides usable metadata, standalone `poll-radio` fails. `run-once` records a warning and continues its remaining stages without adding a radio observation; with `HCR_AUDIT_VERBOSE=true`, apply-mode runs also record a per-poll unavailable event with sanitized failure reasons. Local file, logger, database, and synchronization safety errors still fail the run.
+
 ```bash
 python -m hcr_sync poll-radio --dry-run
 python -m hcr_sync poll-radio --apply

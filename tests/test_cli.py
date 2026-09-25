@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+import sqlite3
 
 import pytest
 
@@ -291,3 +292,72 @@ def test_run_once_zero_spotify_scan_interval_preserves_every_run_scan(monkeypatc
 
     assert cmd_run_once(args, config) == 0
     assert calls == ["spotify_scan"]
+
+
+def test_run_once_continues_all_stages_when_both_radio_sources_are_unavailable(monkeypatch, tmp_path, capsys):
+    from hcr_sync.poller import PollSourcesUnavailable
+
+    config = make_config(tmp_path, HCR_RUN_POLLER="true")
+    args = SimpleNamespace(apply=False, force_mass_delete=False, force_confirm_deletions=False, complete_idless_local=None)
+    calls = []
+
+    def stage(name, result):
+        def run(*_args, **_kwargs):
+            calls.append(name)
+            return result
+
+        return run
+
+    def unavailable(*_args, **_kwargs):
+        raise PollSourcesUnavailable("connection_refused", "timeout")
+
+    monkeypatch.setattr("hcr_sync.cli.poll_radio", unavailable)
+    monkeypatch.setattr("hcr_sync.cli.import_logger", stage("import_logger", SimpleNamespace(files_read=0)))
+    monkeypatch.setattr("hcr_sync.cli.import_local_files", stage("scan_local", SimpleNamespace(files_seen=0)))
+    monkeypatch.setattr("hcr_sync.cli.spotify_playlist_scan_skip", lambda _config: ("", ""))
+    monkeypatch.setattr("hcr_sync.cli.scan_spotify_playlist", stage("spotify_scan", SpotifySummary(_snapshot=object(), _client=object())))
+    monkeypatch.setattr("hcr_sync.cli.reconcile", stage("reconcile", ReconcileSummary()))
+    monkeypatch.setattr("hcr_sync.cli.sync_youtube", stage("youtube_sync", SimpleNamespace(downloaded=0)))
+    monkeypatch.setattr("hcr_sync.cli.sync_spotify", stage("spotify_sync", SpotifySummary()))
+    monkeypatch.setattr("hcr_sync.cli.build_report", lambda _config: "synthetic report")
+    monkeypatch.setattr("hcr_sync.cli.format_report", lambda report: report)
+
+    result = cmd_run_once(args, config)
+
+    assert result == 0
+    assert calls == ["import_logger", "scan_local", "spotify_scan", "reconcile", "youtube_sync", "spotify_sync"]
+    output = capsys.readouterr().out
+    assert "WARNING poll_radio unavailable (icecast=connection_refused; player_page=timeout)" in output
+    assert "continuing run-once without a new radio observation" in output
+    assert "synthetic report" in output
+
+
+@pytest.mark.parametrize("failure", [OSError("logger file write failed"), sqlite3.OperationalError("database is locked")])
+def test_run_once_does_not_swallow_local_or_database_poll_failures(monkeypatch, tmp_path, failure):
+    config = make_config(tmp_path, HCR_RUN_POLLER="true")
+    args = SimpleNamespace(apply=False, force_mass_delete=False, force_confirm_deletions=False, complete_idless_local=None)
+
+    def fail(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr("hcr_sync.cli.poll_radio", fail)
+    with pytest.raises(type(failure)):
+        cmd_run_once(args, config)
+
+
+def test_run_once_keeps_invalid_logger_input_fatal_after_radio_warning(monkeypatch, tmp_path):
+    from hcr_sync.poller import PollSourcesUnavailable
+
+    config = make_config(tmp_path, HCR_RUN_POLLER="true")
+    args = SimpleNamespace(apply=False, force_mass_delete=False, force_confirm_deletions=False, complete_idless_local=None)
+
+    def unavailable(*_args, **_kwargs):
+        raise PollSourcesUnavailable("connection_refused", "timeout")
+
+    def invalid_input(*_args, **_kwargs):
+        raise ValueError("seen-tracks.jsonl line 1: invalid timestamp")
+
+    monkeypatch.setattr("hcr_sync.cli.poll_radio", unavailable)
+    monkeypatch.setattr("hcr_sync.cli.import_logger", invalid_input)
+    with pytest.raises(ValueError, match="invalid timestamp"):
+        cmd_run_once(args, config)

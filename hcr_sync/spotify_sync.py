@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from contextlib import closing
+from contextlib import closing, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
@@ -29,6 +29,7 @@ from .identity import (
     likely_same_recording,
     match_confidence,
     normalize_for_match,
+    radio_metadata_placeholder,
 )
 
 NON_TRACK_RE = re.compile(
@@ -108,6 +109,9 @@ class SpotipyClient:
             retries=config.int("HCR_SPOTIFY_REQUEST_RETRIES"),
             status_retries=config.int("HCR_SPOTIFY_STATUS_RETRIES"),
         )
+        # Return exhausted HTTP responses to Spotipy instead of its synthetic 429.
+        for adapter in self.sp._session.adapters.values():
+            adapter.max_retries = adapter.max_retries.new(raise_on_status=False)
 
     def auth_check(self) -> str:
         user = self.sp.current_user()
@@ -225,7 +229,7 @@ def spotify_enabled(config: Config) -> bool:
 
 
 def looks_like_non_track(artist: str, title: str) -> bool:
-    return bool(NON_TRACK_RE.search(f"{artist} {title}"))
+    return radio_metadata_placeholder(artist, title) or bool(NON_TRACK_RE.search(f"{artist} {title}"))
 
 
 def _core_spotify_title(title: str) -> str:
@@ -297,9 +301,7 @@ def _spotify_match_score(track, candidate: SpotifyTrack) -> float:
 
 
 def _is_rate_limited(exc: Exception) -> bool:
-    status = getattr(exc, "http_status", None)
-    headers = getattr(exc, "headers", {}) or {}
-    return status == 429 or "Retry-After" in headers or "retry-after" in headers
+    return getattr(exc, "http_status", None) == 429
 
 
 def _parse_utc(value: str) -> datetime | None:
@@ -339,13 +341,24 @@ def _rate_limit_details(config: Config, exc: Exception) -> dict[str, object]:
         "retry_after_seconds": seconds,
         "fallback_used": fallback_used,
         "cooldown_until": cooldown_until,
-        "error": str(exc)[:500],
+        "error_type": type(exc).__name__,
+        "reason": getattr(exc, "reason", None),
     }
 
 
 def _spotify_cooldown_active(con) -> bool:
     until = _parse_utc(get_state(con, "spotify_rate_limited_until", ""))
     return bool(until and until > datetime.now(timezone.utc))
+
+
+def _configured_spotify_cooldown_active(config: Config) -> bool:
+    if not config.db_path.exists():
+        return False
+    with closing(sqlite3.connect(config.db_path.resolve().as_uri() + "?mode=ro", uri=True)) as con:
+        con.row_factory = sqlite3.Row
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sync_state'").fetchone():
+            return False
+        return _spotify_cooldown_active(con)
 
 
 SPOTIFY_RATE_LIMIT_STATE_KEYS = (
@@ -358,7 +371,7 @@ SPOTIFY_RATE_LIMIT_STATE_KEYS = (
 def _remember_spotify_rate_limit(con, config: Config, exc: Exception, *, event_source: str = "spotify_sync") -> None:
     payload = _rate_limit_details(config, exc)
     payload["event_source"] = event_source
-    with transaction(con):
+    with nullcontext() if con.in_transaction else transaction(con):
         set_state(con, "spotify_rate_limited_until", str(payload["cooldown_until"]))
         set_state(con, "spotify_rate_limit_last_response", json.dumps(payload, sort_keys=True))
         set_state(con, "spotify_rate_limit_source", event_source)
@@ -379,6 +392,8 @@ def _spotify_rate_limit_source(con) -> str:
 
 
 def _clear_spotify_rate_limit(con, *, event_source: str) -> None:
+    if _spotify_cooldown_active(con):
+        return
     previous_until = get_state(con, "spotify_rate_limited_until", "")
     previous_response = get_state(con, "spotify_rate_limit_last_response", "")
     if not previous_until and not previous_response:
@@ -427,7 +442,7 @@ def _spotify_sync_candidates(con, *, playlist_id: str):
              WHERE t.status = 'wanted'
              ORDER BY
                 CASE WHEN s.search_last_at IS NULL THEN 0 ELSE 1 END,
-                COALESCE(s.search_next_at, s.search_last_at, t.created_at),
+                COALESCE(s.search_last_at, t.created_at),
                 t.id
             """,
             (playlist_id,),
@@ -452,6 +467,34 @@ def _spotify_search_attempts(asset) -> int:
         return max(0, int(asset["search_attempts"] or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def _remember_failed_spotify_attempt(con, config: Config, track, asset, exc: Exception, *, operation: str) -> None:
+    rate_limited = _is_rate_limited(exc)
+    if rate_limited:
+        _remember_spotify_rate_limit(con, config, exc)
+    attempted_at = datetime.now(timezone.utc)
+    attempts = _spotify_search_attempts(asset) + (0 if rate_limited else 1)
+    next_at = get_state(con, "spotify_rate_limited_until") if rate_limited else _next_spotify_retry_at(attempted_at, attempts)
+    with transaction(con):
+        upsert_spotify_asset(
+            con,
+            track_id=track["id"],
+            playlist_id=config.get("HCR_SPOTIFY_PLAYLIST_ID"),
+            in_playlist=bool(asset["in_playlist"]) if asset else False,
+            match_confidence=asset["match_confidence"] if asset else None,
+            status=asset["status"] if asset else "error",
+            search_last_at=_format_utc(attempted_at),
+            search_attempts=attempts,
+            search_next_at=next_at,
+            update_search=True,
+        )
+        add_event(con, track["id"], "spotify_request_failed", "spotify_sync", {
+            "operation": operation,
+            "http_status": getattr(exc, "http_status", None),
+            "error_type": type(exc).__name__,
+            "search_next_at": next_at,
+        })
 
 
 def _is_removed_tentative_asset(asset, match_threshold: float) -> bool:
@@ -1231,8 +1274,18 @@ def backfill_spotify(config: Config, *, apply: bool, client: SpotifyClientProtoc
     playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID")
     if not playlist_id:
         raise RuntimeError("HCR_SPOTIFY_PLAYLIST_ID is required")
+    if _configured_spotify_cooldown_active(config):
+        return SpotifySummary(skipped=1, rate_limited=True)
     client = client or SpotipyClient(config)
-    snapshot = client.playlist_snapshot(playlist_id)
+    try:
+        snapshot = client.playlist_snapshot(playlist_id)
+    except Exception as exc:
+        if not _is_rate_limited(exc):
+            raise
+        if apply:
+            with connect(config) as con:
+                _remember_spotify_rate_limit(con, config, exc, event_source="spotify_backfill")
+        return SpotifySummary(skipped=1, rate_limited=True)
     _validate_playlist_snapshot(snapshot)
     return _import_playlist_snapshot(config, snapshot, apply=apply, event_source="spotify_backfill", establish_baseline=True)
 
@@ -1246,6 +1299,8 @@ def scan_spotify_playlist(config: Config, *, apply: bool, client: SpotifyClientP
     if not playlist_id:
         summary.skipped += 1
         return summary
+    if _configured_spotify_cooldown_active(config):
+        return SpotifySummary(skipped=1, rate_limited=True)
     client = client or SpotipyClient(config)
     try:
         snapshot = client.playlist_snapshot(playlist_id)
@@ -1274,7 +1329,6 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
     if not playlist_id:
         summary.skipped += 1
         return summary
-    client = client or SpotipyClient(config)
     with connect(config) as con:
         if _spotify_cooldown_active(con):
             if apply:
@@ -1283,6 +1337,7 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
             summary.rate_limited = True
             summary.skipped += 1
             return summary
+        client = client or SpotipyClient(config)
         tracks = _spotify_sync_candidates(con, playlist_id=playlist_id)
         suspected_local_delete_ids = _suspected_local_delete_track_ids(con)
         candidate_conflict_ids = _spotify_candidate_conflict_track_ids(con)
@@ -1384,12 +1439,15 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
             try:
                 candidates = client.search_track(track["display_artist"], track["display_title"])
             except Exception as exc:
+                if apply:
+                    _remember_failed_spotify_attempt(con, config, track, asset, exc, operation="search")
                 if _is_rate_limited(exc):
-                    if apply:
-                        _remember_spotify_rate_limit(con, config, exc)
                     summary.rate_limited = True
                     summary.skipped += 1
                     break
+                if getattr(exc, "http_status", None) in {400, 404}:
+                    summary.skipped += 1
+                    continue
                 raise
             best = None
             best_score = 0.0
@@ -1478,12 +1536,15 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
             try:
                 client.add_tracks(playlist_id, [best.uri])
             except Exception as exc:
+                if apply:
+                    _remember_failed_spotify_attempt(con, config, track, asset, exc, operation="add")
                 if _is_rate_limited(exc):
-                    if apply:
-                        _remember_spotify_rate_limit(con, config, exc)
                     summary.rate_limited = True
                     summary.skipped += 1
                     break
+                if getattr(exc, "http_status", None) in {400, 404}:
+                    summary.skipped += 1
+                    continue
                 raise
             with transaction(con):
                 current = con.execute("SELECT status FROM tracks WHERE id = ?", (track["id"],)).fetchone()

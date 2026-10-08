@@ -125,7 +125,9 @@ Playlist scans and backfill establish membership, not match correctness. Existin
 
 These maintenance safeguards prevent future provenance changes and unstable timestamp-less imports. They do not reconstruct confidence already overwritten in an existing database or undo earlier exclusions, duplicate observations, or file movement. No automatic repair or library recovery is performed; any existing-state recovery needs a separate, evidence-based decision.
 
-When Spotify returns a rate limit, sync stores a cooldown in the database and skips Spotify add-sync until that time. If the API client does not expose an exact `Retry-After`, `HCR_SPOTIFY_RATE_LIMIT_FALLBACK_SECONDS` is used.
+When Spotify returns HTTP 429, the database stores its `Retry-After` cooldown. Playlist scans, backfill, reconciliation requests, and add-sync all wait until it expires; local scanning, logger import, and YouTube sync continue. A successful playlist read cannot clear an active cooldown. If no usable `Retry-After` is available, `HCR_SPOTIFY_RATE_LIMIT_FALLBACK_SECONDS` is used. HTTP server errors retain their actual status rather than being mistaken for rate limits.
+
+Spotify sync tries never-searched tracks first, then due retries by oldest attempt (track ID breaks ties), subject to `HCR_SPOTIFY_SYNC_LIMIT`. Failed searches and additions record their attempt without replacing stored recording ownership or match confidence. Unsuccessful matches and track-specific HTTP 400/404 failures retry after seven days initially and fourteen days thereafter. A rate-limited attempt moves back in the queue without counting as an unsuccessful match, and ends Spotify work for that run. Authentication, transport, and server failures remain visible errors. To check recovery, compare radio observations, `youtube_downloaded`, `spotify_added`/`spotify_tentatively_added`, and failure events separately; a successful timer exit does not prove a playlist addition. Recheck the stored cooldown before any controlled sync.
 
 YouTube sync normally treats any known local audio file as already local, including files that were imported without a YouTube video ID. To deliberately test or complete those files into YouTube-ID MP3 downloads, opt in explicitly:
 
@@ -138,7 +140,7 @@ python -m hcr_sync youtube sync --apply --complete-idless-local
 
 If `HCR_RUN_POLLER=true`, `run-once` polls Hardcore Radio itself before importing logger files. The poller only writes observations. It does not download audio and does not touch Spotify.
 
-The poller requests the configured Icecast status endpoint first and falls back to the official player webpage when Icecast is unavailable or has no usable track metadata. Each run starts with Icecast again. Every HTTP attempt uses a unique request URL and no-cache/no-store headers, so the client does not reuse a previous response; the broadcaster may itself serve an older webpage track. Poll timestamps mean **observed at**; they do not establish when the broadcaster first played or published the track. If neither source provides usable metadata, standalone `poll-radio` fails. `run-once` records a warning and continues its remaining stages without adding a radio observation; with `HCR_AUDIT_VERBOSE=true`, apply-mode runs also record a per-poll unavailable event with sanitized failure reasons. Local file, logger, database, and synchronization safety errors still fail the run.
+The poller requests the configured Icecast status endpoint first and falls back to the official player webpage when Icecast is unavailable or has no usable track metadata. Each run starts with Icecast again. Every HTTP attempt uses a unique request URL and no-cache/no-store headers, so the client does not reuse a previous response; the broadcaster may itself serve an older webpage track. Poll timestamps mean **observed at**; they do not establish when the broadcaster first played or published the track. The broadcaster's exact unavailable-information placeholder is rejected as missing metadata and is never searched as a song. If neither source provides usable metadata, standalone `poll-radio` fails. `run-once` records a warning and continues its remaining stages without adding a radio observation; with `HCR_AUDIT_VERBOSE=true`, apply-mode runs also record a per-poll unavailable event with sanitized failure reasons. Local file, logger, database, and synchronization safety errors still fail the run.
 
 ```bash
 python -m hcr_sync poll-radio --dry-run
@@ -254,3 +256,7 @@ python -m hcr_sync run-once --dry-run
 ```
 
 Do not delete legacy logger files until they have been imported and the new system has run successfully. If you archive old runtime files later, prefer moving them to an archive folder outside the repository.
+
+## Local validation
+
+Run `python -m pytest -q` with disposable fixtures and fake provider clients. The supported Python versions are 3.11 through 3.14; run the suite locally for each version. Before committing, also run the privacy/ignore checks in `AGENTS.md` and `git diff --check`. Hosted Actions are not required for delivery.

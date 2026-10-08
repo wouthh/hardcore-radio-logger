@@ -58,9 +58,8 @@ def spotify_playlist_scan_skip(config: Config, *, now: datetime | None = None) -
     now = now or datetime.now(timezone.utc)
     try:
         with connect(config) as con:
-            source = get_state(con, "spotify_rate_limit_source", "")
             cooldown_until = _parse_utc(get_state(con, "spotify_rate_limited_until", ""))
-            if source in {"spotify_scan", "reconcile"} and cooldown_until and cooldown_until > now:
+            if cooldown_until and cooldown_until > now:
                 return "playlist_read_cooldown", _format_utc(cooldown_until)
 
             interval_hours = max(0, config.int("HCR_SPOTIFY_SCAN_INTERVAL_HOURS"))

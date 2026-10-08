@@ -24,6 +24,7 @@ from .spotify_sync import (
     SpotifyClientProtocol,
     SpotipyClient,
     _clear_spotify_rate_limit,
+    _spotify_cooldown_active,
     _is_rate_limited,
     _remember_spotify_rate_limit,
     _snapshot_association_plan,
@@ -274,6 +275,8 @@ def _cascade_local(con, config: Config, track_id: int, summary: ReconcileSummary
 
 
 def _cascade_spotify(con, config: Config, track_id: int, summary: ReconcileSummary, client: SpotifyClientProtocol | None) -> None:
+    if _spotify_cooldown_active(con):
+        client = None
     playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID")
     recording_rows = _active_spotify_recordings(con, playlist_id=playlist_id, track_id=track_id)
     rows = recording_rows or list(
@@ -300,7 +303,14 @@ def _cascade_spotify(con, config: Config, track_id: int, summary: ReconcileSumma
         return
     if client and uris:
         unique_uris = list(dict.fromkeys(uris))
-        client.remove_tracks(playlist_id, unique_uris)
+        try:
+            client.remove_tracks(playlist_id, unique_uris)
+        except Exception as exc:
+            if not _is_rate_limited(exc):
+                raise
+            _remember_spotify_rate_limit(con, config, exc, event_source="reconcile")
+            summary.refused.append("spotify: removal deferred by rate limit")
+            return
         summary.spotify_removed += len(unique_uris)
     for row in rows:
         if recording_rows:
@@ -422,6 +432,9 @@ def reconcile(
 ) -> ReconcileSummary:
     summary = ReconcileSummary()
     with connect(config) as con:
+        if _spotify_cooldown_active(con):
+            skip_spotify = True
+            spotify_client = None
         current_paths = {str(path) for path in audio_paths(config.music_dir)}
         known_local = list(
             con.execute(

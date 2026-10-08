@@ -11,7 +11,7 @@ from typing import Protocol
 
 from .config import Config
 from .db import add_event, connect, now_utc, transaction, upsert_youtube_asset, wanted_tracks
-from .identity import compact_text, duplicate_artist_tokens, duplicate_title_tokens, likely_same_recording, match_confidence, normalize_for_match, parse_artist_title
+from .identity import compact_text, duplicate_artist_tokens, duplicate_title_tokens, likely_same_recording, match_confidence, normalize_for_match, parse_artist_title, radio_metadata_placeholder
 from .local_files import AUDIO_EXTENSIONS, youtube_id_from_path
 from .system import assert_legacy_downloader_safe
 
@@ -428,6 +428,9 @@ def sync_youtube(
         review_ids = _review_track_keys(con)
         for track in tracks:
             summary.wanted += 1
+            if radio_metadata_placeholder(track["display_artist"], track["display_title"]):
+                summary.review += 1
+                continue
             if track["id"] in suspected_local_delete_ids:
                 summary.skipped += 1
                 if apply:

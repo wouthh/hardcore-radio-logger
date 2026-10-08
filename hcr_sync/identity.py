@@ -69,6 +69,10 @@ def canonical_key(artist: str, title: str) -> str:
     return f"{normalized_artist}::{normalized_title}"
 
 
+def radio_metadata_placeholder(artist: str, title: str) -> bool:
+    return canonical_key(artist, title) == "tijdelijk niet beschikbaar::nummerinformatie"
+
+
 def fingerprint(value: str) -> str:
     return hashlib.sha256(normalize_for_match(value).encode("utf-8")).hexdigest()
 

@@ -21,7 +21,7 @@ from typing import Any
 
 from .config import Config
 from .db import add_event, connect, now_utc, transaction
-from .identity import compact_text, display_from_parts, fingerprint, normalize_for_match
+from .identity import compact_text, display_from_parts, fingerprint, normalize_for_match, parse_artist_title, radio_metadata_placeholder
 
 MAX_STATUS_BYTES = 1_000_000
 PLAYER_PAGE_URL = "https://www.hardcoreradio.nl/player/"
@@ -204,6 +204,8 @@ def current_track(payload: dict[str, Any], stream_url: str) -> str:
     source = sorted(entries, key=lambda item: _source_score(item, stream_url), reverse=True)[0]
     artist = compact_text(source.get("artist"))
     title = compact_text(source.get("title"))
+    if radio_metadata_placeholder(artist, title) or radio_metadata_placeholder(*parse_artist_title(title)):
+        raise PollSourceUnavailable("placeholder_track_metadata")
     if artist and title:
         normalized_artist = normalize_for_match(artist)
         normalized_title = normalize_for_match(title)
@@ -324,6 +326,8 @@ def track_from_player_page(page: str) -> str:
     artist, title = fields["artist"][0], fields["title"][0]
     if not artist or not title:
         raise PollSourceUnavailable("missing_track_fields")
+    if radio_metadata_placeholder(artist, title):
+        raise PollSourceUnavailable("placeholder_track_metadata")
     return display_from_parts(artist, title)
 
 

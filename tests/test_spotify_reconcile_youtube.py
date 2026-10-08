@@ -924,7 +924,7 @@ def test_successful_spotify_scan_clears_stale_rate_limit_and_allows_sync(tmp_pat
     with connect(config) as con:
         with transaction(con):
             ensure_track(con, artist="Artist", title="Title", status="wanted")
-            set_state(con, "spotify_rate_limited_until", "2099-01-01T00:00:00Z")
+            set_state(con, "spotify_rate_limited_until", "2000-01-01T00:00:00Z")
             set_state(con, "spotify_rate_limit_last_response", "{}")
 
     scan_summary = scan_spotify_playlist(config, apply=True, client=FakeSpotify(snapshot_tracks=[]))
@@ -943,7 +943,7 @@ def test_successful_spotify_scan_clears_stale_rate_limit_and_allows_sync(tmp_pat
         assert event["event_source"] == "spotify_scan"
 
 
-def test_successful_spotify_scan_keeps_sync_rate_limit_cooldown(tmp_path):
+def test_spotify_scan_skips_active_sync_rate_limit_cooldown(tmp_path):
     config = make_config(tmp_path)
     init_db(config)
     with connect(config) as con:
@@ -954,7 +954,7 @@ def test_successful_spotify_scan_keeps_sync_rate_limit_cooldown(tmp_path):
 
     scan_summary = scan_spotify_playlist(config, apply=True, client=FakeSpotify(snapshot_tracks=[]))
 
-    assert scan_summary.rate_limited is False
+    assert scan_summary.rate_limited is True
     with connect(config) as con:
         assert con.execute("SELECT value FROM sync_state WHERE key = 'spotify_rate_limited_until'").fetchone() is not None
         assert con.execute("SELECT * FROM events WHERE event_type = 'spotify_rate_limit_cooldown_cleared'").fetchone() is None
@@ -970,7 +970,7 @@ def test_successful_reconcile_spotify_fetch_clears_stale_rate_limit(tmp_path):
             set_state(con, "last_local_scan_count", "0")
             set_state(con, "spotify_baseline_complete", "true")
             set_state(con, "last_spotify_playlist_count", "0")
-            set_state(con, "spotify_rate_limited_until", "2099-01-01T00:00:00Z")
+            set_state(con, "spotify_rate_limited_until", "2000-01-01T00:00:00Z")
             set_state(con, "spotify_rate_limit_last_response", "{}")
 
     summary = reconcile(config, apply=True, spotify_client=FakeSpotify(snapshot_tracks=[]))

@@ -230,14 +230,14 @@ def test_spotify_playlist_scan_skip_honors_playlist_read_cooldown(tmp_path):
     assert next_scan_at == "2099-01-01T00:00:00Z"
 
 
-def test_spotify_playlist_scan_skip_ignores_sync_add_cooldown_without_recent_scan(tmp_path):
+def test_spotify_playlist_scan_skip_honors_sync_cooldown_without_recent_scan(tmp_path):
     config = make_config(tmp_path)
     init_db(config)
     with connect(config) as con:
         set_state(con, "spotify_rate_limit_source", "spotify_sync")
         set_state(con, "spotify_rate_limited_until", "2099-01-01T00:00:00Z")
 
-    assert spotify_playlist_scan_skip(config, now=datetime(2026, 1, 1, tzinfo=timezone.utc)) == ("", "")
+    assert spotify_playlist_scan_skip(config, now=datetime(2026, 1, 1, tzinfo=timezone.utc)) == ("playlist_read_cooldown", "2099-01-01T00:00:00Z")
 
 
 def test_run_once_reuses_due_spotify_scan_snapshot_for_reconcile(monkeypatch, tmp_path):

@@ -58,6 +58,7 @@ class FakeSpotify:
 
     def remove_tracks(self, playlist_id: str, uris: list[str]) -> None:
         self.removed.extend(uris)
+        self.tracks = [item for item in self.tracks if item.uri not in uris]
 
 
 def recording(

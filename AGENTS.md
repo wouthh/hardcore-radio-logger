@@ -5,6 +5,8 @@ This project is a SQLite-backed sync system for Hardcore Radio observations, a l
 ## Project Rules
 
 - The SQLite database is the source of truth.
+- Spotify writes require a committed pending intent and verified membership before completion; do not bypass pending recovery or the shared request budget.
+- Unidentified playlist entries cannot prove removal. Source scheduling must not change another track's recording ownership or match provenance.
 - Logger files, local music files, YouTube, and Spotify are inputs or outputs.
 - Exclusions and tombstones must never be resurrected by logger imports.
 - Destructive operations must default to dry-run and require `--apply`.

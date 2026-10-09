@@ -241,6 +241,7 @@ def test_spotify_playlist_scan_skip_honors_sync_cooldown_without_recent_scan(tmp
 
 
 def test_run_once_reuses_due_spotify_scan_snapshot_for_reconcile(monkeypatch, tmp_path):
+    monkeypatch.setattr("hcr_sync.spotify_sync.SpotipyClient", lambda _config: object())
     config = make_config(tmp_path)
     init_db(config)
     snapshot = object()
@@ -273,6 +274,7 @@ def test_run_once_reuses_due_spotify_scan_snapshot_for_reconcile(monkeypatch, tm
 
 
 def test_run_once_zero_spotify_scan_interval_preserves_every_run_scan(monkeypatch, tmp_path):
+    monkeypatch.setattr("hcr_sync.spotify_sync.SpotipyClient", lambda _config: object())
     config = make_config(tmp_path, HCR_SPOTIFY_SCAN_INTERVAL_HOURS="0")
     init_db(config)
     with connect(config) as con:
@@ -297,6 +299,7 @@ def test_run_once_zero_spotify_scan_interval_preserves_every_run_scan(monkeypatc
 def test_run_once_continues_all_stages_when_both_radio_sources_are_unavailable(monkeypatch, tmp_path, capsys):
     from hcr_sync.poller import PollSourcesUnavailable
 
+    monkeypatch.setattr("hcr_sync.spotify_sync.SpotipyClient", lambda _config: object())
     config = make_config(tmp_path, HCR_RUN_POLLER="true")
     args = SimpleNamespace(apply=True, force_mass_delete=False, force_confirm_deletions=False, complete_idless_local=None)
     calls = []
@@ -363,3 +366,35 @@ def test_run_once_keeps_invalid_logger_input_fatal_after_radio_warning(monkeypat
     monkeypatch.setattr("hcr_sync.cli.import_logger", invalid_input)
     with pytest.raises(ValueError, match="invalid timestamp"):
         cmd_run_once(args, config)
+
+
+def test_failed_scan_keeps_one_request_budget_and_continues_local_pipeline(tmp_path, monkeypatch):
+    from hcr_sync.cli import main
+    from hcr_sync.db import ensure_track
+    from test_spotify_adapter import metadata, page, response, spotify_http
+    from hcr_sync.spotify_adapter import RequestBudget
+    config = make_config(tmp_path, HCR_RUN_POLLER='true', HCR_SPOTIFY_SCAN_INTERVAL_HOURS='0',
+                         HCR_SEEN_TRACKS_JSONL=str(tmp_path/'missing.jsonl'), HCR_PLAYED_TRACKS_TSV=str(tmp_path/'missing.tsv'))
+    init_db(config)
+    config.music_dir.mkdir()
+    with connect(config) as con:
+        ensure_track(con, artist='Source', title='Song')
+        set_state(con, 'local_baseline_complete', 'true')
+        con.commit()
+    events = []
+    replies = [response(metadata(416))] + [response(page(416, offset)) for offset in range(0,416,50)]
+    replies += [response(metadata(416, 'changed'))] + [response({'tracks':{'items':[]}})]*2
+    with spotify_http(tmp_path, replies, budget=RequestBudget(20)) as (client, calls):
+        constructed = []
+        def construct(_config):
+            constructed.append(True)
+            return client
+        monkeypatch.setattr('hcr_sync.spotify_sync.SpotipyClient', construct)
+        monkeypatch.setattr('hcr_sync.cli.load_config', lambda _path: config)
+        monkeypatch.setattr('hcr_sync.cli.assert_legacy_downloader_safe', lambda _config: None)
+        monkeypatch.setattr('hcr_sync.cli.poll_radio', lambda *_args, **_kwargs: (events.append('radio') or False, ''))
+        monkeypatch.setattr('hcr_sync.cli.sync_youtube', lambda *_args, **_kwargs: SimpleNamespace(downloaded=events.append('youtube') or 0))
+        assert main(['run-once','--apply']) == 0
+        assert constructed == [True]
+        assert client.budget.used == len(calls) == 13
+        assert events == ['radio','youtube']

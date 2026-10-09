@@ -7,7 +7,7 @@ import sqlite3
 import pytest
 
 from hcr_sync.config import Config, DEFAULTS
-from hcr_sync.db import connect, ensure_track, init_db, mark_excluded, transaction, upsert_spotify_asset
+from hcr_sync.db import connect, ensure_track, init_db, mark_excluded, transaction, unexclude_track, upsert_spotify_asset
 from hcr_sync.spotify_adapter import RequestBudget, SpotifyTrack
 from hcr_sync import spotify_work
 from test_spotify_adapter import item, metadata, response, spotify_http
@@ -172,6 +172,34 @@ def test_failed_compensation_preserves_positive_membership_and_exclusion(tmp_pat
         assert result.removed == 1 and result.pending == 0
         assert client.budget.used == len(calls) == 7
     assert_membership(config, track_id, False, 'excluded')
+
+
+@pytest.mark.parametrize('state', ['ready', 'dispatched', 'acknowledged'])
+def test_unexclude_cancels_compensation_without_removing_wanted_track(tmp_path, state):
+    config, track_id = seed(tmp_path, state='acknowledged', excluded=True)
+    with spotify_http(tmp_path, snapshot_responses(True, 'after-add')) as (client, calls), connect(config) as con:
+        assert spotify_work.recover_pending(con, config, client).pending == 1
+    with connect(config) as con, transaction(con):
+        unexclude_track(con, track_id=track_id)
+        con.execute('UPDATE spotify_pending_work SET state=?', (state,))
+    responses = [] if state == 'ready' else [response(metadata(1, 'after-add'))]
+    with spotify_http(tmp_path, responses) as (client, calls), connect(config) as con:
+        result = spotify_work.recover_pending(con, config, client)
+        assert result.pending == result.removed == 0 and result.failure is None
+        assert all(call['method'] == 'GET' for call in calls)
+        assert client.budget.used == len(calls) == (0 if state == 'ready' else 1)
+    assert_membership(config, track_id, True)
+
+
+def test_unexcluded_dispatched_removal_still_recovers_observed_remote_effect(tmp_path):
+    config, track_id = seed(tmp_path, kind='remove', state='dispatched')
+    with connect(config) as con, transaction(con):
+        unexclude_track(con, track_id=track_id)
+    with spotify_http(tmp_path, snapshot_responses(False, 'after-remove')) as (client, calls), connect(config) as con:
+        result = spotify_work.recover_pending(con, config, client)
+        assert result.pending == 0 and result.removed == 1 and result.failure is None
+        assert all(call['method'] == 'GET' for call in calls)
+    assert_membership(config, track_id, False)
 
 
 @pytest.mark.parametrize('kind', ['add', 'remove'])

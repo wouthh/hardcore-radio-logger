@@ -181,8 +181,9 @@ def recover_pending(con, config, client, snapshot=None, *, dispatch=True):
             with transaction(con):
                 con.execute('DELETE FROM spotify_pending_work WHERE id=?', (row['id'],))
             continue
-        if not add and (not source or source['status'] != 'excluded') and payload['reason'] != 'excluded_during_add':
-            result.deferred += 1
+        if not add and (not source or source['status'] != 'excluded') and row['state'] == 'ready':
+            with transaction(con):
+                con.execute('DELETE FROM spotify_pending_work WHERE id=?', (row['id'],))
             continue
         write_in_flight = False
         try:
@@ -198,6 +199,11 @@ def recover_pending(con, config, client, snapshot=None, *, dispatch=True):
                     result.added += int(add)
                     result.tentative_added += int(add and not payload['confident'])
                     result.removed += int(not add)
+                continue
+            if not add and (not source or source['status'] != 'excluded') and present:
+                # An unexclude cancels removal; dispatched intents still need evidence.
+                with transaction(con):
+                    con.execute('DELETE FROM spotify_pending_work WHERE id=?', (row['id'],))
                 continue
             if snapshot.identified and row['state'] == 'dispatched':
                 # Verified non-effect clears uncertainty, but not the retry delay.

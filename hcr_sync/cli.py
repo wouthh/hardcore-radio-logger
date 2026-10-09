@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
 from .config import Config, load_config
@@ -115,6 +116,11 @@ def cmd_scan_local(args: argparse.Namespace, config: Config) -> int:
 
 
 def cmd_spotify(args: argparse.Namespace, config: Config) -> int:
+    if args.spotify_command == "repair-scheduling":
+        from .spotify_repair import repair_scheduling
+        import json
+        print(json.dumps(repair_scheduling(config, apply=is_apply(args), backup=args.backup), sort_keys=True))
+        return 0
     if args.spotify_command == "auth":
         user = spotify_auth(config)
         print(f"Spotify authenticated: {user}")
@@ -124,7 +130,7 @@ def cmd_spotify(args: argparse.Namespace, config: Config) -> int:
         print_kv("spotify_backfill", summary)
         return 0
     if args.spotify_command == "scan":
-        summary = scan_spotify_playlist(config, apply=is_apply(args))
+        summary = scan_spotify_playlist(config, apply=is_apply(args), protected=False)
         print_kv("spotify_scan", summary)
         return 0
     if args.spotify_command == "sync":
@@ -230,7 +236,10 @@ def cmd_run_once(args: argparse.Namespace, config: Config) -> int:
             skip_spotify_reconcile = True
         else:
             try:
-                spotify_scan_summary = scan_spotify_playlist(config, apply=apply)
+                from . import spotify_sync as spotify_module
+                if config.bool("HCR_SPOTIFY_ENABLED") and config.get("HCR_SPOTIFY_PLAYLIST_ID"):
+                    spotify_client = spotify_module.SpotipyClient(config)
+                spotify_scan_summary = scan_spotify_playlist(config, apply=apply, client=spotify_client)
             except SpotifyAssociationConflict:
                 raise
             except Exception as exc:
@@ -264,7 +273,7 @@ def cmd_run_once(args: argparse.Namespace, config: Config) -> int:
             return 1
         yt_summary = sync_youtube(config, apply=apply, complete_idless_local=args.complete_idless_local)
         print_kv("youtube_sync", yt_summary)
-        sp_summary = sync_spotify(config, apply=apply)
+        sp_summary = sync_spotify(config, apply=apply, client=spotify_client)
         print_kv("spotify_sync", sp_summary)
         print(format_report(build_report(config)))
     return 1 if apply and fatal_reconcile_refusals(rec_summary.refused) else 0
@@ -302,6 +311,9 @@ def build_parser() -> argparse.ArgumentParser:
     spotify_parser = sub.add_parser("spotify")
     spotify_sub = spotify_parser.add_subparsers(dest="spotify_command", required=True)
     spotify_sub.add_parser("auth")
+    repair = spotify_sub.add_parser("repair-scheduling")
+    add_apply_args(repair)
+    repair.add_argument("--backup", help="New owner-only SQLite backup required with --apply")
     spotify_backfill = spotify_sub.add_parser("backfill")
     add_apply_args(spotify_backfill)
     spotify_scan = spotify_sub.add_parser("scan")
@@ -354,7 +366,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     config = load_config(args.config)
     try:
-        return args.func(args, config)
+        lock_needed = is_apply(args) and args.command != "run-once"
+        with sync_lock(config.sync_lock_path) if lock_needed else nullcontext():
+            return args.func(args, config)
     except LegacyDownloaderActive as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

@@ -9,7 +9,7 @@ from hcr_sync.db import connect, ensure_track, init_db, set_state, transaction, 
 from hcr_sync.poller import PollSourceUnavailable, current_track, track_from_player_page
 from hcr_sync.reconcile import _cascade_spotify, ReconcileSummary, reconcile
 from hcr_sync.spotify_sync import (
-    SpotipyClient, SpotifyTrack, _is_rate_limited, backfill_spotify,
+    SpotipyClient, SpotifyTrack, PlaylistSnapshot, _is_rate_limited, backfill_spotify,
     scan_spotify_playlist, sync_spotify,
 )
 from hcr_sync.youtube_sync import sync_youtube
@@ -30,6 +30,7 @@ class EchoSpotify:
     def __init__(self, operation='', status=429):
         self.operation, self.status = operation, status
         self.search_calls, self.added = [], []
+        self.tracks = []
 
     def fail(self):
         exc = RuntimeError('synthetic failure')
@@ -44,10 +45,14 @@ class EchoSpotify:
             self.fail()
         return [SpotifyTrack(uri='spotify:track:' + artist, track_id=artist, artist=artist, title=title)]
 
+    def playlist_snapshot(self, playlist):
+        return PlaylistSnapshot(playlist, "synthetic", list(self.tracks))
+
     def add_tracks(self, playlist, uris):
         if uris == ['spotify:track:First'] and self.operation == 'add':
             self.fail()
         self.added.extend(uris)
+        self.tracks += [SpotifyTrack(uri=uri, track_id=uri.split(":")[-1], artist=uri.split(":")[-1], title="Song") for uri in uris]
 
 
 @pytest.mark.parametrize('operation', ['search', 'add'])
@@ -81,10 +86,18 @@ def test_failed_attempts_rotate_without_losing_provenance(tmp_path, operation, s
             assert payload['retry_after_seconds'] == 82375 and payload['reason'] == 'QUOTA_EXCEEDED'
         set_state(con, 'spotify_rate_limited_until', '2000-01-01T00:00:00Z')
         con.execute("UPDATE spotify_assets SET search_next_at='2000-01-01T00:00:00Z' WHERE track_id=?", (first['id'],))
+        for row in con.execute("SELECT * FROM spotify_pending_work WHERE kind='add'"):
+            payload = json.loads(row['payload_json']); payload['retry_at'] = '2000-01-01T00:00:00Z'
+            payload['retry_after_verification'] = '2000-01-01T00:00:00Z'
+            con.execute('UPDATE spotify_pending_work SET payload_json=? WHERE id=?', (json.dumps(payload), row['id']))
         con.commit()
     healthy = EchoSpotify()
     sync_spotify(config, apply=True, client=healthy)
-    assert healthy.search_calls[0] == (('First', 'Song') if status in (400, 404) else ('Second', 'Song'))
+    if operation == 'add':
+        assert ('First', 'Song') not in healthy.search_calls
+        assert 'spotify:track:First' in healthy.added
+    else:
+        assert healthy.search_calls[0] == (('First', 'Song') if status in (400, 404) else ('Second', 'Song'))
 
 
 @pytest.mark.parametrize('operation', ['search', 'add'])
@@ -181,6 +194,14 @@ def test_removal_rate_limit_defers_membership_and_subsequent_calls(tmp_path):
             _cascade_spotify(con, config, track['id'], summary, client)
         assert con.execute('SELECT in_playlist FROM spotify_assets').fetchone()[0] == 1
         assert con.execute('SELECT in_playlist FROM spotify_playlist_recordings').fetchone()[0] == 1
+    assert client.calls == 0  # Cascades enqueue inside the local transaction.
+    from hcr_sync.spotify_work import recover_pending
+    with connect(config) as con:
+        con.execute("UPDATE tracks SET status='excluded' WHERE id=?", (track['id'],)); con.commit()
+        client.tracks = [SpotifyTrack('spotify:track:stored', 'stored', 'Artist', 'Song')]
+        assert recover_pending(con, config, client).rate_limited
+        assert recover_pending(con, config, client).rate_limited
+        assert con.execute('SELECT in_playlist FROM spotify_assets').fetchone()[0] == 1
     assert client.calls == 1 and summary.spotify_removed == 0
 
 
@@ -198,7 +219,7 @@ def test_first_rate_limited_attempt_creates_schedule_and_rotates(tmp_path, opera
         con.execute("UPDATE spotify_assets SET search_next_at='2000-01-01T00:00:00Z'"); con.commit()
     healthy = EchoSpotify()
     sync_spotify(config, apply=True, client=healthy)
-    assert healthy.search_calls == [('Second', 'Song'), ('First', 'Song')]
+    assert healthy.search_calls == ([('Second', 'Song'), ('First', 'Song')] if operation == 'search' else [('Second', 'Song')])
 
 
 def test_due_retries_use_oldest_attempt_not_oldest_due_date(tmp_path):

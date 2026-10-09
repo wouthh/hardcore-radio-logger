@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from contextlib import closing, nullcontext
+from contextlib import closing, nullcontext, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Protocol
@@ -58,151 +58,18 @@ SPOTIFY_FIRST_RETRY_DAYS = 7
 SPOTIFY_STEADY_RETRY_DAYS = 14
 
 
-@dataclass(frozen=True)
-class SpotifyTrack:
-    uri: str
-    track_id: str
-    artist: str
-    title: str
-    duration_ms: int | None = None
-    artist_ids: tuple[str, ...] = ()
-    album: str = ""
-    isrc: str = ""
-    metadata_ambiguous: bool = False
-
-
-@dataclass(frozen=True)
-class PlaylistSnapshot:
-    playlist_id: str
-    snapshot_id: str
-    tracks: list[SpotifyTrack]
-    complete: bool = True
+from .spotify_adapter import (
+    SpotifyTrack, PlaylistSnapshot, SpotipyClient, BudgetDeferred,
+    _spotify_track_from_playlist_item,
+)
 
 
 class SpotifyClientProtocol(Protocol):
     def auth_check(self) -> str: ...
     def playlist_snapshot(self, playlist_id: str) -> PlaylistSnapshot: ...
     def search_track(self, artist: str, title: str) -> list[SpotifyTrack]: ...
-    def add_tracks(self, playlist_id: str, uris: list[str]) -> None: ...
-    def remove_tracks(self, playlist_id: str, uris: list[str]) -> None: ...
-
-
-class SpotipyClient:
-    def __init__(self, config: Config):
-        try:
-            import spotipy
-            from spotipy.oauth2 import SpotifyOAuth
-        except Exception as exc:
-            raise RuntimeError("Spotipy is not installed; install requirements.txt first") from exc
-
-        self.config = config
-        self.sp = spotipy.Spotify(
-            auth_manager=SpotifyOAuth(
-                client_id=config.get("HCR_SPOTIFY_CLIENT_ID"),
-                client_secret=config.get("HCR_SPOTIFY_CLIENT_SECRET"),
-                redirect_uri=config.get("HCR_SPOTIFY_REDIRECT_URI"),
-                scope=config.spotify_scopes,
-                cache_path=str(config.path("HCR_SPOTIFY_TOKEN_CACHE")),
-                open_browser=True,
-            ),
-            requests_timeout=config.int("HCR_SPOTIFY_REQUEST_TIMEOUT"),
-            retries=config.int("HCR_SPOTIFY_REQUEST_RETRIES"),
-            status_retries=config.int("HCR_SPOTIFY_STATUS_RETRIES"),
-        )
-        # Return exhausted HTTP responses to Spotipy instead of its synthetic 429.
-        for adapter in self.sp._session.adapters.values():
-            adapter.max_retries = adapter.max_retries.new(raise_on_status=False)
-
-    def auth_check(self) -> str:
-        user = self.sp.current_user()
-        return str(user.get("id") or user.get("display_name") or "authenticated")
-
-    def playlist_snapshot(self, playlist_id: str) -> PlaylistSnapshot:
-        meta = self.sp.playlist(playlist_id, fields="snapshot_id")
-        snapshot_id = str(meta.get("snapshot_id") or "")
-        tracks: list[SpotifyTrack] = []
-        offset = 0
-        complete = True
-        while True:
-            page = self.sp.playlist_items(
-                playlist_id,
-                offset=offset,
-                limit=100,
-                fields="items(track(id,uri,name,duration_ms,artists(id,name),album(name),external_ids(isrc),type),item(id,uri,name,duration_ms,artists(id,name),album(name),external_ids(isrc),type)),next,total",
-            )
-            items = page.get("items") or []
-            for item in items:
-                track = _spotify_track_from_playlist_item(item)
-                if track is not None:
-                    tracks.append(track)
-            if not page.get("next"):
-                break
-            offset += len(items)
-            if not items:
-                complete = False
-                break
-        return PlaylistSnapshot(playlist_id=playlist_id, snapshot_id=snapshot_id, tracks=tracks, complete=complete)
-
-    def search_track(self, artist: str, title: str) -> list[SpotifyTrack]:
-        tracks = []
-        seen_ids: set[str] = set()
-        for query in _spotify_search_queries(artist, title):
-            result = self.sp.search(q=query, type="track", limit=10)
-            for item in (result.get("tracks") or {}).get("items") or []:
-                artists = item.get("artists") or []
-                track_id = str(item.get("id") or "")
-                uri = str(item.get("uri") or "")
-                name = str(item.get("name") or "")
-                if not track_id or not uri or not name or track_id in seen_ids:
-                    continue
-                seen_ids.add(track_id)
-                tracks.append(
-                    SpotifyTrack(
-                        uri=uri,
-                        track_id=track_id,
-                        artist=", ".join(str(artist.get("name") or "") for artist in artists),
-                        title=name,
-                        duration_ms=item.get("duration_ms"),
-                        artist_ids=tuple(
-                            str(artist.get("id") or "")
-                            for artist in artists
-                            if artist.get("id")
-                        ),
-                        album=str((item.get("album") or {}).get("name") or ""),
-                        isrc=str((item.get("external_ids") or {}).get("isrc") or ""),
-                    )
-                )
-        return tracks
-
-    def add_tracks(self, playlist_id: str, uris: list[str]) -> None:
-        if uris:
-            self.sp.playlist_add_items(playlist_id, uris)
-
-    def remove_tracks(self, playlist_id: str, uris: list[str]) -> None:
-        if uris:
-            self.sp.playlist_remove_all_occurrences_of_items(playlist_id, uris)
-
-
-def _spotify_track_from_playlist_item(item: dict) -> SpotifyTrack | None:
-    track = item.get("track") or item.get("item") or {}
-    if track.get("type") and track.get("type") != "track":
-        return None
-    track_id = str(track.get("id") or "")
-    uri = str(track.get("uri") or "")
-    title = str(track.get("name") or "")
-    if not track_id or not uri or not title:
-        return None
-    artists = track.get("artists") or []
-    return SpotifyTrack(
-        uri=uri,
-        track_id=track_id,
-        artist=", ".join(str(artist.get("name") or "") for artist in artists),
-        title=title,
-        duration_ms=track.get("duration_ms"),
-        artist_ids=tuple(str(artist.get("id") or "") for artist in artists if artist.get("id")),
-        album=str((track.get("album") or {}).get("name") or ""),
-        isrc=str((track.get("external_ids") or {}).get("isrc") or ""),
-    )
+    def add_tracks(self, playlist_id: str, uris: list[str]) -> dict | None: ...
+    def remove_tracks(self, playlist_id: str, uris: list[str]) -> dict | None: ...
 
 
 @dataclass
@@ -215,6 +82,13 @@ class SpotifySummary:
     skipped: int = 0
     ambiguous: int = 0
     rate_limited: bool = False
+    first_time: int = 0
+    retries: int = 0
+    requests: int = 0
+    acknowledged: int = 0
+    pending: int = 0
+    budget_deferred: int = 0
+    required_budget: int = 0
     _snapshot: PlaylistSnapshot | None = None
     _client: SpotifyClientProtocol | None = None
 
@@ -469,7 +343,7 @@ def _spotify_search_attempts(asset) -> int:
         return 0
 
 
-def _remember_failed_spotify_attempt(con, config: Config, track, asset, exc: Exception, *, operation: str) -> None:
+def _remember_failed_spotify_attempt(con, config: Config, track, asset, exc: Exception, *, operation: str, rotation: tuple[str, int] | None = None) -> None:
     rate_limited = _is_rate_limited(exc)
     if rate_limited:
         _remember_spotify_rate_limit(con, config, exc)
@@ -489,7 +363,11 @@ def _remember_failed_spotify_attempt(con, config: Config, track, asset, exc: Exc
             search_next_at=next_at,
             update_search=True,
         )
+        if rotation is not None:
+            set_state(con, rotation[0], str(rotation[1]))
+            con.execute("DELETE FROM spotify_pending_work WHERE playlist_id=? AND track_id=? AND kind='search'", (config.get("HCR_SPOTIFY_PLAYLIST_ID"), track['id']))
         add_event(con, track["id"], "spotify_request_failed", "spotify_sync", {
+            "playlist_id": config.get("HCR_SPOTIFY_PLAYLIST_ID"),
             "operation": operation,
             "http_status": getattr(exc, "http_status", None),
             "error_type": type(exc).__name__,
@@ -615,49 +493,6 @@ def _track_has_ambiguous_spotify_recording(con, *, playlist_id: str, track) -> b
     return False
 
 
-def _mark_spotify_candidate_conflict(
-    con,
-    *,
-    playlist_id: str,
-    track,
-    candidate: SpotifyTrack,
-    score: float,
-    existing_asset,
-    searched_at: str,
-    search_attempts: int,
-) -> None:
-    upsert_spotify_asset(
-        con,
-        track_id=track["id"],
-        playlist_id=playlist_id,
-        spotify_track_uri=candidate.uri,
-        spotify_track_id="",
-        spotify_artist=candidate.artist,
-        spotify_title=candidate.title,
-        in_playlist=False,
-        match_confidence=0.0,
-        status="review",
-        search_last_at=searched_at,
-        search_attempts=search_attempts,
-        search_next_at=None,
-        update_search=True,
-    )
-    add_event(
-        con,
-        track["id"],
-        "spotify_candidate_already_linked",
-        "spotify_sync",
-        {
-            "spotify_track_id": candidate.track_id,
-            "score": score,
-            "existing_track_id": existing_asset["track_id"],
-            "existing_asset_id": existing_asset["id"],
-            "reason": "candidate Spotify recording is already represented in the playlist registry",
-        },
-        dedupe_key=f"spotify_candidate_already_linked:{track['id']}:{candidate.track_id}:{existing_asset['id']}",
-    )
-
-
 class SpotifyAssociationConflict(RuntimeError):
     """A snapshot cannot safely replace an existing candidate association."""
 
@@ -706,8 +541,10 @@ def _snapshot_recordings(snapshot: PlaylistSnapshot) -> list[SpotifyTrack]:
     """Return one deterministic item per recording, retaining ambiguity markers."""
     by_id: dict[str, SpotifyTrack] = {}
     for item in snapshot.tracks:
-        if not item.track_id or not item.uri or not item.title:
+        if not item.track_id or not item.uri:
             raise SpotifyAssociationConflict("Spotify playlist snapshot association conflict")
+        if not item.title or not item.artist:
+            item = replace(item, metadata_ambiguous=True)
         previous = by_id.get(item.track_id)
         if previous is None:
             by_id[item.track_id] = item
@@ -886,6 +723,12 @@ def _snapshot_association_plan(con, snapshot: PlaylistSnapshot) -> list[_Snapsho
     resolutions: dict[str, _SnapshotResolution] = {}
     ambiguous_reason = "ambiguous Spotify recording metadata"
     for key, items in grouped.items():
+        if all(item.metadata_ambiguous for item in items):
+            for item in items:
+                registry = registry_rows.get(item.track_id)
+                owner = registry['track_id'] if registry is not None and registry['track_id'] is not None else asset_owners.get(item.track_id)
+                resolutions[item.track_id] = _SnapshotResolution(item, key, track_id=owner, ambiguous_reason=ambiguous_reason)
+            continue
         known_owners = {
             int(registry_rows[item.track_id]["track_id"])
             for item in items
@@ -1084,7 +927,7 @@ def _import_playlist_snapshot(
                     """,
                     (snapshot.playlist_id, item.track_id),
                 ).fetchone()
-                if resolution.ambiguous_reason and resolution.track_id is None:
+                if resolution.ambiguous_reason:
                     if existing_recording is not None and existing_recording["track_id"] is not None:
                         # A duplicate provider row may disagree with itself,
                         # but it must never overwrite an already-owned
@@ -1257,7 +1100,7 @@ def _import_playlist_snapshot(
                     dedupe_key=f"spotify_playlist_seen:{snapshot.playlist_id}:{item.track_id}",
                 )
                 summary.linked += 1
-            if establish_baseline:
+            if establish_baseline and snapshot.identified:
                 set_state(con, "spotify_baseline_complete", "true")
                 set_state(con, "last_spotify_snapshot_id", snapshot.snapshot_id)
                 set_state(con, "last_spotify_playlist_count", str(len(snapshot.tracks)))
@@ -1278,7 +1121,15 @@ def backfill_spotify(config: Config, *, apply: bool, client: SpotifyClientProtoc
         return SpotifySummary(skipped=1, rate_limited=True)
     client = client or SpotipyClient(config)
     try:
-        snapshot = client.playlist_snapshot(playlist_id)
+        from .spotify_work import obtain_snapshot
+        if not apply and not config.db_path.exists():
+            snapshot = client.playlist_snapshot(playlist_id)
+        else:
+            with (connect(config) if apply else closing(sqlite3.connect(config.db_path.resolve().as_uri() + '?mode=ro', uri=True))) as con:
+                con.row_factory = sqlite3.Row
+                snapshot = obtain_snapshot(con, config, client, protected=False, apply=apply)
+    except BudgetDeferred as exc:
+        return SpotifySummary(budget_deferred=1, required_budget=exc.required or 0)
     except Exception as exc:
         if not _is_rate_limited(exc):
             raise
@@ -1287,10 +1138,16 @@ def backfill_spotify(config: Config, *, apply: bool, client: SpotifyClientProtoc
                 _remember_spotify_rate_limit(con, config, exc, event_source="spotify_backfill")
         return SpotifySummary(skipped=1, rate_limited=True)
     _validate_playlist_snapshot(snapshot)
+    if apply:
+        from .spotify_work import recover_pending
+        with connect(config) as con:
+            recovered = recover_pending(con, config, client, snapshot, dispatch=False)
+            if recovered.failure:
+                raise recovered.failure
     return _import_playlist_snapshot(config, snapshot, apply=apply, event_source="spotify_backfill", establish_baseline=True)
 
 
-def scan_spotify_playlist(config: Config, *, apply: bool, client: SpotifyClientProtocol | None = None) -> SpotifySummary:
+def scan_spotify_playlist(config: Config, *, apply: bool, client: SpotifyClientProtocol | None = None, protected: bool = True) -> SpotifySummary:
     summary = SpotifySummary()
     if not spotify_enabled(config):
         summary.skipped += 1
@@ -1302,9 +1159,21 @@ def scan_spotify_playlist(config: Config, *, apply: bool, client: SpotifyClientP
     if _configured_spotify_cooldown_active(config):
         return SpotifySummary(skipped=1, rate_limited=True)
     client = client or SpotipyClient(config)
+    summary._client = client
     try:
-        snapshot = client.playlist_snapshot(playlist_id)
+        from .spotify_work import obtain_snapshot
+        if not apply and not config.db_path.exists():
+            snapshot = client.playlist_snapshot(playlist_id)
+        else:
+            with (connect(config) if apply else closing(sqlite3.connect(config.db_path.resolve().as_uri() + "?mode=ro", uri=True))) as con:
+                con.row_factory = sqlite3.Row
+                snapshot = obtain_snapshot(con, config, client, protected=protected, apply=apply)
         _validate_playlist_snapshot(snapshot)
+    except BudgetDeferred as exc:
+        summary.budget_deferred = 1
+        summary.required_budget = exc.required or 0
+        summary.requests = getattr(getattr(client, "budget", None), "used", 0)
+        return summary
     except Exception as exc:
         if _is_rate_limited(exc):
             if apply:
@@ -1314,318 +1183,257 @@ def scan_spotify_playlist(config: Config, *, apply: bool, client: SpotifyClientP
             summary.skipped += 1
             return summary
         raise
+    if apply:
+        from .spotify_work import recover_pending
+        with connect(config) as con:
+            recovered = recover_pending(con, config, client, snapshot, dispatch=False)
+            if recovered.failure:
+                raise recovered.failure
     summary = _import_playlist_snapshot(config, snapshot, apply=apply, event_source="spotify_scan", establish_baseline=False)
+    if apply:
+        summary.added = recovered.added
+        summary.tentative_added = recovered.tentative_added
+        summary.pending = recovered.pending
     summary._snapshot = snapshot
     summary._client = client
+    if hasattr(client, "budget"):
+        client.budget.reserve = 6
+    summary.requests = getattr(getattr(client, "budget", None), "used", 0)
     return summary
 
 
-def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol | None = None) -> SpotifySummary:
+def _save_search_schedule(con, playlist_id, track_id, *, searched_at, attempts, next_at, status='review', confidence=None):
+    asset = con.execute('SELECT * FROM spotify_assets WHERE playlist_id=? AND track_id=?', (playlist_id, track_id)).fetchone()
+    if asset is None:
+        upsert_spotify_asset(con, playlist_id=playlist_id, track_id=track_id, in_playlist=False,
+            match_confidence=confidence, status=status, search_last_at=searched_at, search_attempts=attempts,
+            search_next_at=next_at, update_search=True)
+    else:
+        con.execute('UPDATE spotify_assets SET search_last_at=?,search_attempts=?,search_next_at=?,updated_at=? WHERE id=?',
+                    (searched_at, attempts, next_at, now_utc(), asset['id']))
+
+
+@contextmanager
+def _spotify_connection(config, *, apply):
+    if apply:
+        with connect(config) as con:
+            yield con
+        return
+    if not config.db_path.exists():
+        from .db import SCHEMA
+        with closing(sqlite3.connect(':memory:')) as con:
+            con.row_factory = sqlite3.Row
+            con.executescript(SCHEMA)
+            con.execute("CREATE TEMP VIEW spotify_pending_work AS SELECT NULL AS playlist_id,NULL AS track_id,NULL AS kind,NULL AS payload_json WHERE 0")
+            yield con
+        return
+    with closing(sqlite3.connect(config.db_path.resolve().as_uri() + '?mode=ro', uri=True)) as con:
+        con.row_factory = sqlite3.Row
+        if not con.execute("SELECT 1 FROM sqlite_master WHERE name='spotify_pending_work'").fetchone():
+            # Legacy previews need only an empty work view, never a database copy.
+            con.execute("CREATE TEMP VIEW spotify_pending_work AS SELECT NULL AS playlist_id,NULL AS track_id,NULL AS kind,NULL AS payload_json WHERE 0")
+        yield con
+
+
+def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol | None = None,
+                 snapshot: PlaylistSnapshot | None = None) -> SpotifySummary:
+    from dataclasses import asdict
+    from .spotify_adapter import BudgetDeferred
+    from .spotify_work import save_work, recover_pending, obtain_snapshot
     summary = SpotifySummary()
-    if not spotify_enabled(config):
-        summary.skipped += 1
+    playlist_id = config.get('HCR_SPOTIFY_PLAYLIST_ID')
+    if not spotify_enabled(config) or not playlist_id:
+        summary.skipped = 1
         return summary
-    playlist_id = config.get("HCR_SPOTIFY_PLAYLIST_ID")
-    if not playlist_id:
-        summary.skipped += 1
-        return summary
-    with connect(config) as con:
+    with _spotify_connection(config, apply=apply) as con:
         if _spotify_cooldown_active(con):
             if apply:
                 with transaction(con):
                     _log_spotify_cooldown_skip(con)
             summary.rate_limited = True
-            summary.skipped += 1
+            summary.skipped = 1
             return summary
         client = client or SpotipyClient(config)
-        tracks = _spotify_sync_candidates(con, playlist_id=playlist_id)
-        suspected_local_delete_ids = _suspected_local_delete_track_ids(con)
-        candidate_conflict_ids = _spotify_candidate_conflict_track_ids(con)
-        playlist_assets = {
-            row["track_id"]: row
-            for row in con.execute("SELECT * FROM spotify_assets WHERE playlist_id = ?", (playlist_id,))
-        }
-        existing = {track_id for track_id, row in playlist_assets.items() if row["in_playlist"]}
-        review_assets = {
-            track_id: row
-            for track_id, row in playlist_assets.items()
-            if row["status"] == "review" and not row["in_playlist"]
-        }
-        threshold = config.float("HCR_SPOTIFY_MATCH_THRESHOLD")
-        tentative_threshold = config.float("HCR_SPOTIFY_TENTATIVE_ADD_THRESHOLD")
-        add_review_matches = config.bool("HCR_SPOTIFY_ADD_REVIEW_MATCHES")
-        tentative_removed_event_ids = {
-            row["track_id"]
-            for row in con.execute(
-                "SELECT DISTINCT track_id FROM events WHERE event_type = 'spotify_tentative_removed_by_user' AND track_id IS NOT NULL"
-            )
-        }
-        removed_tentative_ids = {
-            row["track_id"]
-            for row in con.execute(
-                "SELECT * FROM spotify_assets WHERE playlist_id = ? AND status = 'removed' AND in_playlist = 0",
-                (playlist_id,),
-            )
-            if _is_removed_tentative_asset(row, threshold) or row["track_id"] in tentative_removed_event_ids
-        }
-        sync_limit = config.int("HCR_SPOTIFY_SYNC_LIMIT")
-        searched = 0
-        run_started_at = datetime.now(timezone.utc)
-        for track in tracks:
-            if track["id"] in suspected_local_delete_ids:
+        budget = getattr(client, 'budget', None)
+        if budget:
+            budget.reserve = 6
+        pending_result = None
+        if apply:
+            pending_result = recover_pending(con, config, client, snapshot)
+            summary.added += pending_result.added
+            summary.tentative_added += pending_result.tentative_added
+            summary.acknowledged += pending_result.acknowledged
+            summary.pending = pending_result.pending
+            summary.budget_deferred += pending_result.deferred
+            if pending_result.rate_limited:
+                summary.rate_limited = True
+                return summary
+            if pending_result.failure:
+                raise pending_result.failure
+        if budget:
+            budget.reserve = 0
+        weights = (config.int('HCR_SPOTIFY_FIRST_TIME_WEIGHT'), config.int('HCR_SPOTIFY_RETRY_WEIGHT'))
+        if min(weights) < 1:
+            raise ValueError('Spotify rotation weights must be positive')
+        cycle = ['first'] * weights[0] + ['retry'] * weights[1]
+        cursor_key = f'spotify_rotation:{playlist_id}'
+        cursor = int(get_state(con, cursor_key, '0')) % len(cycle)
+        now = datetime.now(timezone.utc)
+        suspected = _suspected_local_delete_track_ids(con)
+        conflicts = _spotify_candidate_conflict_track_ids(con)
+        removed_events = {row[0] for row in con.execute("SELECT DISTINCT track_id FROM events WHERE event_type='spotify_tentative_removed_by_user'")}
+        threshold = config.float('HCR_SPOTIFY_MATCH_THRESHOLD')
+        tentative_threshold = config.float('HCR_SPOTIFY_TENTATIVE_ADD_THRESHOLD')
+        lanes = {'first': [], 'retry': []}
+        for track in _spotify_sync_candidates(con, playlist_id=playlist_id):
+            asset = con.execute('SELECT * FROM spotify_assets WHERE playlist_id=? AND track_id=?', (playlist_id, track['id'])).fetchone()
+            work = con.execute("SELECT * FROM spotify_pending_work WHERE playlist_id=? AND track_id=? AND kind='search'", (playlist_id, track['id'])).fetchone()
+            queued_write = con.execute("SELECT 1 FROM spotify_pending_work WHERE playlist_id=? AND track_id=? AND kind!='search'", (playlist_id, track['id'])).fetchone()
+            if track['id'] in suspected or (asset and asset['in_playlist']) or queued_write:
                 summary.skipped += 1
-                if apply:
+                if apply and track['id'] in suspected:
                     with transaction(con):
-                        add_event(
-                            con,
-                            track["id"],
-                            "spotify_skipped_suspected_local_delete",
-                            "spotify_sync",
-                            {"reason": "local deletion is awaiting confirmation"},
-                            dedupe_key=f"spotify_skipped_suspected_local_delete:{track['id']}",
-                        )
+                        add_event(con, track['id'], 'spotify_skipped_suspected_local_delete', 'spotify_sync', {'reason':'local deletion awaiting confirmation'}, dedupe_key=f"spotify_skipped_suspected_local_delete:{track['id']}")
                 continue
-            if track["id"] in existing:
-                summary.skipped += 1
-                continue
-            if _track_has_ambiguous_spotify_recording(con, playlist_id=playlist_id, track=track):
+            if track['id'] in conflicts or track['id'] in removed_events or (asset and asset['status']=='removed' and _is_removed_tentative_asset(asset, threshold)) or _track_has_ambiguous_spotify_recording(con, playlist_id=playlist_id, track=track):
                 summary.review += 1
                 continue
-            if track["id"] in removed_tentative_ids:
-                summary.review += 1
-                continue
-            if track["id"] in candidate_conflict_ids:
-                summary.review += 1
-                continue
-            asset = playlist_assets.get(track["id"])
-            if asset and _spotify_search_deferred(asset, run_started_at):
-                if asset["status"] == "review":
+            if asset and _spotify_search_deferred(asset, now):
+                if asset['status'] == 'review':
                     summary.review += 1
                 else:
                     summary.skipped += 1
                 continue
-            review_asset = review_assets.get(track["id"])
-            if review_asset and not add_review_matches:
+            if asset and asset['status'] == 'review' and not config.bool('HCR_SPOTIFY_ADD_REVIEW_MATCHES'):
                 summary.review += 1
                 continue
-            if looks_like_non_track(track["display_artist"], track["display_title"]):
+            if looks_like_non_track(track['display_artist'], track['display_title']):
                 summary.review += 1
-                if apply:
+                if apply and asset is None:
                     with transaction(con):
-                        upsert_spotify_asset(
-                            con,
-                            track_id=track["id"],
-                            playlist_id=playlist_id,
-                            in_playlist=False,
-                            match_confidence=0.0,
-                            status="review",
-                        )
-                        add_event(
-                            con,
-                            track["id"],
-                            "ambiguous_spotify_match",
-                            "spotify_sync",
-                            {
-                                "reason": "source row looks like a mix, set, compilation, or non-track item",
-                                "match_status": "review",
-                            },
-                            dedupe_key=f"spotify_non_track_source:{track['id']}",
-                        )
+                        upsert_spotify_asset(con, track_id=track['id'], playlist_id=playlist_id, in_playlist=False, match_confidence=0.0, status='review')
                 continue
-            if sync_limit > 0 and searched >= sync_limit:
-                summary.skipped += 1
-                continue
+            lane = json.loads(work['payload_json'])['lane'] if work else ('first' if not asset or not asset['search_last_at'] else 'retry')
+            lanes[lane].append((track, asset, work))
+        searched = 0
+        sync_limit = config.int('HCR_SPOTIFY_SYNC_LIMIT')
+        while (lanes['first'] or lanes['retry']) and (sync_limit <= 0 or searched < sync_limit):
+            wanted_lane = cycle[cursor]
+            lane = wanted_lane if lanes[wanted_lane] else ('retry' if wanted_lane == 'first' else 'first')
+            both = bool(lanes['first'] and lanes['retry'])
+            track, asset, work = lanes[lane].pop(0)
+            fingerprint = [track['display_artist'], track['display_title']]
+            payload = json.loads(work['payload_json']) if work else {}
+            if payload.get('source') != fingerprint:
+                payload = {'source': fingerprint, 'lane': lane, 'next_query': 0, 'candidates': []}
             searched += 1
             try:
-                candidates = client.search_track(track["display_artist"], track["display_title"])
+                if hasattr(client, 'search_query'):
+                    queries = client.search_queries(*fingerprint)
+                    for index in range(payload['next_query'], len(queries)):
+                        # Leave room for a write and compensation; reads resume next run.
+                        if budget and budget.remaining < 3:
+                            raise BudgetDeferred()
+                        candidates = client.search_query(queries[index])
+                        by_id = {item['track_id']: item for item in payload['candidates']}
+                        by_id.update({item.track_id: asdict(item) for item in candidates})
+                        payload['candidates'] = list(by_id.values())
+                        payload['next_query'] = index + 1
+                        if apply:
+                            with transaction(con):
+                                save_work(con, playlist_id, track['id'], 'search', payload)
+                    candidates = [SpotifyTrack(**item) for item in payload['candidates']]
+                else:
+                    candidates = client.search_track(*fingerprint)
+            except BudgetDeferred:
+                if apply:
+                    with transaction(con):
+                        save_work(con, playlist_id, track['id'], 'search', payload)
+                summary.budget_deferred += 1
+                break
             except Exception as exc:
                 if apply:
-                    _remember_failed_spotify_attempt(con, config, track, asset, exc, operation="search")
+                    with transaction(con):
+                        save_work(con, playlist_id, track['id'], 'search', payload)
+                    terminal = getattr(exc, 'http_status', None) in {400, 404}
+                    next_cursor = (cursor + 1) % len(cycle) if both else 0
+                    _remember_failed_spotify_attempt(con, config, track, asset, exc, operation='search', rotation=(cursor_key, next_cursor) if terminal else None)
+                    if not _is_rate_limited(exc) and not terminal:
+                        with transaction(con):
+                            # Retry a fresh candidate pool after provider backoff.
+                            payload['next_query'], payload['candidates'] = 0, []
+                            save_work(con, playlist_id, track['id'], 'search', payload)
                 if _is_rate_limited(exc):
                     summary.rate_limited = True
                     summary.skipped += 1
                     break
-                if getattr(exc, "http_status", None) in {400, 404}:
-                    summary.skipped += 1
+                if getattr(exc, 'http_status', None) in {400,404}:
+                    cursor = (cursor + 1) % len(cycle) if both else 0
                     continue
                 raise
-            best = None
-            best_score = 0.0
+            best, best_score = None, 0.0
             for candidate in candidates:
                 score = _spotify_match_score(track, candidate)
                 if score > best_score:
-                    best = candidate
-                    best_score = score
-            searched_at_dt = datetime.now(timezone.utc)
-            searched_at = _format_utc(searched_at_dt)
-            failed_search_attempts = _spotify_search_attempts(asset) + 1
-            confident_match = best is not None and best_score >= threshold
-            tentative_match = best is not None and add_review_matches and best_score >= tentative_threshold
-            if not confident_match and not tentative_match:
-                next_search_at = _next_spotify_retry_at(searched_at_dt, failed_search_attempts)
+                    best, best_score = candidate, score
+            confident = best is not None and best_score >= threshold
+            matched = confident or (best is not None and config.bool('HCR_SPOTIFY_ADD_REVIEW_MATCHES') and best_score >= tentative_threshold)
+            searched_dt = datetime.now(timezone.utc)
+            searched_at = _format_utc(searched_dt)
+            attempts = 0 if matched else _spotify_search_attempts(asset) + 1
+            next_at = None if matched else _next_spotify_retry_at(searched_dt, attempts)
+            conflict = _spotify_candidate_used_by_other_track(con, playlist_id=playlist_id, track_id=track['id'], spotify_track_id=best.track_id) if matched else None
+            if not matched or conflict:
                 summary.review += 1
-                if apply:
-                    with transaction(con):
-                        upsert_spotify_asset(
-                            con,
-                            track_id=track["id"],
-                            playlist_id=playlist_id,
-                            spotify_track_uri=best.uri if best else "",
-                            spotify_track_id=best.track_id if best else "",
-                            spotify_artist=best.artist if best else "",
-                            spotify_title=best.title if best else "",
-                            in_playlist=False,
-                            match_confidence=best_score if best else 0.0,
-                            status="review",
-                            search_last_at=searched_at,
-                            search_attempts=failed_search_attempts,
-                            search_next_at=next_search_at,
-                            update_search=True,
-                        )
-                        add_event(
-                            con,
-                            track["id"],
-                            "ambiguous_spotify_match",
-                            "spotify_sync",
-                            {
-                                "reason": "below tentative threshold or not found",
-                                "score": best_score,
-                                "spotify_track_id": best.track_id if best else "",
-                                "match_threshold": threshold,
-                                "tentative_threshold": tentative_threshold,
-                                "add_review_matches": add_review_matches,
-                                "match_status": "review",
-                                "spotify_search_last_at": searched_at,
-                                "spotify_search_attempts": failed_search_attempts,
-                                "spotify_search_next_at": next_search_at,
-                            },
-                            dedupe_key=f"ambiguous_spotify_match:{track['id']}:{best.track_id if best else 'none'}:{best_score:.3f}",
-                        )
-                continue
-            conflicting_asset = _spotify_candidate_used_by_other_track(
-                con,
-                playlist_id=playlist_id,
-                track_id=track["id"],
-                spotify_track_id=best.track_id,
-            )
-            if conflicting_asset:
-                summary.review += 1
-                if apply:
-                    with transaction(con):
-                        _mark_spotify_candidate_conflict(
-                            con,
-                            playlist_id=playlist_id,
-                            track=track,
-                            candidate=best,
-                            score=best_score,
-                            existing_asset=conflicting_asset,
-                            searched_at=searched_at,
-                            search_attempts=failed_search_attempts,
-                        )
-                continue
             if not apply:
-                summary.added += 1
-                if tentative_match and not confident_match:
-                    summary.tentative_added += 1
+                if matched and not conflict:
+                    summary.added += 1
+                    summary.tentative_added += int(not confident)
+                cursor = (cursor + 1) % len(cycle) if both else 0
                 continue
             with transaction(con):
-                current = con.execute("SELECT status FROM tracks WHERE id = ?", (track["id"],)).fetchone()
-                if not current or current["status"] == "excluded":
-                    summary.skipped += 1
-                    continue
-            try:
-                client.add_tracks(playlist_id, [best.uri])
-            except Exception as exc:
-                if apply:
-                    _remember_failed_spotify_attempt(con, config, track, asset, exc, operation="add")
-                if _is_rate_limited(exc):
-                    summary.rate_limited = True
-                    summary.skipped += 1
-                    break
-                if getattr(exc, "http_status", None) in {400, 404}:
-                    summary.skipped += 1
-                    continue
-                raise
-            with transaction(con):
-                current = con.execute("SELECT status FROM tracks WHERE id = ?", (track["id"],)).fetchone()
-                if not current or current["status"] == "excluded":
-                    client.remove_tracks(playlist_id, [best.uri])
-                    summary.skipped += 1
-                    continue
-                existing_asset = con.execute(
-                    "SELECT * FROM spotify_assets WHERE track_id = ? AND playlist_id = ?",
-                    (track["id"], playlist_id),
-                ).fetchone()
-                upsert_spotify_playlist_recording(
-                    con,
-                    playlist_id=playlist_id,
-                    spotify_track_id=best.track_id,
-                    spotify_track_uri=best.uri,
-                    spotify_artist=best.artist,
-                    spotify_title=best.title,
-                    artist_ids=best.artist_ids,
-                    album=best.album,
-                    isrc=best.isrc,
-                    duration_ms=best.duration_ms,
-                    track_id=track["id"],
-                    in_playlist=True,
-                    status="added" if confident_match else "review",
-                )
-                if (
-                    existing_asset is None
-                    or not existing_asset["spotify_track_id"]
-                    or existing_asset["spotify_track_id"] == best.track_id
-                    or not _spotify_asset_has_primary_history(con, existing_asset)
-                ):
-                    upsert_spotify_asset(
-                        con,
-                        track_id=track["id"],
-                        playlist_id=playlist_id,
-                        spotify_track_uri=best.uri,
-                        spotify_track_id=best.track_id,
-                        spotify_artist=best.artist,
-                        spotify_title=best.title,
-                        in_playlist=True,
-                        match_confidence=best_score,
-                        status="added" if confident_match else "review",
-                        added_at=now_utc(),
-                        search_last_at=searched_at,
-                        search_attempts=0,
-                        search_next_at=None,
-                        update_search=True,
-                    )
+                _save_search_schedule(con, playlist_id, track['id'], searched_at=searched_at, attempts=attempts, next_at=next_at, confidence=0.0 if conflict else (best_score if not matched else None))
+                cursor = (cursor + 1) % len(cycle) if both else 0
+                set_state(con, cursor_key, str(cursor))
+                set_state(con, f'spotify_scan_only_spent:{playlist_id}', 'false')
+                con.execute("DELETE FROM spotify_pending_work WHERE playlist_id=? AND track_id=? AND kind='search'", (playlist_id, track['id']))
+                add_event(con, track['id'], 'spotify_search_completed', 'spotify_sync', {
+                    'playlist_id': playlist_id, 'lane': lane, 'spotify_search_last_at': searched_at,
+                    'spotify_search_attempts': attempts, 'spotify_search_next_at': next_at,
+                    'spotify_track_id': best.track_id if best else '', 'score': best_score,
+                    'outcome': 'conflict' if conflict else 'matched' if matched else 'review',
+                })
+                if conflict:
+                    add_event(con, track['id'], 'spotify_candidate_already_linked', 'spotify_sync', {
+                        'playlist_id': playlist_id, 'spotify_track_id': best.track_id,
+                        'existing_track_id': conflict['track_id'], 'existing_asset_id': conflict['id'],
+                        'reason': 'candidate Spotify recording already owned',
+                    }, dedupe_key=f"spotify_candidate_already_linked:{track['id']}:{best.track_id}:{conflict['id']}")
+                elif not matched:
+                    add_event(con, track['id'], 'ambiguous_spotify_match', 'spotify_sync', {
+                        'playlist_id': playlist_id, 'spotify_track_id': best.track_id if best else '',
+                        'score': best_score, 'reason': 'below tentative threshold or not found', 'match_status': 'review', 'spotify_search_last_at': searched_at,
+                        'spotify_search_attempts': attempts, 'spotify_search_next_at': next_at,
+                    })
                 else:
-                    # Keep the established primary recording and its
-                    # provenance. The newly added recording lives in the
-                    # registry and establishes membership for the logical
-                    # track.
-                    con.execute(
-                        """
-                        UPDATE spotify_assets
-                           SET in_playlist = 1, updated_at = ?, suspected_missing_at = NULL
-                         WHERE id = ?
-                        """,
-                        (now_utc(), existing_asset["id"]),
-                    )
-                event_type = "spotify_added" if confident_match else "spotify_tentatively_added"
-                add_event(
-                    con,
-                    track["id"],
-                    event_type,
-                    "spotify_sync",
-                    {
-                        "spotify_track_id": best.track_id,
-                        "spotify_artist": best.artist,
-                        "spotify_title": best.title,
-                        "score": best_score,
-                        "match_threshold": threshold,
-                        "tentative_threshold": tentative_threshold,
-                        "match_status": "added" if confident_match else "tentative_review",
-                        "spotify_search_last_at": searched_at,
-                    },
-                    dedupe_key=f"{event_type}:{track['id']}:{best.track_id}",
-                )
-                summary.added += 1
-                if tentative_match and not confident_match:
-                    summary.tentative_added += 1
+                    save_work(con, playlist_id, track['id'], 'add', {'candidate': asdict(best),
+                        'confident': confident, 'score': best_score, 'searched_at': searched_at, 'source': fingerprint}, work_key=best.uri)
+            summary.first_time += int(lane == 'first')
+            summary.retries += int(lane == 'retry')
+            if matched and not conflict:
+                pending = recover_pending(con, config, client, snapshot)
+                snapshot = None
+                summary.added += pending.added
+                summary.tentative_added += pending.tentative_added
+                summary.acknowledged += pending.acknowledged
+                summary.pending = pending.pending
+                summary.budget_deferred += pending.deferred
+                if pending.rate_limited:
+                    summary.rate_limited = True
+                    break
+                if pending.failure:
+                    raise pending.failure
+        summary.skipped += len(lanes['first']) + len(lanes['retry'])
+        if budget:
+            summary.requests = budget.used
     return summary

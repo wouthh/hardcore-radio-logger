@@ -173,9 +173,29 @@ def _table_columns(con: sqlite3.Connection, table: str) -> set[str]:
     }
 
 
+PENDING_WORK_SCHEMA = """
+CREATE TABLE IF NOT EXISTS spotify_pending_work (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    playlist_id TEXT NOT NULL,
+    track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE RESTRICT,
+    kind TEXT NOT NULL CHECK(kind IN ('search', 'add', 'remove')),
+    work_key TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL DEFAULT 'ready',
+    payload_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(playlist_id, track_id, kind, work_key)
+)
+"""
+
+
 def migrate_db(con: sqlite3.Connection) -> None:
     if not _table_exists(con, "spotify_assets"):
         return
+
+    con.execute(PENDING_WORK_SCHEMA)
+    if _table_exists(con, "schema_migrations"):
+        con.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)", (now_utc(),))
 
     columns = _table_columns(con, "spotify_assets")
     added_search_columns = False
@@ -648,11 +668,13 @@ def upsert_spotify_asset(
         "SELECT * FROM spotify_assets WHERE track_id = ? AND playlist_id = ?",
         (track_id, playlist_id),
     ).fetchone()
-    if existing is None and spotify_track_id:
-        existing = con.execute(
-            "SELECT * FROM spotify_assets WHERE playlist_id = ? AND spotify_track_id = ?",
+    if spotify_track_id:
+        owner = con.execute(
+            "SELECT track_id FROM spotify_assets WHERE playlist_id = ? AND spotify_track_id = ?",
             (playlist_id, spotify_track_id),
         ).fetchone()
+        if owner is not None and owner["track_id"] != track_id:
+            raise ValueError("Spotify recording belongs to another source track")
     if existing:
         con.execute(
             """

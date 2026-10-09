@@ -85,6 +85,8 @@ def _spotify_guard(config: Config, con, snapshot, *, missing_known_count: int, f
         return "spotify playlist snapshot was not fetched"
     if not snapshot.complete:
         return "spotify playlist pagination did not complete"
+    if not snapshot.identified:
+        return ""
     if not snapshot.snapshot_id:
         return "spotify playlist snapshot id is missing"
     if snapshot.tracks and not any(track.track_id for track in snapshot.tracks):
@@ -140,7 +142,7 @@ def _spotify_snapshot_logical_count(con, snapshot) -> int:
         for resolution in resolutions
         if resolution.track_id is not None
     }
-    owners = set(owners_by_key.values())
+    owners = {resolution.track_id for resolution in resolutions if resolution.track_id is not None}
     unresolved_keys = {
         resolution.canonical_key
         for resolution in resolutions
@@ -167,7 +169,7 @@ def _is_tentative_spotify_asset(config: Config, asset) -> bool:
     if asset["status"] == "review":
         return True
     score = asset["match_confidence"]
-    return score is not None and float(score) < config.float("HCR_SPOTIFY_MATCH_THRESHOLD")
+    return score is None or float(score) < config.float("HCR_SPOTIFY_MATCH_THRESHOLD")
 
 
 def _spotify_recordings_table_exists(con) -> bool:
@@ -300,57 +302,10 @@ def _cascade_spotify(con, config: Config, track_id: int, summary: ReconcileSumma
                 },
                 dedupe_key=f"spotify_removal_deferred_due_to_missing_client:{track_id}:{row['id']}",
             )
-        return
-    if client and uris:
-        unique_uris = list(dict.fromkeys(uris))
-        try:
-            client.remove_tracks(playlist_id, unique_uris)
-        except Exception as exc:
-            if not _is_rate_limited(exc):
-                raise
-            _remember_spotify_rate_limit(con, config, exc, event_source="reconcile")
-            summary.refused.append("spotify: removal deferred by rate limit")
-            return
-        summary.spotify_removed += len(unique_uris)
-    for row in rows:
-        if recording_rows:
-            con.execute(
-                """
-                UPDATE spotify_playlist_recordings
-                   SET in_playlist = 0, status = 'removed', updated_at = ?, suspected_missing_at = NULL
-                 WHERE id = ?
-                """,
-                (now_utc(), row["id"]),
-            )
-        else:
-            con.execute(
-                """
-                UPDATE spotify_assets
-                   SET in_playlist = 0, status = 'removed', updated_at = ?, suspected_missing_at = NULL
-                 WHERE id = ?
-                """,
-                (now_utc(), row["id"]),
-            )
-        add_event(
-            con,
-            track_id,
-            "removed_from_spotify_due_to_exclusion",
-            "reconcile",
-            {
-                "playlist_id": playlist_id,
-                "spotify_track_id": row["spotify_track_id"],
-                "reason": "local/global exclusion cascade",
-            },
-        )
-    if recording_rows:
-        con.execute(
-            """
-            UPDATE spotify_assets
-               SET in_playlist = 0, status = 'removed', updated_at = ?, suspected_missing_at = NULL
-             WHERE track_id = ? AND playlist_id = ?
-            """,
-            (now_utc(), track_id, playlist_id),
-        )
+    if uris:
+        from .spotify_work import enqueue_removal
+
+        enqueue_removal(con, playlist_id, track_id, list(dict.fromkeys(uris)), "local/global exclusion cascade")
 
 
 def _cascade_excluded_spotify(con, config: Config, summary: ReconcileSummary, client: SpotifyClientProtocol | None) -> None:
@@ -523,6 +478,13 @@ def reconcile(
                     if apply and _is_rate_limited(exc):
                         _remember_spotify_rate_limit(con, config, exc, event_source="reconcile")
                     summary.refused.append(f"spotify: playlist fetch failed: {exc}")
+        if apply and snapshot is not None:
+            from .spotify_work import recover_pending
+
+            recovery = recover_pending(con, config, spotify_client, snapshot=snapshot, dispatch=False)
+            if recovery.failure:
+                raise recovery.failure
+            summary.spotify_removed += recovery.removed
         if playlist_id:
             current_ids = {track.track_id for track in snapshot.tracks if track.track_id} if snapshot is not None else set()
             registry_available = _spotify_recordings_table_exists(con)
@@ -561,9 +523,21 @@ def reconcile(
             if spotify_refusal:
                 summary.refused.append(f"spotify: {spotify_refusal}")
             elif snapshot is not None:
-                if apply:
+                if apply and snapshot.identified:
                     with transaction(con):
                         _cascade_excluded_spotify(con, config, summary, spotify_client)
+                original_assets = {
+                    row["track_id"]: row
+                    for row in con.execute("SELECT * FROM spotify_assets WHERE playlist_id = ?", (playlist_id,))
+                }
+                confident_missing_tracks = {
+                    row["track_id"]
+                    for row in known_spotify
+                    if row["spotify_track_id"] not in current_ids
+                    and row["status"] != "review"
+                    and row["track_id"] in original_assets
+                    and not _is_tentative_spotify_asset(config, original_assets[row["track_id"]])
+                }
                 previous_spotify_scan_at = get_state(con, "last_spotify_scan_at", "")
                 for recording in known_spotify:
                     if recording["spotify_track_id"] in current_ids:
@@ -600,6 +574,8 @@ def reconcile(
                                         {"spotify_track_id": recording["spotify_track_id"]},
                                         dedupe_key=f"spotify_asset_removal_suspicion_cleared:{recording['track_id']}:{asset['id']}:{snapshot.snapshot_id}",
                                     )
+                        continue
+                    if not snapshot.identified:
                         continue
                     if (
                         _is_recent_self_added_spotify_recording(recording, previous_spotify_scan_at)
@@ -656,11 +632,7 @@ def reconcile(
                                 {"spotify_track_id": recording["spotify_track_id"]},
                                 dedupe_key=f"spotify_recording_removed_by_user:{recording['track_id']}:{recording['id']}",
                             )
-                            asset = _spotify_asset_for_track(
-                                con,
-                                playlist_id=playlist_id,
-                                track_id=recording["track_id"],
-                            )
+                            asset = original_assets.get(recording["track_id"])
                             other_active = _active_spotify_recordings(
                                 con,
                                 playlist_id=playlist_id,
@@ -681,7 +653,7 @@ def reconcile(
                             other_active = []
                         if asset is None:
                             continue
-                        if _is_tentative_spotify_asset(config, asset):
+                        if asset["track_id"] not in confident_missing_tracks:
                             add_event(
                                 con,
                                 asset["track_id"],
@@ -727,7 +699,7 @@ def reconcile(
                             (now_utc(), asset["id"]),
                         )
                         summary.excluded_spotify += 1
-                if apply:
+                if apply and snapshot.identified:
                     with transaction(con):
                         set_state(con, "last_spotify_snapshot_id", snapshot.snapshot_id)
                         set_state(con, "last_spotify_playlist_count", str(len(snapshot.tracks)))
@@ -737,6 +709,15 @@ def reconcile(
             with transaction(con):
                 set_state(con, "last_local_scan_count", str(len(audio_paths(config.music_dir))))
                 set_state(con, "last_local_scan_at", now_utc())
+        if apply and spotify_client is not None and not skip_spotify:
+            from .spotify_work import recover_pending
+
+            recovery = recover_pending(con, config, spotify_client, snapshot=snapshot)
+            summary.spotify_removed += recovery.removed
+            if recovery.rate_limited:
+                summary.refused.append("spotify: removal deferred by rate limit")
+            elif recovery.failure or recovery.deferred:
+                summary.refused.append("spotify: pending work could not be verified")
     return summary
 
 
@@ -756,4 +737,13 @@ def manual_exclude(
             mark_excluded(con, track_id=track_id, source="manual", reason=reason)
             _cascade_local(con, config, track_id, summary)
             _cascade_spotify(con, config, track_id, summary, spotify_client)
+        if spotify_client is not None:
+            from .spotify_work import recover_pending
+
+            recovery = recover_pending(con, config, spotify_client)
+            summary.spotify_removed += recovery.removed
+            if recovery.rate_limited:
+                summary.refused.append("spotify: removal deferred by rate limit")
+            elif recovery.failure or recovery.deferred:
+                summary.refused.append("spotify: pending work could not be verified")
     return summary

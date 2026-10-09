@@ -289,9 +289,12 @@ class FakeSpotify:
 
     def add_tracks(self, playlist_id, uris):
         self.added.extend(uris)
+        known = {item.uri for item in self.snapshot_tracks}
+        self.snapshot_tracks = self.snapshot_tracks + [item for item in self.search_tracks if item.uri in uris and item.uri not in known]
 
     def remove_tracks(self, playlist_id, uris):
         self.removed.extend(uris)
+        self.snapshot_tracks = [item for item in self.snapshot_tracks if item.uri not in uris]
 
 
 def test_playlist_item_parser_accepts_spotify_item_shape():
@@ -756,8 +759,9 @@ def test_spotify_sync_retries_old_review_once_then_keeps_terminal_review(tmp_pat
         asset = con.execute("SELECT * FROM spotify_assets").fetchone()
         assert asset["status"] == "review"
         assert asset["in_playlist"] == 0
-        assert asset["match_confidence"] == 0.55
-        assert asset["spotify_track_id"] == "low"
+        assert asset["match_confidence"] is None
+        assert asset["spotify_track_id"] is None
+        # Unsuccessful candidates are diagnostics, not recording ownership.
         payload = json.loads(con.execute("SELECT payload_json FROM events WHERE event_type = 'ambiguous_spotify_match'").fetchone()["payload_json"])
         assert payload["reason"] == "below tentative threshold or not found"
         assert payload["match_status"] == "review"
@@ -788,7 +792,8 @@ def test_spotify_sync_prioritizes_unsearched_tracks_before_retry_due_tracks(tmp_
         def search_track(self, artist, title):
             self.search_calls.append((artist, title))
             track_id = f"{artist}-{title}".replace(" ", "-").casefold()
-            return [SpotifyTrack(uri=f"spotify:track:{track_id}", track_id=track_id, artist=artist, title=title)]
+            self.search_tracks = [SpotifyTrack(uri=f"spotify:track:{track_id}", track_id=track_id, artist=artist, title=title)]
+            return self.search_tracks
 
     client = EchoSpotify()
     with connect(config) as con:

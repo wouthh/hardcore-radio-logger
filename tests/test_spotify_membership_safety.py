@@ -160,3 +160,39 @@ def test_pending_recovery_failure_stops_absence_processing(tmp_path, monkeypatch
         assert con.execute('SELECT count(*) FROM spotify_pending_work').fetchone()[0] == 1
         assert con.execute("SELECT count(*) FROM events WHERE event_type='spotify_removed_by_user'").fetchone()[0] == 0
         assert con.execute("SELECT value FROM sync_state WHERE key='last_spotify_snapshot_id'").fetchone()[0] == 'previous'
+
+
+@pytest.mark.parametrize('force_confirm,two_passes', [(True, 'true'), (False, 'false')])
+def test_cooldown_ignores_supplied_absence_and_preserves_unexcluded_pending_removal(tmp_path, force_confirm, two_passes):
+    from hcr_sync.db import mark_excluded, unexclude_track
+    from hcr_sync.spotify_work import save_work
+    from test_spotify_adapter import spotify_http
+
+    config, track_id, audio = seed(tmp_path, [('a', 'added')])
+    config.values['HCR_RECONCILE_REQUIRE_TWO_PASSES'] = two_passes
+    with connect(config) as con, transaction(con):
+        mark_excluded(con, track_id=track_id, source='manual', reason='synthetic initial exclusion')
+        save_work(con, 'playlist', track_id, 'remove', {'uri': 'spotify:track:a', 'reason': 'local/global exclusion cascade'},
+                  work_key='spotify:track:a', state='dispatched')
+        unexclude_track(con, track_id=track_id)
+        set_state(con, 'spotify_rate_limited_until', '2099-01-01T00:00:00Z')
+        pending_before = dict(con.execute('SELECT * FROM spotify_pending_work').fetchone())
+    snapshot = PlaylistSnapshot('playlist', 'removed', [SpotifyTrack('spotify:track:keep', 'keep', 'Keep', 'Song')],
+                                complete=True, identified=True, total=1)
+    with spotify_http(tmp_path, []) as (client, calls):
+        summary = reconcile(config, apply=True, spotify_client=client, spotify_snapshot=snapshot,
+                            force_confirm_deletions=force_confirm)
+        assert client.budget.used == len(calls) == 0
+        assert summary.spotify_removed == summary.excluded_spotify == summary.suspected_spotify == 0
+        assert summary.tentative_spotify_removed == summary.local_trashed == summary.excluded_local == 0
+        assert summary.planned == []
+    assert audio.read_bytes() == b'synthetic audio'
+    with connect(config) as con:
+        assert dict(con.execute('SELECT * FROM spotify_pending_work').fetchone()) == pending_before
+        assert con.execute('SELECT status FROM tracks WHERE id=?', (track_id,)).fetchone()[0] == 'wanted'
+        assert con.execute('SELECT in_playlist FROM spotify_assets WHERE track_id=?', (track_id,)).fetchone()[0] == 1
+        assert con.execute('SELECT file_exists FROM youtube_assets WHERE track_id=?', (track_id,)).fetchone()[0] == 1
+        assert con.execute("SELECT count(*) FROM exclusions WHERE track_id=? AND source='spotify_removed'", (track_id,)).fetchone()[0] == 0
+        assert con.execute("SELECT count(*) FROM events WHERE event_type IN ('spotify_removed_by_user','suspected_spotify_remove') AND track_id=?", (track_id,)).fetchone()[0] == 0
+        assert con.execute("SELECT value FROM sync_state WHERE key='last_spotify_snapshot_id'").fetchone()[0] == 'previous'
+        assert con.execute("SELECT value FROM sync_state WHERE key='last_spotify_scan_at'").fetchone()[0] == '2026-01-02T00:00:00Z'

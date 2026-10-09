@@ -478,6 +478,13 @@ def reconcile(
                     if apply and _is_rate_limited(exc):
                         _remember_spotify_rate_limit(con, config, exc, event_source="reconcile")
                     summary.refused.append(f"spotify: playlist fetch failed: {exc}")
+        if apply and snapshot is not None:
+            from .spotify_work import recover_pending
+
+            recovery = recover_pending(con, config, spotify_client, snapshot=snapshot, dispatch=False)
+            if recovery.failure:
+                raise recovery.failure
+            summary.spotify_removed += recovery.removed
         if playlist_id:
             current_ids = {track.track_id for track in snapshot.tracks if track.track_id} if snapshot is not None else set()
             registry_available = _spotify_recordings_table_exists(con)

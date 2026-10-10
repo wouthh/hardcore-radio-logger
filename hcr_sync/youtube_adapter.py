@@ -7,16 +7,19 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shutil
 import signal
 import subprocess
 import tempfile
+import time
 
 from .config import Config
 
 SEARCH_SECONDS = 45
 DOWNLOAD_SECONDS = 120
 TERMINATE_SECONDS = 5
+OUTPUT_LIMIT = 2 * 1024 * 1024
 VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
 RECEIPT_TEMPLATE = 'after_move:{"video_id":%(id)j,"title":%(title)j,"artist":%(artist|null)j,"artist_names":%(artists|null)j,"track":%(track|null)j,"duration":%(duration)j,"filepath":%(filepath)j}'
 
@@ -58,12 +61,17 @@ def _failure(stderr: str, *, video=False) -> YouTubeFailure:
 
 
 def _terminate(process: subprocess.Popen) -> None:
+    # Stop reading before termination: communicate() could capture unbounded
+    # output from a writer ignoring SIGTERM during the grace period.
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
         pass
     try:
-        process.communicate(timeout=TERMINATE_SECONDS)
+        process.wait(timeout=TERMINATE_SECONDS)
     except subprocess.TimeoutExpired:
         pass
     finally:
@@ -72,7 +80,7 @@ def _terminate(process: subprocess.Popen) -> None:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        process.communicate()
+        process.wait()
 
 
 def run_process(command, timeout, *, lock_handle=None, on_spawn=None, video=False):
@@ -84,25 +92,45 @@ def run_process(command, timeout, *, lock_handle=None, on_spawn=None, video=Fals
 def _run_process(command, timeout, *, lock_handle, on_spawn, video, stdout_file, stderr_file):
     pass_fds = (lock_handle.fileno(),) if lock_handle is not None else ()
     try:
-        process = subprocess.Popen(command, stdout=stdout_file, stderr=stderr_file,
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=True, pass_fds=pass_fds)
     except FileNotFoundError as exc:
         raise YouTubeFailure("missing_tool", "Required local executable is unavailable") from exc
     except OSError as exc:
         raise YouTubeFailure("configuration", "Cannot start required local executable") from exc
     try:
+        deadline = time.monotonic() + timeout
         if on_spawn is not None:
             on_spawn(process.pid)
-        process.wait(timeout=timeout)
+        with selectors.DefaultSelector() as selector:
+            for stream, output in ((process.stdout, stdout_file), (process.stderr, stderr_file)):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, output)
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                for key, _ in selector.select(remaining):
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                        continue
+                    output = key.data
+                    allowance = OUTPUT_LIMIT - output.tell()
+                    output.write(chunk[:allowance])
+                    if len(chunk) > allowance:
+                        raise YouTubeFailure("invalid_response", "Local tool output exceeds the safe response limit")
+            process.wait(timeout=max(0, deadline - time.monotonic()))
     except subprocess.TimeoutExpired as exc:
         _terminate(process)
         raise YouTubeFailure("transport", "yt-dlp operation exceeded its execution deadline") from exc
     except BaseException:
         _terminate(process)
         raise
+    finally:
+        for stream in (process.stdout, process.stderr):
+            stream.close()
     for output in (stdout_file, stderr_file):
-        if output.tell() > 2 * 1024 * 1024:
-            raise YouTubeFailure("invalid_response", "Local tool output exceeds the safe response limit")
         output.seek(0)
     stdout = stdout_file.read().decode("utf-8", errors="replace")
     stderr = stderr_file.read().decode("utf-8", errors="replace")

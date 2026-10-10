@@ -78,11 +78,77 @@ def test_timeout_terminates_and_reaps_owned_process(tmp_path, monkeypatch):
         os.kill(int(pidfile.read_text()), 0)
 
 
+def test_spawn_callback_failure_still_reaps_owned_process(tmp_path):
+    executable = tool(tmp_path, 'import time\ntime.sleep(30)\n')
+    pids = []
+    def fail(pid):
+        pids.append(pid)
+        raise RuntimeError('synthetic durable intent failure')
+    with pytest.raises(RuntimeError, match='durable intent'):
+        run_process([str(executable)], 10, on_spawn=fail)
+    with pytest.raises(ProcessLookupError):
+        os.kill(pids[0], 0)
+
+
 def test_large_output_is_bounded_and_not_completed_empty(tmp_path):
     executable = tool(tmp_path, 'print("x" * (2 * 1024 * 1024 + 1))\n')
     with pytest.raises(YouTubeFailure) as error:
         run_process([str(executable)], 2)
     assert error.value.category == 'invalid_response'
+
+
+@pytest.mark.parametrize('streams', [(1,), (2,), (1, 2)])
+def test_continuous_output_is_capped_before_exit_and_owned_group_is_killed(tmp_path, monkeypatch, streams):
+    import fcntl
+    import tempfile
+    import time
+    from hcr_sync.youtube_adapter import OUTPUT_LIMIT
+    from hcr_sync.youtube_download import _process_identity, process_is_alive
+
+    sizes = []
+    temporary_file = tempfile.TemporaryFile
+    class Capture:
+        def __init__(self):
+            self.file = temporary_file(mode='w+b')
+        def __getattr__(self, name):
+            return getattr(self.file, name)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            self.file.flush()
+            sizes.append(os.fstat(self.file.fileno()).st_size)
+            self.file.close()
+    monkeypatch.setattr('hcr_sync.youtube_adapter.tempfile.TemporaryFile', lambda **kwargs: Capture())
+    monkeypatch.setattr('hcr_sync.youtube_adapter.TERMINATE_SECONDS', .1)
+    pidfile = tmp_path / 'writer'
+    executable = tool(tmp_path, f'''import os,signal,time
+signal.signal(signal.SIGTERM,signal.SIG_IGN)
+child=os.fork()
+if child:
+    while True: time.sleep(1)
+open({str(pidfile)!r},'w').write(str(os.getpid()))
+while True:
+    for fd in {streams!r}:
+        try: os.write(fd,b'x'*65536)
+        except BrokenPipeError: time.sleep(.01)
+''')
+    started = time.monotonic()
+    lock = tmp_path / 'sync.lock'
+    with sync_lock(lock) as handle:
+        with pytest.raises(YouTubeFailure) as error:
+            run_process([str(executable)], 10, lock_handle=handle)
+    assert error.value.category == 'invalid_response'
+    assert time.monotonic() - started < 2
+    assert len(sizes) == 2 and max(sizes) == OUTPUT_LIMIT
+    assert all(size <= OUTPUT_LIMIT for size in sizes)
+    pid = int(pidfile.read_text())
+    identity, _ = _process_identity(pid)
+    deadline = time.monotonic() + 2
+    while process_is_alive(pid, identity) and time.monotonic() < deadline:
+        time.sleep(.01)
+    assert not process_is_alive(pid, identity)
+    with lock.open('a') as competing:
+        fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 def test_timeout_also_kills_child_ignoring_termination(tmp_path):

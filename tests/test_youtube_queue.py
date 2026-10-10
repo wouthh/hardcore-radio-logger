@@ -361,3 +361,22 @@ def test_dry_run_explicit_adapter_does_not_read_previous_run_counters_or_spawn(t
     assert summary.wanted == summary.due == 1
     assert summary.search_invocations == summary.download_starts == 0
     assert row(config, source)['search_attempts'] == 0
+
+
+def test_closest_version_reject_keeps_real_score_without_download(tmp_path):
+    from hcr_sync.youtube_adapter import YouTubeCandidate
+    config = fixture(tmp_path)
+    base = 'Silver Midnight Signals Drift Across Frozen Valleys Beneath Endless Distant Stars'
+    source = track(config, 'Artist', base + ' (Alpha Remix)')
+    class Rejected(Fake):
+        def search(self, *args):
+            return [YouTubeCandidate('Artist - Unrelated Short Song', 'https://www.youtube.com/watch?v=unrelated01', 'unrelated01', channel='', duration=180),
+                    YouTubeCandidate('Artist - ' + base + ' (Beta Remix)', 'https://www.youtube.com/watch?v=closewrong1', 'closewrong1', channel='', duration=180)]
+    client = Rejected()
+    summary = run(config, client)
+    evidence = json.loads(row(config, source)['decision_json'])
+    assert evidence['candidate']['video_id'] == 'closewrong1'
+    assert evidence['decision']['score'] > .9
+    assert not evidence['decision']['accepted']
+    assert evidence['decision']['reason'] == 'version_mismatch'
+    assert summary.download_starts == 0 and not client.downloads

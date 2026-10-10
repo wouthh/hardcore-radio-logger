@@ -70,14 +70,14 @@ def compare_recordings(source_artist, source_title, candidate_artist, candidate_
         reason = 'ambiguous_credits' if any(separator in source_artist or separator in candidate_artist
                     for separator in (' & ', ',')) else 'artist_evidence'
         return replace(decision, reason=reason)
-    decision = replace(decision, source_artist=artists[0], candidate_artist=artists[1])
+    score = match_confidence(artist=artists[0], title=source.text,
+                             candidate_artist=artists[1], candidate_title=target.text)
+    decision = replace(decision, source_artist=artists[0], candidate_artist=artists[1], score=score)
     if not compatible_titles(source, target):
         return replace(decision, reason='version_mismatch')
     a, b = duplicate_title_tokens(source.base), duplicate_title_tokens(target.base)
     if not a or not b or len(a & b)/len(a) < .75 or len(a & b)/len(b) < .75:
         return replace(decision, reason='title_overlap')
-    score = match_confidence(artist=artists[0], title=source.text,
-                             candidate_artist=artists[1], candidate_title=target.text)
     return replace(decision, accepted=score >= threshold, score=score,
                    reason='matched' if score >= threshold else 'below_threshold')
 

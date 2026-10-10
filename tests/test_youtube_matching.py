@@ -48,6 +48,7 @@ def test_long_shared_base_does_not_override_recording_distinctions(a, b):
     result = evaluate_candidate('Synthetic Artist', f'{LONG} {a}',
                                   video(f'Synthetic Artist - {LONG} {b}'))
     assert not result.accepted and result.reason == 'version_mismatch'
+    assert result.score > .9  # A high text score cannot authorize a different recording.
 
 
 @pytest.mark.parametrize('source,heading,names,accepted', [

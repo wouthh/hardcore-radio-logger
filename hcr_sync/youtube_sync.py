@@ -174,7 +174,7 @@ def _candidate_decision(track, candidate, threshold=.90):
 
 def _candidate_score(track, candidate):
     decision = _candidate_decision(track,candidate)
-    return decision.score if decision.reason in {'accepted','below_threshold'} else 0.0
+    return decision.score if decision.reason in {'matched','below_threshold'} else 0.0
 
 
 def _mark_youtube_review(con, track_id: int, *, reason: str, score: float | None = None) -> None:

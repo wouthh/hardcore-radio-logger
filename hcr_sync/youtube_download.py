@@ -172,6 +172,8 @@ def verify_output(config, candidate, path, source_artist, source_title, receipt=
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise UnsafeDownloadOutput("Audio verification returned malformed evidence") from exc
     except YouTubeFailure as exc:
+        if exc.category in {"missing_tool", "configuration"}:
+            raise
         raise UnsafeDownloadOutput("Downloaded audio could not be fully decoded") from exc
     if candidate.duration is not None and abs(duration - candidate.duration) > max(3, candidate.duration * 0.02):
         raise UnsafeDownloadOutput("Downloaded duration does not match the selected video")

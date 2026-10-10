@@ -110,7 +110,8 @@ def test_real_adapter_failed_search_is_counted_in_degraded_summary(setup):
     assert summary.degraded and summary.deferred == 1
 
 
-def test_missing_verification_tool_preserves_receipt_for_resume_and_offline_recovery(setup, monkeypatch):
+@pytest.mark.parametrize('tool_failure', ['missing', 'ffprobe', 'ffmpeg'])
+def test_verification_tool_failure_preserves_receipt_for_resume_and_offline_recovery(setup, monkeypatch, tool_failure):
     from types import SimpleNamespace
     from test_youtube_download_recovery import stage
     from hcr_sync.cli import cmd_youtube
@@ -120,14 +121,22 @@ def test_missing_verification_tool_preserves_receipt_for_resume_and_offline_reco
     initialize_schedule(config)
     output, _ = stage(config, audio)
     original = download.shutil.which
-    monkeypatch.setattr(download.shutil, 'which', lambda name: None if name == 'ffprobe' else original(name))
+    broken = audio.parent / 'incompatible-verifier'
+    broken.write_text('#!/usr/bin/python3\nimport sys\nprint("no such option", file=sys.stderr)\nsys.exit(2)\n')
+    broken.chmod(0o700)
+    def selected_tool(name):
+        if tool_failure == 'missing' and name == 'ffprobe':
+            return None
+        return str(broken) if name == tool_failure else original(name)
+    monkeypatch.setattr(download.shutil, 'which', selected_tool)
+    category = 'missing_tool' if tool_failure == 'missing' else 'configuration'
     summary = recover_youtube_pending(config)
-    assert summary.degraded == 'missing_tool' and output.is_file()
+    assert summary.degraded == category and output.is_file()
     with connect(config) as con:
         assert con.execute('SELECT state FROM youtube_pending_work').fetchone()[0] == 'prepared'
         assert con.execute('SELECT phase FROM youtube_schedule').fetchone()[0] == 'download'
         assert pause_state(con)['operator_required']
-    assert recover_youtube_pending(config).degraded == 'missing_tool'
+    assert recover_youtube_pending(config).degraded == category
     monkeypatch.setattr(download.shutil, 'which', original)
     checks = []
     monkeypatch.setattr('hcr_sync.youtube_adapter.local_tool_check', lambda c: checks.append(c))

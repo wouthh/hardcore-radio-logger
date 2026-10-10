@@ -215,6 +215,11 @@ def publish_output(config, candidate, work, source_artist, source_title) -> Path
         verify_output(config, candidate, source, source_artist, source_title)
         return source
     if source == target and target.exists():
+        if work.get("stage_dir") or receipt is not None:
+            staged_source = _inside(config, stage / "output.mp3")
+            if not staged_source.is_file() or not os.path.samefile(staged_source, target):
+                raise UnsafeDownloadOutput("Published destination is not the staged hard link")
+        # Explicit direct-output clients have no staged publication to recover.
         verify_output(config, candidate, target, source_artist, source_title, receipt)
         return target
     source = stage / "output.mp3"

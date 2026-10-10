@@ -147,3 +147,33 @@ def test_verification_tool_failure_preserves_receipt_for_resume_and_offline_reco
     with connect(config) as con:
         assert con.execute('SELECT state FROM youtube_pending_work').fetchone()[0] == 'completed'
         assert con.execute('SELECT file_exists FROM youtube_assets').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('receipt_failure', ['malformed', 'oversized', 'symlink'])
+def test_unsafe_receipt_persists_safety_hold_before_fatal_error(setup, receipt_failure):
+    from test_youtube_download_recovery import stage
+    from hcr_sync.youtube_download import UnsafeDownloadOutput
+    config, audio = setup
+    initialize_schedule(config)
+    output, _ = stage(config, audio)
+    receipt = output.parent / 'receipt.jsonl'
+    if receipt_failure == 'malformed':
+        receipt.write_text('{truncated')
+    elif receipt_failure == 'oversized':
+        receipt.write_text('x' * 65537)
+    else:
+        outside = audio.parent / 'external-receipt'
+        outside.write_bytes(receipt.read_bytes())
+        receipt.unlink()
+        receipt.symlink_to(outside)
+    with pytest.raises(UnsafeDownloadOutput):
+        recover_youtube_pending(config)
+    with connect(config) as con:
+        assert con.execute('SELECT state FROM youtube_pending_work').fetchone()[0] == 'held'
+        row = con.execute('SELECT phase,hold_origin FROM youtube_schedule').fetchone()
+        assert tuple(row) == ('held', 'filesystem_safety')
+        assert con.execute('SELECT COUNT(*) FROM youtube_assets').fetchone()[0] == 0
+        assert con.execute('SELECT COUNT(*) FROM exclusions').fetchone()[0] == 0
+    # The unchanged unsafe artifact is retained, but cannot abort every later run.
+    assert recover_youtube_pending(config).downloaded == 0
+    assert output.is_file() and receipt.exists()

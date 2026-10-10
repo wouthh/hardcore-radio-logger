@@ -393,38 +393,38 @@ def recover_youtube_pending(config, *, apply=True):
             if process_is_alive(work['process_pid'],work['process_start']):
                 summary.pending+=1
                 continue
-            receipt=read_receipt(config,work)
-            if receipt:
-                try:
-                    completed=_complete_download(config,con,work,now)
-                except (UnsafeDownloadOutput,OSError):
-                    with transaction(con):
-                        con.execute("UPDATE youtube_pending_work SET state='held',updated_at=? WHERE work_id=?",(stamp(now),work['work_id']))
-                        _hold(con,{'track_id':work['track_id']},now,'filesystem_safety')
-                    raise
-                except YouTubeFailure as exc:
-                    with transaction(con):
-                        if exc.category in {'missing_tool', 'configuration'}:
-                            row = con.execute('SELECT * FROM youtube_schedule WHERE track_id=?', (work['track_id'],)).fetchone()
-                            failed(con, row, 2, exc, now)
-                            con.execute("UPDATE youtube_pending_work SET state='prepared',error_json=?,updated_at=? WHERE work_id=?", (decision_json({'category':exc.category,'reason':exc.detail}), stamp(now), work['work_id']))
-                        else:
-                            con.execute("UPDATE youtube_pending_work SET state='held',error_json=?,updated_at=? WHERE work_id=?",(decision_json({'category':exc.category,'reason':exc.detail}),stamp(now),work['work_id']))
-                            _hold(con,{'track_id':work['track_id']},now,exc.category)
-                    summary.pending+=1
+            try:
+                receipt=read_receipt(config,work)
+                completed=_complete_download(config,con,work,now) if receipt else None
+            except (UnsafeDownloadOutput,OSError):
+                with transaction(con):
+                    con.execute("UPDATE youtube_pending_work SET state='held',updated_at=? WHERE work_id=?",(stamp(now),work['work_id']))
+                    _hold(con,{'track_id':work['track_id']},now,'filesystem_safety')
+                raise
+            except YouTubeFailure as exc:
+                with transaction(con):
                     if exc.category in {'missing_tool', 'configuration'}:
-                        summary.degraded = exc.category
-                        summary.pause_until = pause_state(con).get('until', '')
-                        break
-                else:
+                        row = con.execute('SELECT * FROM youtube_schedule WHERE track_id=?', (work['track_id'],)).fetchone()
+                        failed(con, row, 2, exc, now)
+                        con.execute("UPDATE youtube_pending_work SET state='prepared',error_json=?,updated_at=? WHERE work_id=?", (decision_json({'category':exc.category,'reason':exc.detail}), stamp(now), work['work_id']))
+                    else:
+                        con.execute("UPDATE youtube_pending_work SET state='held',error_json=?,updated_at=? WHERE work_id=?",(decision_json({'category':exc.category,'reason':exc.detail}),stamp(now),work['work_id']))
+                        _hold(con,{'track_id':work['track_id']},now,exc.category)
+                summary.pending+=1
+                if exc.category in {'missing_tool', 'configuration'}:
+                    summary.degraded = exc.category
+                    summary.pause_until = pause_state(con).get('until', '')
+                    break
+            else:
+                if receipt:
                     summary.downloaded+=int(completed)
                     summary.review+=int(not completed)
-            elif work['state']=='dispatched':
-                row=con.execute('SELECT * FROM youtube_schedule WHERE track_id=?',(work['track_id'],)).fetchone()
-                with transaction(con):
-                    failed(con,row,2,YouTubeFailure('transient','interrupted download has no verified completion receipt'),now)
-                    con.execute("UPDATE youtube_pending_work SET state='prepared',process_pid=NULL,process_start=NULL,updated_at=? WHERE work_id=? AND state='dispatched'",(stamp(now),work['work_id']))
-                summary.pending+=1
+                elif work['state']=='dispatched':
+                    row=con.execute('SELECT * FROM youtube_schedule WHERE track_id=?',(work['track_id'],)).fetchone()
+                    with transaction(con):
+                        failed(con,row,2,YouTubeFailure('transient','interrupted download has no verified completion receipt'),now)
+                        con.execute("UPDATE youtube_pending_work SET state='prepared',process_pid=NULL,process_start=NULL,updated_at=? WHERE work_id=? AND state='dispatched'",(stamp(now),work['work_id']))
+                    summary.pending+=1
     return summary
 
 

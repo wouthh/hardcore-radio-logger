@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -404,14 +405,15 @@ def reconcile(
                 cache={}
                 for track in con.execute("SELECT DISTINCT t.* FROM tracks t JOIN youtube_assets y ON y.track_id=t.id WHERE y.file_exists=1 AND y.status='downloaded'").fetchall():
                     local_satisfaction(config,con,track,cache=cache,persist=True)
-        current_paths = {str(path) for path in audio_paths(config.music_dir)}
+        # Compare location spellings without resolving symlinks or rewriting provenance.
+        current_paths = {os.path.abspath(path) for path in audio_paths(config.music_dir)}
         known_local = list(
             con.execute(
                 "SELECT * FROM youtube_assets WHERE file_exists = 1 AND status = 'downloaded' AND file_path IS NOT NULL"
             )
         )
         confirmed_local = [asset for asset in known_local if association_allows_absence(con,asset)]
-        missing_known_local_count = sum(1 for asset in confirmed_local if asset["file_path"] not in current_paths)
+        missing_known_local_count = sum(1 for asset in confirmed_local if os.path.abspath(asset["file_path"]) not in current_paths)
         local_refusal = _local_scan_guard(
             config,
             con,
@@ -425,7 +427,7 @@ def reconcile(
             summary.refused.append(f"local: {local_refusal}")
         else:
             for asset in known_local:
-                if asset["file_path"] in current_paths:
+                if os.path.abspath(asset["file_path"]) in current_paths:
                     if apply and asset["suspected_missing_at"]:
                         with transaction(con):
                             con.execute(
@@ -472,7 +474,7 @@ def reconcile(
                         },
                         dedupe_key=f"local_file_deleted_by_user:{asset['track_id']}:{asset['id']}",
                     )
-                    still_local=any(other['track_id']==asset['track_id'] and other['id']!=asset['id'] and other['file_path'] in current_paths for other in confirmed_local)
+                    still_local=any(other['track_id']==asset['track_id'] and other['id']!=asset['id'] and os.path.abspath(other['file_path']) in current_paths for other in confirmed_local)
                     if not still_local:
                         mark_excluded(con, track_id=asset["track_id"], source="local_deleted", reason="local file missing")
                         _cascade_spotify(con, config, asset["track_id"], summary, spotify_client)

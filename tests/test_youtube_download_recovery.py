@@ -187,3 +187,30 @@ def test_truncated_audio_cannot_use_original_duration_header(setup):
     output.write_bytes(raw[:len(raw) // 2])
     with pytest.raises(UnsafeDownloadOutput):
         verify_output(config, CANDIDATE, output, 'Artist', 'Song', receipt)
+
+
+def test_crash_before_link_rejects_compatible_destination_with_different_inode(setup, monkeypatch):
+    config, audio = setup
+    source, _ = stage(config, audio)
+    def crash(*args, **kwargs):
+        raise KeyboardInterrupt('synthetic crash after destination commit')
+    real_link = os.link
+    monkeypatch.setattr('hcr_sync.youtube_download.os.link', crash)
+    with pytest.raises(KeyboardInterrupt):
+        publish_output(config, CANDIDATE, work(config), 'Artist', 'Song')
+    recorded = work(config)
+    destination = config.music_dir / 'Artist - Song [abcdefghijk].mp3'
+    shutil.copyfile(audio, destination)
+    # Same audio, metadata and intended filename are not publication provenance.
+    original = destination.read_bytes()
+    original_inode = destination.stat().st_ino
+    assert not os.path.samefile(source, destination)
+    monkeypatch.setattr('hcr_sync.youtube_download.os.link', real_link)
+    with pytest.raises(UnsafeDownloadOutput, match='staged hard link'):
+        publish_output(config, CANDIDATE, recorded, 'Artist', 'Song')
+    assert destination.read_bytes() == original
+    assert destination.stat().st_ino == original_inode
+    assert source.is_file() and not os.path.samefile(source, destination)
+    assert work(config) == recorded
+    with connect(config) as con:
+        assert not con.execute('SELECT 1 FROM youtube_assets').fetchone()

@@ -209,3 +209,58 @@ def test_cross_source_filter_avoids_unrelated_full_comparisons_without_skipping_
         con.execute('UPDATE youtube_assets SET file_path=?', (str(renamed),))
     assert satisfaction(config, source_id)[0] == 'none'
     assert calls and not original(*calls[-1]).accepted
+
+
+@pytest.mark.parametrize('absolute_asset_path', [True, False])
+def test_relative_music_directory_preserves_present_published_asset_across_reconciliation(tmp_path, monkeypatch, absolute_asset_path):
+    from hcr_sync.db import upsert_spotify_asset
+    from hcr_sync.spotify_adapter import SpotifyTrack
+    from test_spotify_reconcile_youtube import FakeSpotify
+    from test_youtube_duplicates import audio_file
+    config, source_id, _, path = seed(tmp_path, 'Synthetic Artist - Night Signal [local123456].mp3')
+    audio_file(path)
+    monkeypatch.chdir(tmp_path)
+    config.values.update(HCR_MUSIC_DIR='./music', HCR_SPOTIFY_ENABLED='true', HCR_SPOTIFY_PLAYLIST_ID='playlist')
+    stored_path = str(path) if absolute_asset_path else str(path.relative_to(tmp_path))
+    spotify = FakeSpotify(snapshot_tracks=[SpotifyTrack('spotify:track:present', 'present', 'Synthetic Artist', 'Night Signal')])
+    with connect(config) as con, transaction(con):
+        con.execute('UPDATE youtube_assets SET file_path=?', (stored_path,))
+        set_state(con, 'local_baseline_complete', 'true')
+        set_state(con, 'last_local_scan_count', '1')
+        set_state(con, 'spotify_baseline_complete', 'true')
+        set_state(con, 'last_spotify_playlist_count', '1')
+        upsert_spotify_asset(con, track_id=source_id, playlist_id='playlist', spotify_track_id='present',
+            spotify_track_uri='spotify:track:present', spotify_artist='Synthetic Artist', spotify_title='Night Signal',
+            in_playlist=True, match_confidence=1, status='added')
+    for _ in range(2):
+        result = reconcile(config, apply=True, spotify_client=spotify)
+        assert result.suspected_local == result.excluded_local == result.spotify_removed == 0
+        assert not any(action.kind == 'local_deleted' for action in result.planned)
+    with connect(config) as con:
+        asset = con.execute('SELECT * FROM youtube_assets WHERE track_id=?', (source_id,)).fetchone()
+        assert asset['file_path'] == stored_path and asset['file_exists'] == 1 and asset['status'] == 'downloaded'
+        assert asset['suspected_missing_at'] is None and asset['match_confidence'] == 1
+        assert con.execute('SELECT status FROM tracks WHERE id=?', (source_id,)).fetchone()[0] == 'wanted'
+        assert con.execute("SELECT count(*) FROM events WHERE event_type IN ('suspected_local_delete','local_file_deleted_by_user')").fetchone()[0] == 0
+        assert con.execute("SELECT count(*) FROM spotify_pending_work WHERE kind='remove'").fetchone()[0] == 0
+    assert spotify.removed == [] and path.exists()
+
+
+def test_relative_music_directory_still_confirms_genuinely_missing_verified_asset(tmp_path, monkeypatch):
+    config, source_id, _, path = seed(tmp_path, 'Synthetic Artist - Night Signal [local123456].mp3')
+    assert satisfaction(config, source_id, persist=True)[0] == 'satisfied'
+    monkeypatch.chdir(tmp_path)
+    config.values['HCR_MUSIC_DIR'] = './music'
+    with connect(config) as con, transaction(con):
+        set_state(con, 'local_baseline_complete', 'true')
+        set_state(con, 'last_local_scan_count', '1')
+    path.unlink()
+    (config.music_dir/'Unrelated - Still Present.mp3').write_bytes(b'fixture')
+    first = reconcile(config, apply=True, force_mass_delete=True, skip_spotify=True)
+    second = reconcile(config, apply=True, force_mass_delete=True, skip_spotify=True)
+    assert first.suspected_local == 1 and first.excluded_local == 0
+    assert second.excluded_local == 1
+    with connect(config) as con:
+        assert con.execute('SELECT status FROM tracks WHERE id=?', (source_id,)).fetchone()[0] == 'excluded'
+        asset = con.execute('SELECT * FROM youtube_assets WHERE track_id=?', (source_id,)).fetchone()
+        assert asset['file_exists'] == 0 and asset['status'] == 'deleted'

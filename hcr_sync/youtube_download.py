@@ -179,17 +179,20 @@ def verify_output(config, candidate, path, source_artist, source_title, receipt=
     if candidate.duration is not None and abs(duration - candidate.duration) > max(3, candidate.duration * 0.02):
         raise UnsafeDownloadOutput("Downloaded duration does not match the selected video")
     tags = {str(key).casefold(): value for key, value in data["format"].get("tags", {}).items()}
-    evidence = receipt or {}
+    # Embedded tags must not fill missing raw extractor fields in a receipt.
+    evidence = receipt if receipt is not None else {
+        "artist": tags.get("artist"), "title": tags.get("title"), "track": tags.get("title"),
+    }
     def known(value):
         return value if value not in (None, "NA", "") else None
-    artist = str(known(evidence.get("artist")) or tags.get("artist") or "")
+    artist = str(known(evidence.get("artist")) or "")
     artists = evidence.get("artist_names") or ()
-    title = str(known(evidence.get("title")) or tags.get("title") or "")
+    title = str(known(evidence.get("title")) or "")
     if receipt is None and not title:
         title = path.stem.removesuffix(f" [{candidate.video_id}]")
     actual = YouTubeCandidate(title=title, url=candidate.url, video_id=candidate.video_id,
                              channel=candidate.channel, duration=round(duration),
-                             artist=artist, track=str(known(evidence.get("track")) or tags.get("title") or ""),
+                             artist=artist, track=str(known(evidence.get("track")) or ""),
                              artist_names=tuple(value for value in artists if isinstance(value, str)) if isinstance(artists, (list, tuple)) else ())
     _metadata_decision(config, source_artist, source_title, actual)
     if tags.get("artist") and tags.get("title"):

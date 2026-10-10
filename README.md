@@ -148,7 +148,7 @@ python -m hcr_sync spotify repair-scheduling --apply --backup /path/to/private/r
 
 To check recovery, compare radio observations, `youtube_downloaded`, completed first-time/retry searches, acknowledged/pending work, verified Spotify additions, and failure events separately. A successful timer exit does not prove additions. Recheck the stored cooldown before a controlled sync. Spotify budget/cooldown deferrals allow radio discovery, imports, and YouTube processing to continue. Keep verbose auditing disabled during ordinary operation.
 
-YouTube sync checks existing files against recording and artist evidence before treating them as local, including files imported without a YouTube video ID. Different meaningful versions cannot satisfy each other; ambiguous metadata remains held. Saved local decisions authorize missing-file handling only at the same configured YouTube match threshold. To deliberately test or complete those files into YouTube-ID MP3 downloads, opt in explicitly:
+YouTube sync checks existing files against recording and artist evidence before treating them as local, including files imported without a YouTube video ID. Downloads embed artist and track tags from explicit extractor metadata or the actual video heading, never the uploader; raw receipt metadata is checked independently. Different meaningful versions cannot satisfy each other; ambiguous metadata remains held. Saved local decisions authorize missing-file handling only at the same configured YouTube match threshold. To deliberately test or complete those files into YouTube-ID MP3 downloads, opt in explicitly:
 
 ```bash
 python -m hcr_sync youtube sync --dry-run --complete-idless-local

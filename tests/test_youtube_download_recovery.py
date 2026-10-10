@@ -555,3 +555,92 @@ def test_flat_verified_completion_recognizes_long_publication_without_inventing_
         tags.save(v2_version=4)
         with connect(config) as con:
             assert local_satisfaction(config,con,owner)[0]=='ambiguous'
+
+
+@pytest.mark.parametrize('heading,metadata,source_artist,source_title,accepted,expected_artist,expected_title',[
+    ('Artist - Song',{},'Artist','Song',True,'Artist','Song'),
+    ('Artist – Song',{},'Artist','Song',True,'Artist','Song'),
+    ('Artist — Song',{},'Artist','Song',True,'Artist','Song'),
+    ('Sound, Vision - Song',{},'Sound, Vision','Song',True,'Sound, Vision','Song'),
+    ('Artist & MC Voice - Song (Alpha Remix)',{},'Artist & MC Voice','Song (Alpha Remix)',True,'Artist & MC Voice','Song (Alpha Remix)'),
+    ('Artist - Song',{'artist':'Artist','track':'Song'},'Artist','Song',True,'Artist','Song'),
+    ('Artist & MC Voice - Song',{'artists':['Artist','MC Voice'],'track':'Song'},'Artist & MC Voice','Song',True,'Artist, MC Voice','Song'),
+    ('Song',{},'Artist','Song',False,'','Song'),
+    ('Artist - Song',{'artist':'Wrong Artist'},'Artist','Song',False,'Wrong Artist','Song'),
+    ('Artist - Song',{'track':'Song (Other Remix)'},'Artist','Song',False,'Artist','Song (Other Remix)'),
+    ('Other Artist - Song',{},'Artist','Song',False,'Other Artist','Song'),
+    ('Artist - Song (Alpha Remix)',{},'Artist','Song (Beta Remix)',False,'Artist','Song (Alpha Remix)'),
+    ('Artist & Collaborator - Song',{},'Artist, Collaborator','Song',False,'Artist & Collaborator','Song'),
+])
+def test_installed_download_cli_embeds_actual_heading_preserving_raw_metadata_and_conflicts(
+        setup,heading,metadata,source_artist,source_title,accepted,expected_artist,expected_title):
+    import shlex
+    from pathlib import Path
+    from mutagen.easyid3 import EasyID3
+    from hcr_sync.db import upsert_youtube_asset
+    from hcr_sync.youtube_local import local_satisfaction
+    from hcr_sync.youtube_queue import source_fingerprint
+    executable=shutil.which('yt-dlp')
+    if not executable:
+        pytest.skip('installed yt-dlp is required for its offline download fixture')
+    config,audio=setup
+    interpreter=shlex.split(Path(executable).read_text().splitlines()[0][2:])
+    fixture=audio.parent/'offline-download-ytdlp'
+    fixture.write_text('#!'+' '.join(interpreter)+'\n'+f'''
+import sys
+import yt_dlp
+from yt_dlp.extractor.common import InfoExtractor
+from yt_dlp.postprocessor.metadataparser import MetadataParserPP
+from pathlib import Path
+original_run=MetadataParserPP.run
+def capture(self,info):
+    Path({str(audio.parent/'actual-metadata.json')!r}).write_text(__import__('json').dumps({{key:info.get(key) for key in ('title','artist','artists','track')}}))
+    return original_run(self,info)
+MetadataParserPP.run=capture
+class FixtureIE(InfoExtractor):
+    _VALID_URL=r'https://www.youtube.com/watch\\?v=(?P<id>abcdefghijk)'
+    def _real_extract(self,url):
+        return dict({metadata!r},id='abcdefghijk',title={heading!r},duration=125,uploader='Artist',
+                    formats=[{{'url':{audio.as_uri()!r},'ext':'mp3','format_id':'1','acodec':'mp3','vcodec':'none'}}])
+yt_dlp.YoutubeDL.add_default_info_extractors=lambda self:self.add_info_extractor(FixtureIE())
+# Only this controlled extractor is registered; file access is fixture-local.
+sys.argv.insert(1,'--enable-file-urls')
+yt_dlp.main()
+''')
+    fixture.chmod(0o700)
+    config.values['HCR_YTDLP_BIN']=str(fixture)
+    candidate=replace(CANDIDATE,title=f'{source_artist} - {source_title}')
+    with connect(config) as con,transaction(con):
+        con.execute("UPDATE tracks SET status='excluded'")
+        owner=ensure_track(con,artist=source_artist,title=source_title)
+        con.execute("UPDATE tracks SET status='wanted' WHERE id=?",(owner['id'],))
+        owner=con.execute('SELECT * FROM tracks WHERE id=?',(owner['id'],)).fetchone()
+        payload={'candidate':asdict(candidate),'source_artist':source_artist,'source_title':source_title,
+                 'fingerprint':source_fingerprint(owner)}
+        con.execute('UPDATE youtube_pending_work SET track_id=?,payload_json=?',(owner['id'],json.dumps(payload)))
+    output=YtDlpClient(config).download(candidate,work=work(config))
+    receipt=read_receipt(config,work(config))
+    extracted=json.loads((audio.parent/'actual-metadata.json').read_text())
+    assert receipt['title']==extracted['title']==heading
+    assert receipt['artist']==extracted['artist']
+    assert receipt['artist_names']==extracted['artists']
+    assert receipt['track']==extracted['track']
+    tags=EasyID3(output)
+    assert tags.get('artist',[''])[0]==expected_artist
+    assert tags['title']==[expected_title]
+    if not accepted:
+        with pytest.raises(UnsafeDownloadOutput,match='requested recording'):
+            publish_output(config,candidate,work(config),source_artist,source_title)
+        assert output.is_file()
+        assert not list(config.music_dir.glob('*.mp3'))
+        return
+    published=publish_output(config,candidate,work(config),source_artist,source_title)
+    with connect(config) as con,transaction(con):
+        con.execute("UPDATE youtube_pending_work SET state='completed'")
+        upsert_youtube_asset(con,track_id=owner['id'],youtube_video_id=candidate.video_id,file_path=str(published),
+                             file_exists=True,status='downloaded',match_confidence=1)
+        assert local_satisfaction(config,con,owner,persist=True)[0]=='satisfied'
+        verified=json.loads(con.execute('SELECT payload_json FROM youtube_pending_work').fetchone()[0])['verified_recording']
+        assert verified['title']==heading
+        assert verified['artist']==(receipt['artist'] or '')
+        assert verified['track']==(receipt['track'] or '')

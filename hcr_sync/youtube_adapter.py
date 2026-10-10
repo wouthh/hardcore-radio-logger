@@ -15,6 +15,7 @@ import tempfile
 import time
 
 from .config import Config
+from .identity import SEPARATOR_RE
 
 SEARCH_SECONDS = 45
 DOWNLOAD_SECONDS = 120
@@ -23,6 +24,14 @@ OUTPUT_LIMIT = 2 * 1024 * 1024
 VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
 RECEIPT_TEMPLATE = 'after_move:{"video_id":%(id)j,"title":%(title)j,"artist":%(artist|null)j,"artist_names":%(artists|null)j,"track":%(track|null)j,"duration":%(duration)j,"filepath":%(filepath)j}'
 SEARCH_TEMPLATE = 'playlist:{"_type":%(_type)j,"entries_present":%(entries&true|false)s,"playlist_count":%(playlist_count)j,"entries":%(entries.:.{id,title,duration,artists,artist,track,channel,uploader,description,is_live,was_live,live_status}|[])j}'
+# Keep extractor metadata intact; only embedded tags use the actual heading
+# when explicit recording fields are absent. Blank artist prevents uploader fallback.
+DOWNLOAD_METADATA_RULES = (
+    '%(artist,artists|)l:(?s)^(?P<meta_artist>.*)$',
+    f'title:(?s)^\\s*(?P<meta_artist>.+?){SEPARATOR_RE.pattern}(?P<meta_title>.+?)\\s*$',
+    '%(artist,artists|)l:(?s)^(?P<meta_artist>.+)$',
+    '%(track|)s:(?s)^(?P<meta_title>.+)$',
+)
 
 
 @dataclass(frozen=True)
@@ -245,6 +254,7 @@ class YtDlpClient:
 
         command = [*self._base_command(), "--no-playlist", "--download-archive", str(archive),
                    "--no-overwrites", "--continue", "--no-simulate", "-f", "ba/b", "-x", "--audio-format", "mp3",
+                   *[arg for rule in DOWNLOAD_METADATA_RULES for arg in ("--parse-metadata", rule)],
                    "--audio-quality", "0", "--embed-metadata", "--embed-thumbnail", "--convert-thumbnails", "jpg", "--match-filter", "!is_live & duration >= 120 & duration <= 480",
                    "--paths", f"temp:{prepare_partials(self.config, work['work_id'])}", "-o", str(stage / "output.%(ext)s"),
                    "--print-to-file", RECEIPT_TEMPLATE, str(stage / "receipt.jsonl"),

@@ -446,23 +446,24 @@ def test_spotify_scan_imports_playlist_addition_for_youtube_sync(tmp_path):
             return [
                 YouTubeCandidate(
                     title="Artist - Title",
-                    url="https://www.youtube.com/watch?v=ytnew123",
-                    video_id="ytnew123",
+                    url="https://www.youtube.com/watch?v=ytnew123456",
+                    video_id="ytnew123456",
                     channel="Artist",
                     duration=180,
                 )
             ]
 
         def download(self, candidate):
-            path = config.music_dir / "Artist - Title [ytnew123].mp3"
-            path.write_bytes(b"audio")
+            path = config.music_dir / "Artist - Title [ytnew123456].mp3"
+            from test_youtube_duplicates import audio_file
+            audio_file(path)
             return path
 
     youtube_summary = sync_youtube(config, apply=True, client=DownloadingYouTube())
 
     assert youtube_summary.downloaded == 1
     with connect(config) as con:
-        youtube = con.execute("SELECT * FROM youtube_assets WHERE youtube_video_id = 'ytnew123'").fetchone()
+        youtube = con.execute("SELECT * FROM youtube_assets WHERE youtube_video_id = 'ytnew123456'").fetchone()
         assert youtube is not None
 
 
@@ -1228,8 +1229,8 @@ def test_youtube_sync_downloads_even_when_spotify_is_review(tmp_path):
             return [
                 YouTubeCandidate(
                     title="Artist - Title",
-                    url="https://www.youtube.com/watch?v=abc123xyz",
-                    video_id="abc123xyz",
+                    url="https://www.youtube.com/watch?v=abc123xyz45",
+                    video_id="abc123xyz45",
                     channel="Artist",
                     duration=180,
                 )
@@ -1237,8 +1238,9 @@ def test_youtube_sync_downloads_even_when_spotify_is_review(tmp_path):
 
         def download(self, candidate):
             self.downloads.append(candidate)
-            path = config.music_dir / "Artist - Title [abc123xyz].mp3"
-            path.write_bytes(b"audio")
+            path = config.music_dir / "Artist - Title [abc123xyz45].mp3"
+            from test_youtube_duplicates import audio_file
+            audio_file(path)
             return path
 
     with connect(config) as con:
@@ -1325,11 +1327,16 @@ def test_reconcile_refuses_many_local_known_missing_even_when_replacement_files_
                 upsert_youtube_asset(
                     con,
                     track_id=track["id"],
-                    file_path=str(config.music_dir / f"missing-{index}.mp3"),
+                    file_path=str(config.music_dir / f"Missing {index} - Song.mp3"),
                     file_exists=True,
                     match_confidence=1.0,
                     status="downloaded",
                 )
+                recorded=config.music_dir / f"Missing {index} - Song.mp3"
+                recorded.write_bytes(b"fixture")
+                from hcr_sync.youtube_local import local_satisfaction
+                local_satisfaction(config,con,track,persist=True)
+                recorded.unlink()
             set_state(con, "local_baseline_complete", "true")
             set_state(con, "last_local_scan_count", "3")
     for index in range(3):
@@ -1689,6 +1696,9 @@ def test_reconcile_two_pass_local_delete_then_cascade(tmp_path):
             upsert_youtube_asset(con, track_id=gone_track["id"], file_path=str(gone), file_exists=True, match_confidence=1.0, status="downloaded")
             set_state(con, "local_baseline_complete", "true")
             set_state(con, "last_local_scan_count", "2")
+    from hcr_sync.youtube_local import local_satisfaction
+    with connect(config) as con,transaction(con):
+        local_satisfaction(config,con,gone_track,persist=True)
     gone.unlink()
 
     first = reconcile(config, apply=True, spotify_client=FakeSpotify())

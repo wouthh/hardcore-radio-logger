@@ -5,6 +5,7 @@ This project is a SQLite-backed sync system for Hardcore Radio observations, a l
 ## Project Rules
 
 - The SQLite database is the source of truth.
+- YouTube download starts require durable source/video intent, bounded subprocess work, and verified audio before local completion. Failed searches are not completed no-match decisions; exclusions/manual holds and provider pauses remain authoritative.
 - Spotify writes require a committed pending intent and verified membership before completion; do not bypass pending recovery or the shared request budget.
 - Unidentified playlist entries cannot prove removal. Source scheduling must not change another track's recording ownership or match provenance.
 - Logger files, local music files, YouTube, and Spotify are inputs or outputs.

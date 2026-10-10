@@ -10,7 +10,7 @@ from .youtube_adapter import YouTubeCandidate
 from .youtube_queue import source_fingerprint
 
 
-def _completed_credits(con, asset, item, owner):
+def _completed_credits(con, asset, item, owner, threshold):
     if not asset['youtube_video_id'] or not item or item.youtube_video_id != asset['youtube_video_id']:
         return ()
     if owner is None:
@@ -32,13 +32,14 @@ def _completed_credits(con, asset, item, owner):
                 recording=YouTubeCandidate(**candidate)
             except TypeError:
                 continue
-            if evaluate_candidate(owner['display_artist'],owner['display_title'],recording).accepted:
+            if evaluate_candidate(owner['display_artist'],owner['display_title'],recording,threshold=threshold).accepted:
                 return tuple(names)
     return ()
 
 
 def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=None, persist=False):
     cache = cache if cache is not None else {}
+    threshold = config.float('HCR_YOUTUBE_MATCH_THRESHOLD')
     rows = con.execute("SELECT * FROM youtube_assets WHERE file_exists=1 AND status='downloaded' AND file_path IS NOT NULL ORDER BY track_id=? DESC,id", (track['id'],)).fetchall()
     source_tokens = duplicate_title_tokens(_title(track['display_title']).base)
     ambiguous = None
@@ -76,9 +77,9 @@ def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=No
             continue
         owner=con.execute('SELECT * FROM tracks WHERE id=?',(row['track_id'],)).fetchone()
         credit_key = ('completed_credits', row['id'], row['track_id'], row['youtube_video_id'], key,
-                      source_fingerprint(owner) if owner else None)
+                      source_fingerprint(owner) if owner else None, threshold)
         if credit_key not in cache:
-            cache[credit_key] = _completed_credits(con,row,item,owner)
+            cache[credit_key] = _completed_credits(con,row,item,owner,threshold)
         credits = cache[credit_key]
         status = 'different'
         artist,title = (item.artist,item.title) if item else ('','')
@@ -92,11 +93,11 @@ def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=No
             if projected:
                 artist,title = tags
             owner_tags_agree = not projected or compare_recordings(owner['display_artist'],owner['display_title'],
-                                                                   *tags,artist_names=credits).accepted
-            decision = compare_recordings(track['display_artist'], track['display_title'], artist, title, artist_names=credits)
+                                                                   *tags,artist_names=credits,threshold=threshold).accepted
+            decision = compare_recordings(track['display_artist'], track['display_title'], artist, title, artist_names=credits,threshold=threshold)
             if decision.accepted:
                 status = 'ambiguous' if (source_projection and not projected) or not owner_tags_agree else 'satisfied'
-                if tags[0] and tags[1] and not compare_recordings(track['display_artist'],track['display_title'],*tags,artist_names=credits).accepted:
+                if tags[0] and tags[1] and not compare_recordings(track['display_artist'],track['display_title'],*tags,artist_names=credits,threshold=threshold).accepted:
                     status = 'ambiguous'
             elif (projected and own) or not owner_tags_agree or decision.reason in {'artist_evidence', 'ambiguous_credits', 'missing_artist', 'metadata_conflict'}:
                 # Only plausible title evidence can hold unrelated sources.

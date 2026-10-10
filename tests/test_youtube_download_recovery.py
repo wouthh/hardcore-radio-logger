@@ -292,3 +292,64 @@ def test_crash_before_link_rejects_compatible_destination_with_different_inode(s
     assert work(config) == recorded
     with connect(config) as con:
         assert not con.execute('SELECT 1 FROM youtube_assets').fetchone()
+
+
+def test_configured_threshold_is_shared_by_verified_completion_local_tags_and_cached_proof(setup):
+    from hcr_sync.db import upsert_youtube_asset
+    from hcr_sync.youtube_local import local_satisfaction
+    from hcr_sync.youtube_matching import evaluate_candidate
+    from hcr_sync.youtube_queue import source_fingerprint
+    config,audio=setup
+    config.values['HCR_YOUTUBE_MATCH_THRESHOLD']='0.88'
+    source_title='Silver Midnight Signals Drift Transformation'
+    recording_title='Silver Midnight Signals Drift'
+    candidate=replace(CANDIDATE,title=f'Artist - {recording_title}',artist='Artist',
+                      artist_names=('Artist',),track=recording_title)
+    decision=evaluate_candidate('Artist',source_title,candidate,threshold=.88)
+    assert decision.accepted and decision.score==pytest.approx(.89)
+    assert not evaluate_candidate('Artist',source_title,candidate).accepted
+    tagged=audio.parent/'threshold.mp3'
+    subprocess.run(['ffmpeg','-v','error','-i',str(audio),'-c:a','copy','-metadata',f'title={recording_title}',str(tagged)],
+                   check=True,timeout=15)
+    output=prepare_download(config,'job1')/'output.mp3'
+    shutil.copyfile(tagged,output)
+    receipt={'video_id':candidate.video_id,'title':candidate.title,'artist':'Artist',
+             'artist_names':['Artist'],'track':recording_title,'duration':125,'filepath':str(output)}
+    (output.parent/'receipt.jsonl').write_text(json.dumps(receipt)+'\n')
+    with connect(config) as con,transaction(con):
+        source=ensure_track(con,artist='Artist',title=source_title)
+        payload={'candidate':asdict(candidate),'source_artist':'Artist','source_title':source_title,
+                 'fingerprint':source_fingerprint(source)}
+        con.execute('UPDATE youtube_pending_work SET track_id=?,payload_json=?,stage_dir=?,output_path=?',
+                    (source['id'],json.dumps(payload),str(output.parent),str(output)))
+    published=publish_output(config,candidate,work(config),'Artist',source_title)
+    with connect(config) as con,transaction(con):
+        con.execute("UPDATE youtube_pending_work SET state='completed'")
+        upsert_youtube_asset(con,track_id=source['id'],youtube_video_id=candidate.video_id,file_path=str(published),
+                             file_exists=True,status='downloaded',match_confidence=decision.score)
+    cache={}
+    for threshold,expected in (('.88','satisfied'),('.90','ambiguous'),('.95','ambiguous')):
+        config.values['HCR_YOUTUBE_MATCH_THRESHOLD']=threshold
+        with connect(config) as con:
+            assert local_satisfaction(config,con,source,cache=cache)[0]==expected
+        proofs=[value for key,value in cache.items() if key[0]=='completed_credits' and key[-1]==float(threshold)]
+        assert proofs==([('Artist',)] if expected=='satisfied' else [()])
+    conflicting=replace(candidate,title=candidate.title+' (Other Remix)',track=recording_title+' (Other Remix)')
+    assert not evaluate_candidate('Artist',source_title,conflicting,threshold=.50).accepted
+    # The same policy also applies to legacy raw tags without completion proof.
+    with connect(config) as con,transaction(con):
+        payload=json.loads(work(config)['payload_json'])
+        payload.pop('verified_recording')
+        con.execute('UPDATE youtube_pending_work SET payload_json=?',(json.dumps(payload),))
+    for threshold,expected in (('.88','satisfied'),('.90','ambiguous'),('.95','ambiguous')):
+        config.values['HCR_YOUTUBE_MATCH_THRESHOLD']=threshold
+        with connect(config) as con:
+            assert local_satisfaction(config,con,source)[0]==expected
+    # A lower score threshold never permits a contradictory recording version.
+    from mutagen.easyid3 import EasyID3
+    tags=EasyID3(published)
+    tags['title']=[recording_title+' (Other Remix)']
+    tags.save(v2_version=4)
+    config.values['HCR_YOUTUBE_MATCH_THRESHOLD']='0.50'
+    with connect(config) as con:
+        assert local_satisfaction(config,con,source)[0]=='ambiguous'

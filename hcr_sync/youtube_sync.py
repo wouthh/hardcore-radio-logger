@@ -322,6 +322,12 @@ def _initialize_queue(config, con, now, summary, require_youtube_id):
                 save_schedule(con,source_id,now,source_fingerprint=source_fingerprint(track),phase='search_retry',candidate_json=None,candidate_at=None,hold_origin=None)
         elif row['phase']=='held' and row['hold_origin'] in {'local_satisfied','local_ambiguous','local_missing','local_deletion'}:
             save_schedule(con,source_id,now,phase='search_retry',hold_origin=None)
+        elif row['phase']=='first_search' and row['search_attempts']>0:
+            # Older classified failures retained the first-search lane. Keep
+            # their retry dates and evidence; in-flight work retains its slot.
+            decision=json.loads(row['decision_json'] or '{}')
+            if isinstance(decision,dict) and decision.get('outcome')=='failure':
+                save_schedule(con,source_id,now,phase='search_retry')
     summary.review=con.execute("SELECT COUNT(*) FROM youtube_schedule q JOIN tracks t ON t.id=q.track_id WHERE t.status='wanted' AND q.phase='held' AND q.hold_origin!='local_satisfied'").fetchone()[0]
 
 

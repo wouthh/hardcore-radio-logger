@@ -82,6 +82,8 @@ def failed(con, row, lane, failure, now):
     streak = row[streak_field]+1
     seconds = BACKOFF_SECONDS[min(streak-1,len(BACKOFF_SECONDS)-1)]
     fields = {attempt_field:row[attempt_field]+1,streak_field:streak,time_field:stamp(now)}
+    if not downloading:
+        fields['phase'] = 'search_retry'
     state = pause_state(con)
     provider = category in {'restriction','missing_tool','configuration'}
     if category == 'transport':

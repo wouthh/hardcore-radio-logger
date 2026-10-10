@@ -383,6 +383,12 @@ def recover_youtube_pending(config, *, apply=True):
                 with transaction(con):
                     failed(con,row,evidence['lane'],YouTubeFailure('transient','interrupted search has no completed response'),now)
         works=con.execute("SELECT * FROM youtube_pending_work WHERE state NOT IN ('completed','cancelled','held') ORDER BY created_at,work_id").fetchall()
+        pause = pause_active(con, now)
+        if pause and pause.get('operator_required'):
+            summary.pending = len(works)
+            summary.degraded = pause['kind']
+            summary.pause_until = pause.get('until', '')
+            return summary
         for work in works:
             if process_is_alive(work['process_pid'],work['process_start']):
                 summary.pending+=1
@@ -398,9 +404,18 @@ def recover_youtube_pending(config, *, apply=True):
                     raise
                 except YouTubeFailure as exc:
                     with transaction(con):
-                        con.execute("UPDATE youtube_pending_work SET state='held',error_json=?,updated_at=? WHERE work_id=?",(decision_json({'category':exc.category,'reason':exc.detail}),stamp(now),work['work_id']))
-                        _hold(con,{'track_id':work['track_id']},now,exc.category)
+                        if exc.category in {'missing_tool', 'configuration'}:
+                            row = con.execute('SELECT * FROM youtube_schedule WHERE track_id=?', (work['track_id'],)).fetchone()
+                            failed(con, row, 2, exc, now)
+                            con.execute("UPDATE youtube_pending_work SET state='prepared',error_json=?,updated_at=? WHERE work_id=?", (decision_json({'category':exc.category,'reason':exc.detail}), stamp(now), work['work_id']))
+                        else:
+                            con.execute("UPDATE youtube_pending_work SET state='held',error_json=?,updated_at=? WHERE work_id=?",(decision_json({'category':exc.category,'reason':exc.detail}),stamp(now),work['work_id']))
+                            _hold(con,{'track_id':work['track_id']},now,exc.category)
                     summary.pending+=1
+                    if exc.category in {'missing_tool', 'configuration'}:
+                        summary.degraded = exc.category
+                        summary.pause_until = pause_state(con).get('until', '')
+                        break
                 else:
                     summary.downloaded+=int(completed)
                     summary.review+=int(not completed)

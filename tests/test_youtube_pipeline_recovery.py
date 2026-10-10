@@ -108,3 +108,33 @@ def test_real_adapter_failed_search_is_counted_in_degraded_summary(setup):
     assert summary.searched == summary.search_invocations == 1
     assert summary.download_starts == summary.downloaded == 0
     assert summary.degraded and summary.deferred == 1
+
+
+def test_missing_verification_tool_preserves_receipt_for_resume_and_offline_recovery(setup, monkeypatch):
+    from types import SimpleNamespace
+    from test_youtube_download_recovery import stage
+    from hcr_sync.cli import cmd_youtube
+    from hcr_sync.youtube_queue import pause_state
+    import hcr_sync.youtube_download as download
+    config, audio = setup
+    initialize_schedule(config)
+    output, _ = stage(config, audio)
+    original = download.shutil.which
+    monkeypatch.setattr(download.shutil, 'which', lambda name: None if name == 'ffprobe' else original(name))
+    summary = recover_youtube_pending(config)
+    assert summary.degraded == 'missing_tool' and output.is_file()
+    with connect(config) as con:
+        assert con.execute('SELECT state FROM youtube_pending_work').fetchone()[0] == 'prepared'
+        assert con.execute('SELECT phase FROM youtube_schedule').fetchone()[0] == 'download'
+        assert pause_state(con)['operator_required']
+    assert recover_youtube_pending(config).degraded == 'missing_tool'
+    monkeypatch.setattr(download.shutil, 'which', original)
+    checks = []
+    monkeypatch.setattr('hcr_sync.youtube_adapter.local_tool_check', lambda c: checks.append(c))
+    assert cmd_youtube(SimpleNamespace(youtube_command='resume', apply=True), config) == 0
+    assert checks == [config]
+    # Verification uses the existing receipt and audio, never a new provider client.
+    assert recover_youtube_pending(config).downloaded == 1
+    with connect(config) as con:
+        assert con.execute('SELECT state FROM youtube_pending_work').fetchone()[0] == 'completed'
+        assert con.execute('SELECT file_exists FROM youtube_assets').fetchone()[0] == 1

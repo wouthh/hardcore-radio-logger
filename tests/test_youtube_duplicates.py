@@ -152,8 +152,13 @@ def test_youtube_sync_rejects_multi_title_candidate(tmp_path):
         asset = con.execute("SELECT * FROM youtube_assets WHERE status='review'").fetchone()
         event = con.execute("SELECT * FROM events WHERE event_type='ambiguous_youtube_match'").fetchone()
     assert asset is not None
-    assert asset["match_confidence"] == 0.0
+    assert asset["match_confidence"] > .9
     assert event is not None
+    import json
+    with connect(config) as con:
+        evidence = json.loads(con.execute('SELECT decision_json FROM youtube_schedule').fetchone()[0])
+    assert evidence['decision']['reason'] == 'multi_title'
+    assert not evidence['decision']['accepted']
 
 
 def test_youtube_sync_skips_existing_review_asset_without_search(tmp_path):

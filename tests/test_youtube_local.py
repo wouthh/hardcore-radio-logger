@@ -190,3 +190,22 @@ def test_deleted_established_recording_retains_ownership_hold(tmp_path):
         other=ensure_track(con,artist='Other Artist',title='Another Song')
         con.execute("UPDATE youtube_assets SET status='deleted',file_exists=0 WHERE track_id=?",(source_id,))
         assert _ownership_conflict(con,other['id'],candidate)['track_id']==source_id
+
+
+def test_cross_source_filter_avoids_unrelated_full_comparisons_without_skipping_versions(tmp_path, monkeypatch):
+    config, source_id, _, path = seed(tmp_path,
+        'Synthetic Artist - Unrelated Recording [local123456].mp3', foreign=True)
+    original = youtube_local.compare_recordings
+    calls = []
+    def counted(*args, **kwargs):
+        calls.append(args)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(youtube_local, 'compare_recordings', counted)
+    assert satisfaction(config, source_id)[0] == 'none'
+    assert calls == []
+    renamed = path.with_name('Synthetic Artist - Night Signal (Hard Refix) [local123456].mp3')
+    path.rename(renamed)
+    with connect(config) as con, transaction(con):
+        con.execute('UPDATE youtube_assets SET file_path=?', (str(renamed),))
+    assert satisfaction(config, source_id)[0] == 'none'
+    assert calls and not original(*calls[-1]).accepted

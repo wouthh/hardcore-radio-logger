@@ -99,7 +99,7 @@ def _youtube_candidate_used_by_other_track(
         SELECT *
           FROM youtube_assets
          WHERE track_id != ?
-           AND status != 'deleted'
+           AND (file_exists=1 OR NULLIF(file_path,'') IS NOT NULL OR downloaded_at IS NOT NULL)
            AND ({' OR '.join(conditions)})
          LIMIT 1
         """,
@@ -191,15 +191,17 @@ def _mark_youtube_review(con, track_id: int, *, reason: str, score: float | None
 
 
 def _mark_youtube_error(con, track_id: int, candidate: YouTubeCandidate, *, score: float, error: Exception) -> None:
-    upsert_youtube_asset(
-        con,
-        track_id=track_id,
-        youtube_video_id=candidate.video_id,
-        youtube_url=candidate.url,
-        match_confidence=score,
-        file_exists=False,
-        status="error",
-    )
+    established=con.execute("SELECT 1 FROM youtube_assets WHERE track_id=? AND youtube_video_id=? AND (file_exists=1 OR NULLIF(file_path,'') IS NOT NULL OR downloaded_at IS NOT NULL)",(track_id,candidate.video_id)).fetchone()
+    if not established:
+        upsert_youtube_asset(
+            con,
+            track_id=track_id,
+            youtube_video_id=candidate.video_id,
+            youtube_url=candidate.url,
+            match_confidence=score,
+            file_exists=False,
+            status="error",
+        )
     add_event(
         con,
         track_id,
@@ -264,6 +266,9 @@ def _ownership_conflict(con, source_id, candidate, work_id=''):
     asset = _youtube_candidate_used_by_other_track(con,track_id=source_id,youtube_video_id=candidate.video_id)
     if asset:
         return asset
+    established=con.execute("SELECT * FROM youtube_assets WHERE track_id=? AND youtube_video_id=? AND (file_exists=1 OR NULLIF(file_path,'') IS NOT NULL OR downloaded_at IS NOT NULL) LIMIT 1",(source_id,candidate.video_id)).fetchone()
+    if established:
+        return established
     return con.execute("SELECT track_id,work_id FROM youtube_pending_work WHERE video_id=? AND work_id!=? AND state NOT IN ('completed','cancelled')",(candidate.video_id,work_id)).fetchone()
 
 

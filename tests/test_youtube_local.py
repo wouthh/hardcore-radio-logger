@@ -158,3 +158,35 @@ def test_one_removed_copy_cannot_exclude_source_still_confirmed_locally(tmp_path
     with connect(config) as con:
         assert con.execute('SELECT status FROM tracks WHERE id=?',(source_id,)).fetchone()[0]=='wanted'
     assert result.excluded_local==0 and second.exists()
+
+
+def test_failed_candidate_evidence_never_replaces_established_asset(tmp_path):
+    config,source_id,_,path=seed(tmp_path,'Synthetic Artist - Night Signal (Alpha Remix) [local123456].mp3',source_title='Night Signal (Beta Remix)')
+    from hcr_sync.youtube_sync import YouTubeCandidate,_mark_youtube_error,_ownership_conflict
+    candidate=YouTubeCandidate('Synthetic Artist - Night Signal (Beta Remix)','https://www.youtube.com/watch?v=local123456','local123456','Channel',180)
+    with connect(config) as con,transaction(con):
+        original=dict(con.execute('SELECT * FROM youtube_assets').fetchone())
+        assert _ownership_conflict(con,source_id,candidate)['id']==original['id']
+        _mark_youtube_error(con,source_id,candidate,score=.90,error=RuntimeError('synthetic retry failure'))
+        assert dict(con.execute('SELECT * FROM youtube_assets').fetchone())==original
+    assert path.exists()
+
+
+def test_unverified_error_is_not_exclusive_recording_ownership(tmp_path):
+    config,source_id,_,path=seed(tmp_path,'Synthetic Artist - Night Signal [local123456].mp3')
+    from hcr_sync.youtube_sync import YouTubeCandidate,_ownership_conflict
+    candidate=YouTubeCandidate('Other Artist - Other Song','https://www.youtube.com/watch?v=error123456','error123456','Channel',180)
+    with connect(config) as con,transaction(con):
+        owner=ensure_track(con,artist='Prior Artist',title='Prior Song')
+        upsert_youtube_asset(con,track_id=owner['id'],youtube_video_id=candidate.video_id,file_exists=False,status='error',match_confidence=.9)
+        assert _ownership_conflict(con,source_id,candidate) is None
+
+
+def test_deleted_established_recording_retains_ownership_hold(tmp_path):
+    config,source_id,_,path=seed(tmp_path,'Synthetic Artist - Night Signal [local123456].mp3')
+    from hcr_sync.youtube_sync import YouTubeCandidate,_ownership_conflict
+    candidate=YouTubeCandidate('Synthetic Artist - Night Signal','https://www.youtube.com/watch?v=local123456','local123456','Channel',180)
+    with connect(config) as con,transaction(con):
+        other=ensure_track(con,artist='Other Artist',title='Another Song')
+        con.execute("UPDATE youtube_assets SET status='deleted',file_exists=0 WHERE track_id=?",(source_id,))
+        assert _ownership_conflict(con,other['id'],candidate)['track_id']==source_id

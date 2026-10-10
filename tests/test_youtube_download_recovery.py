@@ -332,8 +332,9 @@ def test_configured_threshold_is_shared_by_verified_completion_local_tags_and_ca
         config.values['HCR_YOUTUBE_MATCH_THRESHOLD']=threshold
         with connect(config) as con:
             assert local_satisfaction(config,con,source,cache=cache)[0]==expected
-        proofs=[value for key,value in cache.items() if key[0]=='completed_credits' and key[-1]==float(threshold)]
-        assert proofs==([('Artist',)] if expected=='satisfied' else [()])
+        proofs=[value for key,value in cache.items() if key[0]=='completed_recording' and key[-1]==float(threshold)]
+        assert len(proofs)==1
+        assert (tuple(proofs[0].artist_names) if proofs[0] else None)==(('Artist',) if expected=='satisfied' else None)
     conflicting=replace(candidate,title=candidate.title+' (Other Remix)',track=recording_title+' (Other Remix)')
     assert not evaluate_candidate('Artist',source_title,conflicting,threshold=.50).accepted
     # The same policy also applies to legacy raw tags without completion proof.
@@ -412,3 +413,145 @@ def test_reconcile_absence_requires_the_threshold_that_verified_local_audio(setu
             assert asset['file_exists']==0 and asset['status']=='deleted'
         assert json.loads(get_state(con,evidence_key))==evidence
     assert present.is_file()
+
+
+@pytest.mark.parametrize('title', [
+    'Étoile Astral Lumière Cosmos Horizon Crépuscule Mémoire Sillage Océan Vibrations '
+    'Galaxie Énergie Aurore Constellation Fréquence Harmonie Nuages Résonance Solstice '
+    'Métamorphose Infini / Beyond',
+    'Infinity / Beyond',
+])
+def test_published_sanitized_or_truncated_filename_uses_attributed_tags_without_redundant_search(setup,title):
+    from hcr_sync.db import upsert_youtube_asset
+    from hcr_sync.youtube_local import local_satisfaction
+    from hcr_sync.youtube_queue import source_fingerprint
+    from hcr_sync.youtube_sync import sync_youtube
+    from mutagen.easyid3 import EasyID3
+    config,audio=setup
+    names=('North/Tone','Signal MC','Orbit')
+    artist='North/Tone & Orbit & Signal MC'
+    tagged_artist=', '.join(names)
+    candidate=replace(CANDIDATE,title=f'{tagged_artist} - {title}',artist=tagged_artist,
+                      artist_names=names,track=title)
+    tagged=audio.parent/'publication-tags.mp3'
+    subprocess.run(['ffmpeg','-v','error','-i',str(audio),'-c:a','copy','-metadata',f'artist={tagged_artist}',
+                    '-metadata',f'title={title}',str(tagged)],check=True,timeout=15)
+    output=prepare_download(config,'job1')/'output.mp3'
+    shutil.copyfile(tagged,output)
+    receipt={'video_id':candidate.video_id,'title':candidate.title,'artist':tagged_artist,
+             'artist_names':list(names),'track':title,'duration':125,'filepath':str(output)}
+    (output.parent/'receipt.jsonl').write_text(json.dumps(receipt)+'\n')
+    with connect(config) as con,transaction(con):
+        con.execute("UPDATE tracks SET status='excluded'")
+        owner=ensure_track(con,artist=artist,title=title)
+        foreign=ensure_track(con,artist=tagged_artist,title=title)
+        remix=ensure_track(con,artist=tagged_artist,title=title+' (Other Remix)')
+        assert foreign['id']!=owner['id']
+        payload={'candidate':asdict(candidate),'source_artist':artist,'source_title':title,
+                 'fingerprint':source_fingerprint(owner)}
+        con.execute('UPDATE youtube_pending_work SET track_id=?,payload_json=?,stage_dir=?,output_path=?',
+                    (owner['id'],json.dumps(payload),str(output.parent),str(output)))
+    published=publish_output(config,candidate,work(config),artist,title)
+    assert '/' not in published.name
+    assert published.name!=f'{artist} - {title} [{candidate.video_id}].mp3'
+    if title.startswith('Étoile'):
+        assert len(published.stem.removesuffix(f' [{candidate.video_id}]').encode('utf-8'))>=178
+        assert 'Beyond' not in published.name
+    with connect(config) as con,transaction(con):
+        con.execute("UPDATE youtube_pending_work SET state='completed'")
+        upsert_youtube_asset(con,track_id=owner['id'],youtube_video_id=candidate.video_id,file_path=str(published),
+                             file_exists=True,status='downloaded',match_confidence=1)
+        asset=dict(con.execute('SELECT * FROM youtube_assets').fetchone())
+        assert local_satisfaction(config,con,owner,persist=True)[0]=='satisfied'
+        assert local_satisfaction(config,con,foreign)[0]=='satisfied'
+        assert local_satisfaction(config,con,remix)[0]=='none'
+        con.execute("UPDATE tracks SET status='excluded' WHERE id=?",(remix['id'],))
+    class NoProvider:
+        def search(self,*args): pytest.fail('attributed published tags must avoid redundant searches')
+        def download(self,*args): pytest.fail('attributed published tags must avoid redundant downloads')
+    for _ in range(2):
+        result=sync_youtube(config,apply=True,client=NoProvider())
+        assert result.already_local==2 and result.searched==result.download_attempts==0
+    with connect(config) as con:
+        assert dict(con.execute('SELECT * FROM youtube_assets').fetchone())==asset
+    # Current contradictory or missing tags cannot borrow completed credits.
+    tags=EasyID3(published)
+    for field,value in [('title',title+' (Other Remix)'),('artist','Wrong Artist, Signal MC, Orbit'),('artist',None)]:
+        tags['artist']=[tagged_artist]
+        tags['title']=[title]
+        if value is None:
+            del tags[field]
+        else:
+            tags[field]=[value]
+        tags.save(v2_version=4)
+        with connect(config) as con:
+            assert local_satisfaction(config,con,owner)[0]=='ambiguous'
+            assert local_satisfaction(config,con,foreign)[0]!='satisfied'
+    tags['artist']=[tagged_artist]
+    tags['title']=[title]
+    tags.save(v2_version=4)
+    # Exact work owner, path, video and current source fingerprint stay required.
+    original=work(config)
+    for column,value in [('track_id',foreign['id']),('output_path',str(published)+'wrong'),
+                         ('video_id','wrongvideo12'),('payload_json',json.dumps(dict(json.loads(original['payload_json']),fingerprint='stale')))]:
+        with connect(config) as con,transaction(con):
+            con.execute(f'UPDATE youtube_pending_work SET {column}=?',(value,))
+            assert local_satisfaction(config,con,owner)[0]!='satisfied'
+            assert local_satisfaction(config,con,foreign)[0]!='satisfied'
+            con.execute(f'UPDATE youtube_pending_work SET {column}=?',(original[column],))
+
+
+@pytest.mark.parametrize('artist',['Artist/Collective','Sound, Vision'])
+def test_flat_verified_completion_recognizes_long_publication_without_inventing_credits(setup,artist):
+    from hcr_sync.db import upsert_youtube_asset
+    from hcr_sync.youtube_local import local_satisfaction
+    from hcr_sync.youtube_queue import source_fingerprint
+    from hcr_sync.youtube_sync import sync_youtube
+    from mutagen.easyid3 import EasyID3
+    config,audio=setup
+    title='Étoile Astral Lumière Cosmos Horizon Crépuscule Mémoire Sillage Océan Vibrations Galaxie Énergie Aurore Constellation Fréquence Harmonie Nuages Résonance Solstice Métamorphose Infini / Beyond'
+    candidate=replace(CANDIDATE,title=f'{artist} - {title}',artist=artist,artist_names=(),track=title)
+    tagged=audio.parent/'flat-tags.mp3'
+    subprocess.run(['ffmpeg','-v','error','-i',str(audio),'-c:a','copy','-metadata',f'artist={artist}',
+                    '-metadata',f'title={title}',str(tagged)],check=True,timeout=15)
+    output=prepare_download(config,'job1')/'output.mp3'
+    shutil.copyfile(tagged,output)
+    receipt={'video_id':candidate.video_id,'title':candidate.title,'artist':artist,
+             'artist_names':None,'track':title,'duration':125,'filepath':str(output)}
+    (output.parent/'receipt.jsonl').write_text(json.dumps(receipt)+'\n')
+    with connect(config) as con,transaction(con):
+        con.execute("UPDATE tracks SET status='excluded'")
+        owner=ensure_track(con,artist=artist,title=title)
+        payload={'candidate':asdict(candidate),'source_artist':artist,'source_title':title,
+                 'fingerprint':source_fingerprint(owner)}
+        con.execute('UPDATE youtube_pending_work SET track_id=?,payload_json=?,stage_dir=?,output_path=?',
+                    (owner['id'],json.dumps(payload),str(output.parent),str(output)))
+    published=publish_output(config,candidate,work(config),artist,title)
+    assert 'Beyond' not in published.name
+    assert json.loads(work(config)['payload_json'])['verified_recording']['artist_names']==[]
+    with connect(config) as con,transaction(con):
+        con.execute("UPDATE youtube_pending_work SET state='completed'")
+        upsert_youtube_asset(con,track_id=owner['id'],youtube_video_id=candidate.video_id,file_path=str(published),
+                             file_exists=True,status='downloaded',match_confidence=1)
+        cache={}
+        assert local_satisfaction(config,con,owner,cache=cache,persist=True)[0]=='satisfied'
+        proof=next(value for key,value in cache.items() if key[0]=='completed_recording')
+        assert not proof.artist_names  # Flat compound names do not become a structured list.
+    class NoProvider:
+        def search(self,*args): pytest.fail('flat verified publication must not repeat search')
+        def download(self,*args): pytest.fail('flat verified publication must not repeat download')
+    for _ in range(2):
+        result=sync_youtube(config,apply=True,client=NoProvider())
+        assert result.already_local==1 and result.searched==result.download_attempts==0
+    tags=EasyID3(published)
+    conflicting_artist=artist.replace(',', ' &') if ',' in artist else 'Other Artist'
+    for field,value in [('artist',conflicting_artist),('title',title+' (Other Remix)'),('artist',None),('title',None)]:
+        tags['artist']=[artist]
+        tags['title']=[title]
+        if value is None:
+            del tags[field]
+        else:
+            tags[field]=[value]
+        tags.save(v2_version=4)
+        with connect(config) as con:
+            assert local_satisfaction(config,con,owner)[0]=='ambiguous'

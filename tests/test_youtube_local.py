@@ -290,7 +290,12 @@ def test_cross_source_filter_avoids_unrelated_full_comparisons_without_skipping_
         calls.append(args)
         return original(*args, **kwargs)
     monkeypatch.setattr(youtube_local, 'compare_recordings', counted)
-    assert satisfaction(config, source_id)[0] == 'none'
+    with connect(config) as con:
+        source=con.execute('SELECT * FROM tracks WHERE id=?',(source_id,)).fetchone()
+        queries=[]
+        con.set_trace_callback(queries.append)
+        assert local_satisfaction(config,con,source)[0]=='none'
+    assert not any('SELECT * FROM tracks WHERE id=' in query or 'FROM youtube_pending_work' in query for query in queries)
     assert calls == []
     renamed = path.with_name('Synthetic Artist - Night Signal (Hard Refix) [local123456].mp3')
     path.rename(renamed)

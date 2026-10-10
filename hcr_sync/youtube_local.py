@@ -10,11 +10,11 @@ from .youtube_adapter import YouTubeCandidate
 from .youtube_queue import source_fingerprint
 
 
-def _completed_credits(con, asset, item, owner, threshold):
+def _completed_recording(con, asset, item, owner, threshold):
     if not asset['youtube_video_id'] or not item or item.youtube_video_id != asset['youtube_video_id']:
-        return ()
+        return None
     if owner is None:
-        return ()
+        return None
     for work in con.execute("SELECT payload_json FROM youtube_pending_work WHERE state='completed' AND track_id=? AND video_id=? AND output_path=? ORDER BY updated_at DESC,work_id",
                             (owner['id'],asset['youtube_video_id'],asset['file_path'])):
         try:
@@ -27,14 +27,14 @@ def _completed_credits(con, asset, item, owner, threshold):
         if not isinstance(candidate,dict) or candidate.get('video_id') != asset['youtube_video_id']:
             continue
         names=candidate.get('artist_names')
-        if isinstance(names,(list,tuple)) and names and all(isinstance(name,str) and name.strip() for name in names):
+        if isinstance(names,(list,tuple)) and all(isinstance(name,str) and name.strip() for name in names):
             try:
                 recording=YouTubeCandidate(**candidate)
             except TypeError:
                 continue
             if evaluate_candidate(owner['display_artist'],owner['display_title'],recording,threshold=threshold).accepted:
-                return tuple(names)
-    return ()
+                return recording
+    return None
 
 
 def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=None, persist=False):
@@ -65,9 +65,32 @@ def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=No
             cache[key] = (inspect_audio_file(path),_tag_values(path))
         item,tags = cache[key]
         own = row['track_id'] == track['id']
-        token_key = ('title_tokens', key)
+        if not own:
+            # Cheap cached title checks precede owner/work queries. Tags can
+            # keep a truncated publication plausible, but cannot authorize it.
+            for projection,evidence_title in ((False,item.title if item else ''),(True,tags[1])):
+                token_key = ('title_tokens', key, projection)
+                if token_key not in cache:
+                    cache[token_key] = duplicate_title_tokens(_title(evidence_title).base)
+            if not any(source_tokens and tokens and
+                       len(source_tokens & tokens) / len(source_tokens) >= .75 and
+                       len(source_tokens & tokens) / len(tokens) >= .75
+                       for tokens in (cache[('title_tokens',key,False)],cache[('title_tokens',key,True)])):
+                continue
+        owner=con.execute('SELECT * FROM tracks WHERE id=?',(row['track_id'],)).fetchone()
+        recording_key = ('completed_recording', row['id'], row['track_id'], row['youtube_video_id'], key,
+                      source_fingerprint(owner) if owner else None, threshold)
+        if recording_key not in cache:
+            cache[recording_key] = _completed_recording(con,row,item,owner,threshold)
+        recording = cache[recording_key]
+        credits = recording.artist_names if recording else ()
+        # Exact completed output attribution recognizes publication names even
+        # when sanitizing or truncating them loses the original source text.
+        source_projection = recording is not None
+        token_key = ('title_tokens', key, source_projection)
         if token_key not in cache:
-            cache[token_key] = duplicate_title_tokens(_title(item.title).base) if item else set()
+            evidence_title = tags[1] if source_projection else (item.title if item else '')
+            cache[token_key] = duplicate_title_tokens(_title(evidence_title).base)
         candidate_tokens = cache[token_key]
         plausible = bool(source_tokens and candidate_tokens and
                          len(source_tokens & candidate_tokens) / len(source_tokens) >= .75 and
@@ -75,28 +98,19 @@ def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=No
         # Full version/credit checks are needed only for plausible cross-source files.
         if not own and not plausible:
             continue
-        owner=con.execute('SELECT * FROM tracks WHERE id=?',(row['track_id'],)).fetchone()
-        credit_key = ('completed_credits', row['id'], row['track_id'], row['youtube_video_id'], key,
-                      source_fingerprint(owner) if owner else None, threshold)
-        if credit_key not in cache:
-            cache[credit_key] = _completed_credits(con,row,item,owner,threshold)
-        credits = cache[credit_key]
         status = 'different'
         artist,title = (item.artist,item.title) if item else ('','')
-        if item and item.artist and item.title:
-            # Publication names are a projection of the source, which may have
-            # fewer credits than the actual accepted recording. Exact owner
-            # filenames can defer to present tags corroborated by verification.
-            source_projection = bool(credits and owner and item.artist==owner['display_artist'] and
-                                     item.title==owner['display_title'])
-            projected = bool(source_projection and tags[0] and tags[1])
+        projected = bool(source_projection and tags[0] and tags[1])
+        if source_projection and not projected:
+            status = 'ambiguous'
+        elif projected or (item and item.artist and item.title):
             if projected:
                 artist,title = tags
             owner_tags_agree = not projected or compare_recordings(owner['display_artist'],owner['display_title'],
                                                                    *tags,artist_names=credits,threshold=threshold).accepted
             decision = compare_recordings(track['display_artist'], track['display_title'], artist, title, artist_names=credits,threshold=threshold)
             if decision.accepted:
-                status = 'ambiguous' if (source_projection and not projected) or not owner_tags_agree else 'satisfied'
+                status = 'ambiguous' if not owner_tags_agree else 'satisfied'
                 if tags[0] and tags[1] and not compare_recordings(track['display_artist'],track['display_title'],*tags,artist_names=credits,threshold=threshold).accepted:
                     status = 'ambiguous'
             elif (projected and own) or not owner_tags_agree or decision.reason in {'artist_evidence', 'ambiguous_credits', 'missing_artist', 'metadata_conflict'}:

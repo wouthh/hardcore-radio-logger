@@ -30,14 +30,23 @@ def config(tmp_path, executable):
 @pytest.mark.parametrize('entries', [[], [{'id': 'abcdefghijk', 'title': 'Artist - Song', 'duration': 125}]])
 def test_search_completed_results_and_explicit_boundary_flags(tmp_path, entries):
     logfile = tmp_path / 'args.json'
-    executable = tool(tmp_path, f'import json,sys\nopen({str(logfile)!r},"w").write(json.dumps(sys.argv))\nprint({json.dumps({"_type": "playlist", "entries": entries})!r})\n')
+    executable = tool(tmp_path, f'import json,sys\nopen({str(logfile)!r},"w").write(json.dumps(sys.argv))\nprint({json.dumps({"_type": "playlist", "entries_present":True, "playlist_count":len(entries), "entries": entries})!r})\n')
     results = YtDlpClient(config(tmp_path, executable)).search('Artist', 'Song')
     assert len(results) == len(entries)
     args = json.loads(logfile.read_text())
-    assert '--ignore-config' in args and '--dump-single-json' in args
+    assert '--ignore-config' in args and '--print' in args and '--dump-single-json' not in args
     for flag in ('--retries', '--extractor-retries', '--fragment-retries', '--file-access-retries'):
         assert args[args.index(flag) + 1] == '0'
     assert args[-1] == 'ytsearch10:Artist - Song'
+
+
+@pytest.mark.parametrize('count,entries', [(1, []), (0, [{}]), (False, []), (None, [])])
+def test_projected_entries_must_match_completed_playlist_count(tmp_path, count, entries):
+    value=json.dumps({'_type':'playlist','entries_present':True,'playlist_count':count,'entries':entries})
+    executable=tool(tmp_path,f'print({value!r})\n')
+    with pytest.raises(YouTubeFailure) as error:
+        YtDlpClient(config(tmp_path,executable)).search('Artist','Song')
+    assert error.value.category=='invalid_response'
 
 
 @pytest.mark.parametrize('response', ['broken', '{}', '{"entries":[]}',
@@ -217,3 +226,80 @@ print(formatter.evaluate_outtmpl(sys.argv[1].removeprefix('after_move:'),info))
     receipt=json.loads(value)
     assert receipt['artist'] is receipt['artist_names'] is receipt['track'] is None
     assert receipt['video_id']=='abcdefghijk' and receipt['title']=='Artist - Song'
+
+
+@pytest.mark.parametrize('mode', ['complete', 'empty', 'failed', 'null_entry', 'all_null', 'missing_entries'])
+def test_installed_cli_full_extraction_prints_only_completed_matching_fields(tmp_path, mode):
+    # Run the installed CLI entry point with a local extractor. No external
+    # extractor or media access is registered; the adapter's arguments are real.
+    import shlex
+    import shutil
+    from pathlib import Path
+    executable = shutil.which('yt-dlp')
+    if not executable:
+        pytest.skip('installed yt-dlp is required for its offline CLI fixture')
+    interpreter = shlex.split(Path(executable).read_text().splitlines()[0][2:])
+    fixture = tmp_path / 'offline-ytdlp'
+    evidence = tmp_path / 'extraction.json'
+    fixture.write_text('#!' + ' '.join(interpreter) + '\n' + f'''
+import json
+from pathlib import Path
+import yt_dlp
+from yt_dlp.extractor.common import InfoExtractor
+from yt_dlp.utils import ExtractorError
+mode={mode!r}
+seen=[]
+class FixtureIE(InfoExtractor):
+    _VALID_URL=r'(?P<id>ytsearch10:.+|fixture:fixture[0-9]+)'
+    def _real_extract(self,url):
+        if url.startswith('ytsearch10:'):
+            entries=[] if mode=='empty' else [self.url_result('fixture:fixture%04d'%i,ie='Fixture') for i in range(10)]
+            if mode=='null_entry': entries[0]=None
+            if mode=='all_null': entries=[None]*10
+            if mode=='missing_entries': return {{'_type':'playlist','id':'fixturelist','playlist_count':0}}
+            return self.playlist_result(entries,'fixturelist')
+        index=int(url[-4:])
+        if mode=='failed' and index==5:
+            raise ExtractorError('synthetic transport failure',expected=True)
+        seen.append(index)
+        info={{'id':url.split(':')[1],'title':'Artist - Song','duration':125,
+            'artists':['Artist'],'artist':'Artist','track':'Song','channel':'Fixture Channel',
+            'uploader':'Fixture Uploader','description':'full DJ set guard marker',
+            'is_live':False,'was_live':False,'live_status':'not_live',
+            'formats':[{{'url':'https://fixture.invalid/audio.mp3','ext':'mp3','format_id':'1',
+                'acodec':'mp3','vcodec':'none','format_note':'x'*300000}}],
+            'thumbnails':[{{'url':'https://fixture.invalid/image.jpg'}}],
+            'subtitles':{{'en':[{{'url':'https://fixture.invalid/captions.vtt'}}]}}}}
+        Path({str(evidence)!r}).write_text(json.dumps({{'seen':seen,'one_entry_bytes':len(json.dumps(info))}}))
+        return info
+yt_dlp.YoutubeDL.add_default_info_extractors=lambda self:self.add_info_extractor(FixtureIE())
+yt_dlp.main()
+''')
+    fixture.chmod(0o700)
+    cfg = config(tmp_path, fixture)
+    if mode in {'failed', 'null_entry', 'all_null', 'missing_entries'}:
+        with pytest.raises(YouTubeFailure):
+            YtDlpClient(cfg).search('Artist', 'Song')
+        if mode == 'failed':
+            assert json.loads(evidence.read_text())['seen'] == [i for i in range(10) if i != 5]
+            from hcr_sync.youtube_adapter import SEARCH_TEMPLATE
+            value=subprocess.run([*YtDlpClient(cfg)._base_command(),'--print',SEARCH_TEMPLATE,
+                '--skip-download','--no-playlist','ytsearch10:Artist - Song'],capture_output=True,text=True,timeout=10)
+            assert value.returncode != 0
+            assert len(json.loads(value.stdout)['entries']) == 9
+        return
+    candidates = YtDlpClient(cfg).search('Artist', 'Song')
+    if mode == 'empty':
+        assert candidates == [] and not evidence.exists()
+        return
+    assert len(candidates) == 10
+    resolved = json.loads(evidence.read_text())
+    assert resolved['seen'] == list(range(10))
+    assert resolved['one_entry_bytes'] * 10 > 2 * 1024 * 1024
+    for candidate in candidates:
+        assert candidate.title == 'Artist - Song' and candidate.duration == 125
+        assert candidate.artist_names == ('Artist',) and candidate.artist == 'Artist' and candidate.track == 'Song'
+        assert candidate.channel == 'Fixture Channel' and candidate.description == 'full DJ set guard marker'
+        assert candidate.is_live is False
+    from hcr_sync.youtube_matching import evaluate_candidate
+    assert evaluate_candidate('Artist','Song',candidates[0]).reason == 'bad_video'

@@ -80,17 +80,80 @@ def test_no_match_seven_then_fourteen_days_and_restart(tmp_path):
     assert saved['next_eligible_at']==stamp(NOW+timedelta(days=21))
 
 
-def test_transient_search_is_fifteen_minutes_without_review(tmp_path):
+@pytest.mark.parametrize('category', ['invalid_response', 'transient', 'transport'])
+def test_transient_search_is_fifteen_minutes_without_review(tmp_path, category):
     from hcr_sync.youtube_adapter import YouTubeFailure
     config=fixture(tmp_path)
     source=track(config)
-    run(config,Fake(YouTubeFailure('transient','synthetic')))
+    run(config,Fake(YouTubeFailure(category,'synthetic')))
     saved=row(config,source)
     assert saved['search_attempts']==saved['search_failures']==1
     assert saved['unsuccessful_matches']==0
     assert saved['next_eligible_at']==stamp(NOW+timedelta(minutes=15))
+    assert saved['phase']=='search_retry'
+    fresh=track(config,'New Arrival')
+    schedule(config,fresh,'first_search')
     with connect(config) as con:
         assert not con.execute("SELECT 1 FROM youtube_assets WHERE status='review'").fetchone()
+        lane,selected=choose(con,NOW+timedelta(minutes=15))
+        assert lane==1 and selected['track_id']==source
+        assert con.execute("SELECT value FROM sync_state WHERE key='youtube_queue_cursor'").fetchone()[0]=='1'
+
+
+@pytest.mark.parametrize('category,hours', [('restriction',12),('configuration',1),('missing_tool',1)])
+def test_completed_provider_failure_enters_retry_lane_without_changing_pause(tmp_path, category, hours):
+    from hcr_sync.youtube_adapter import YouTubeFailure
+    config=fixture(tmp_path)
+    source=track(config)
+    run(config,Fake(YouTubeFailure(category,'synthetic')))
+    saved=row(config,source)
+    assert saved['phase']=='search_retry' and saved['search_attempts']==1
+    assert saved['search_failures']==saved['unsuccessful_matches']==0
+    assert saved['next_eligible_at']==stamp(NOW+timedelta(hours=hours))
+    with connect(config) as con:
+        pause=json.loads(con.execute("SELECT value FROM sync_state WHERE key='youtube_provider_pause'").fetchone()[0])
+        assert pause['until']==saved['next_eligible_at']
+        assert pause['operator_required'] is (category!='restriction')
+        assert choose(con,NOW+timedelta(hours=hours))[0]==1
+
+
+def test_existing_classified_failure_moves_lane_and_preserves_due_counters_evidence(tmp_path):
+    config=fixture(tmp_path)
+    source=track(config)
+    evidence=json.dumps({'outcome':'failure','category':'invalid_response','reason':'synthetic','next_eligible_at':stamp(NOW+timedelta(hours=1))})
+    schedule(config,source,'first_search',due=NOW+timedelta(hours=1),
+             search_attempts=2,search_failures=2,unsuccessful_matches=0,last_search_at=stamp(NOW),decision_json=evidence)
+    with connect(config) as con, transaction(con):
+        set_state(con,'youtube_queue_cursor','2')
+    before=row(config,source)
+    client=Fake()
+    run(config,client,NOW+timedelta(minutes=30))
+    after=row(config,source)
+    assert not client.searches
+    assert after['phase']=='search_retry'
+    assert {k:v for k,v in after.items() if k not in {'phase','updated_at'}}=={k:v for k,v in before.items() if k not in {'phase','updated_at'}}
+    with connect(config) as con:
+        assert con.execute("SELECT value FROM sync_state WHERE key='youtube_queue_cursor'").fetchone()[0]=='2'
+
+
+@pytest.mark.parametrize('outcome', ['search_inflight','unknown',None])
+def test_existing_ambiguous_or_inflight_attempt_keeps_original_lane_until_classified(tmp_path, outcome):
+    from hcr_sync.youtube_sync import _initialize_queue, recover_youtube_pending, YouTubeSummary
+    config=fixture(tmp_path)
+    source=track(config)
+    evidence=json.dumps({'outcome':outcome,'lane':0})
+    schedule(config,source,'first_search',due=NOW+timedelta(hours=1),search_attempts=1,decision_json=evidence)
+    before=row(config,source)
+    with connect(config) as con, transaction(con):
+        _initialize_queue(config,con,NOW,YouTubeSummary(),False)
+    assert row(config,source)==before
+    if outcome=='search_inflight':
+        recover_youtube_pending(config)
+        saved=row(config,source)
+        assert saved['phase']=='search_retry' and saved['search_attempts']==2
+        assert saved['search_failures']==1 and saved['unsuccessful_matches']==0
+        with connect(config) as con:
+            assert con.execute("SELECT value FROM sync_state WHERE key='youtube_queue_cursor'").fetchone()[0]=='1'
 
 
 def test_fair_lane_cycles_survive_restarts_and_empty_lanes(tmp_path):
@@ -210,6 +273,7 @@ def test_download_backoff_reuses_candidate_without_search(tmp_path):
     assert len(client.downloads)==2
     assert summary.candidate_reused==1
     second=row(config,source)
+    assert second['phase']=='download'
     assert second['next_eligible_at']==stamp(NOW+timedelta(minutes=75))
     assert second['download_attempts']==2
 

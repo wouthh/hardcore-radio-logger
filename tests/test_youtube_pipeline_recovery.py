@@ -85,8 +85,8 @@ def test_real_adapter_normalized_search_reaches_verified_download(setup):
     from pathlib import Path
     path=Path(executable)
     original=path.read_text().split('\n',1)[1]
-    search=json.dumps({'_type':'playlist','entries':[{'id':CANDIDATE.video_id,'title':CANDIDATE.title,'duration':125}]})
-    path.write_text('#!/usr/bin/python3\nimport sys\nif "--dump-single-json" in sys.argv:\n print('+repr(search)+')\n sys.exit(0)\n'+original)
+    search=json.dumps({'_type':'playlist','entries_present':True,'playlist_count':1,'entries':[{'id':CANDIDATE.video_id,'title':CANDIDATE.title,'duration':125}]})
+    path.write_text('#!/usr/bin/python3\nimport sys\nif any(arg.startswith("playlist:") for arg in sys.argv):\n print('+repr(search)+')\n sys.exit(0)\n'+original)
     summary=sync_youtube(config,apply=True,client=YtDlpClient(config))
     assert summary.searched==summary.download_starts==summary.downloaded==1
     with connect(config) as con:

@@ -22,6 +22,7 @@ TERMINATE_SECONDS = 5
 OUTPUT_LIMIT = 2 * 1024 * 1024
 VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
 RECEIPT_TEMPLATE = 'after_move:{"video_id":%(id)j,"title":%(title)j,"artist":%(artist|null)j,"artist_names":%(artists|null)j,"track":%(track|null)j,"duration":%(duration)j,"filepath":%(filepath)j}'
+SEARCH_TEMPLATE = 'playlist:{"_type":%(_type)j,"entries_present":%(entries&true|false)s,"playlist_count":%(playlist_count)j,"entries":%(entries.:.{id,title,duration,artists,artist,track,channel,uploader,description,is_live,was_live,live_status}|[])j}'
 
 
 @dataclass(frozen=True)
@@ -171,7 +172,7 @@ class YtDlpClient:
 
     def search(self, artist: str, title: str) -> list[YouTubeCandidate]:
         query = f"{artist} - {title}" if artist else title
-        stdout = run_process([*self._base_command(), "--dump-single-json", "--skip-download", "--no-playlist",
+        stdout = run_process([*self._base_command(), "--print", SEARCH_TEMPLATE, "--skip-download", "--no-playlist",
                               f"ytsearch10:{query}"], SEARCH_SECONDS, lock_handle=self.lock_handle,on_spawn=self._search_spawned)
         try:
             result = json.loads(stdout)
@@ -179,6 +180,11 @@ class YtDlpClient:
             raise YouTubeFailure("invalid_response", "yt-dlp search returned invalid JSON") from exc
         if not isinstance(result, dict) or result.get("_type") != "playlist" or not isinstance(result.get("entries"), list) or len(result["entries"]) > 10:
             raise YouTubeFailure("invalid_response", "yt-dlp search did not return playlist entries")
+        # Native field projection drops null/empty entries. The original count
+        # keeps an incomplete response from appearing to be an empty search.
+        count = result.get("playlist_count")
+        if result.get("entries_present") is not True or type(count) is not int or count != len(result["entries"]):
+            raise YouTubeFailure("invalid_response", "yt-dlp search entries do not match its completed count")
         candidates = []
         for entry in result["entries"]:
             if not isinstance(entry, dict):

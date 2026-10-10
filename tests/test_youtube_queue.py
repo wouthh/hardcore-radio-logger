@@ -344,3 +344,20 @@ def test_runtime_dispatch_rotates_first_retry_download_in_order(tmp_path):
     assert trace==['First Song','Retry Song','Download Song']
     assert [row(config,source)['search_attempts'] for source in (first,retry)]==[1,1]
     assert row(config,download)['download_attempts']==1
+
+
+def test_dry_run_explicit_adapter_does_not_read_previous_run_counters_or_spawn(tmp_path, monkeypatch):
+    from hcr_sync.youtube_adapter import YtDlpClient
+    from hcr_sync.youtube_sync import sync_youtube
+    config = fixture(tmp_path)
+    source = track(config)
+    schedule(config, source, 'first_search')
+    client = YtDlpClient(config)
+    client.search_invocations = 3
+    client.download_invocations = 2
+    monkeypatch.setattr(client, 'search', lambda *a: pytest.fail('dry-run provider search'))
+    monkeypatch.setattr(client, 'download', lambda *a: pytest.fail('dry-run provider download'))
+    summary = sync_youtube(config, apply=False, client=client, now=NOW)
+    assert summary.wanted == summary.due == 1
+    assert summary.search_invocations == summary.download_starts == 0
+    assert row(config, source)['search_attempts'] == 0

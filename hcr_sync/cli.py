@@ -162,6 +162,8 @@ def cmd_youtube(args: argparse.Namespace, config: Config) -> int:
         print('youtube_resume tools_verified=true applied='+str(is_apply(args)))
         return 0
     if args.youtube_command == "sync":
+        if is_apply(args):
+            assert_legacy_downloader_safe(config)
         recover_youtube_pending(config, apply=is_apply(args))
         summary = sync_youtube(config, apply=is_apply(args), complete_idless_local=args.complete_idless_local, lock_handle=getattr(args,"_sync_lock_handle",None))
         print_kv("youtube_sync", summary)

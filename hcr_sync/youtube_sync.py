@@ -430,10 +430,7 @@ def sync_youtube(config: Config, *, apply: bool, client: YouTubeClientProtocol|N
             tracks=wanted_tracks(con)
             summary.wanted=len(tracks)
             summary.review=sum(radio_metadata_placeholder(t['display_artist'],t['display_title']) for t in tracks)
-            summary.search_invocations=client.search_invocations-initial_searches if isinstance(client,YtDlpClient) else summary.searched
-        if isinstance(client,YtDlpClient):
-            summary.download_starts=client.download_invocations-initial_downloads
-        summary.due=con.execute("SELECT COUNT(*) FROM youtube_schedule WHERE phase IN ('first_search','search_retry','download') AND next_eligible_at<=?",(stamp(now),)).fetchone()[0]
+            summary.due=con.execute("SELECT COUNT(*) FROM youtube_schedule WHERE phase IN ('first_search','search_retry','download') AND next_eligible_at<=?",(stamp(now),)).fetchone()[0]
         return summary
     deadline=time.monotonic()+seconds
     with connect(config) as con:

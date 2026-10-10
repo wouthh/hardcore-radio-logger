@@ -250,14 +250,14 @@ def _candidate_payload(candidate):
     return payload
 
 
-def _current_authorized(con, row):
+def _current_authorized(config, con, row):
     track = con.execute("SELECT * FROM tracks WHERE id=?",(row['track_id'],)).fetchone()
     if not track or track['status'] != 'wanted' or source_fingerprint(track) != row['source_fingerprint']:
         return False
     if con.execute("SELECT 1 FROM exclusions WHERE track_id=?",(row['track_id'],)).fetchone():
         return False
     for asset in con.execute("SELECT * FROM youtube_assets WHERE track_id=? AND file_exists=1 AND status='downloaded' AND file_path IS NOT NULL",(row['track_id'],)):
-        if not Path(asset['file_path']).is_file() and not association_is_different(con,asset):
+        if not Path(asset['file_path']).is_file() and not association_is_different(config,con,asset):
             return False
     return not con.execute("SELECT 1 FROM youtube_assets WHERE track_id=? AND (suspected_missing_at IS NOT NULL OR status='deleted')",(row['track_id'],)).fetchone()
 
@@ -299,7 +299,7 @@ def _initialize_queue(config, con, now, summary, require_youtube_id):
                     add_event(con,source_id,'youtube_skipped_existing_local_match','youtube_sync',{'matched_track_id':asset['track_id'],'matched_asset_id':asset['id']},dedupe_key=f"youtube_skipped_existing_local_match:{source_id}:{asset['id']}")
             elif local=='ambiguous':
                 protected='local_ambiguous'
-            elif any(not Path(asset['file_path']).is_file() and not association_is_different(con,asset) for asset in con.execute("SELECT * FROM youtube_assets WHERE track_id=? AND file_exists=1 AND status='downloaded' AND file_path IS NOT NULL",(source_id,))):
+            elif any(not Path(asset['file_path']).is_file() and not association_is_different(config,con,asset) for asset in con.execute("SELECT * FROM youtube_assets WHERE track_id=? AND file_exists=1 AND status='downloaded' AND file_path IS NOT NULL",(source_id,))):
                 protected='local_missing'
                 summary.skipped+=1
         if row is None:
@@ -339,7 +339,7 @@ def _complete_download(config,con,work,now):
     row=con.execute('SELECT * FROM youtube_schedule WHERE track_id=?',(work['track_id'],)).fetchone()
     candidate=_work_candidate(work)
     payload=json.loads(work['payload_json'])
-    if not row or payload.get('fingerprint') != row['source_fingerprint'] or not _current_authorized(con,row) or _ownership_conflict(con,work['track_id'],candidate,work['work_id']):
+    if not row or payload.get('fingerprint') != row['source_fingerprint'] or not _current_authorized(config,con,row) or _ownership_conflict(con,work['track_id'],candidate,work['work_id']):
         with transaction(con):
             con.execute("UPDATE youtube_pending_work SET state='held',updated_at=? WHERE work_id=?",(stamp(now),work['work_id']))
             if row:
@@ -363,7 +363,7 @@ def _complete_download(config,con,work,now):
     output=publish_output(config,candidate,work,payload['source_artist'],payload['source_title'])
     # Publication is idempotent; a crash before this commit is recovered offline.
     with transaction(con):
-        if not _current_authorized(con,row) or _ownership_conflict(con,work['track_id'],candidate,work['work_id']):
+        if not _current_authorized(config,con,row) or _ownership_conflict(con,work['track_id'],candidate,work['work_id']):
             _hold(con,row,now,'authorization_or_ownership')
             con.execute("UPDATE youtube_pending_work SET state='held',updated_at=? WHERE work_id=?",(stamp(now),work['work_id']))
             return False
@@ -477,7 +477,7 @@ def sync_youtube(config: Config, *, apply: bool, client: YouTubeClientProtocol|N
                     set_state(con,'youtube_queue_cursor',str(lane))
                 summary.degraded='work_budget'
                 break
-            if not _current_authorized(con,row):
+            if not _current_authorized(config,con,row):
                 with transaction(con):
                     _hold(con,row,now,'authorization')
                 summary.skipped+=1

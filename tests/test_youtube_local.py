@@ -1,11 +1,13 @@
 """Local recording evidence cannot be replaced by a database association."""
 from pathlib import Path
+import json
 
 import pytest
 
 from hcr_sync.db import connect, ensure_track, init_db, set_state, transaction, upsert_youtube_asset
 from hcr_sync.reconcile import reconcile
 from hcr_sync.youtube_local import association_allows_absence, local_satisfaction
+from hcr_sync.youtube_queue import source_fingerprint
 from hcr_sync import youtube_local
 from test_youtube_duplicates import make_config
 
@@ -30,6 +32,93 @@ def satisfaction(config, source_id, **kwargs):
         return local_satisfaction(config, con, source, **kwargs)
 
 
+def credited_candidate():
+    return {'video_id':'local123456','title':'North Tone, Signal MC, Orbit - Infinity',
+            'url':'https://www.youtube.com/watch?v=local123456','channel':'','duration':180,
+            'artist':'North Tone, Signal MC, Orbit','track':'Infinity',
+            'artist_names':['North Tone','Signal MC','Orbit']}
+
+
+@pytest.mark.parametrize('bad_proof', [None,'owner','path','video','candidate_video','source','state',
+    'candidate_heading','candidate_artist','candidate_version','fingerprint','malformed','no_verified'])
+def test_structured_local_credits_require_exact_completed_owned_work(tmp_path,monkeypatch,bad_proof):
+    config,source_id,_,path=seed(tmp_path,'North Tone & Orbit & Signal MC - Infinity [local123456].mp3',
+        source_artist='North Tone & Orbit & Signal MC',source_title='Infinity')
+    monkeypatch.setattr(youtube_local,'_tag_values',lambda path: ('North Tone, Signal MC, Orbit','Infinity'))
+    with connect(config) as con,transaction(con):
+        owner=ensure_track(con,artist='Other Owner',title='Other Recording')['id'] if bad_proof=='owner' else source_id
+        payload={'source_artist':'North Tone & Orbit & Signal MC','source_title':'Infinity',
+                 'candidate':credited_candidate(),'verified_recording':credited_candidate()}
+        payload['fingerprint']=source_fingerprint(con.execute('SELECT * FROM tracks WHERE id=?',(source_id,)).fetchone())
+        if bad_proof=='candidate_video': payload['verified_recording']['video_id']='wrong123456'
+        if bad_proof=='source': payload['source_artist']='Other Owner'
+        if bad_proof=='candidate_heading': payload['verified_recording']['title']='Other Artist - Infinity'
+        if bad_proof=='candidate_artist': payload['verified_recording']['artist']='North Tone, Other Artist, Orbit'
+        if bad_proof=='candidate_version': payload['verified_recording']['title']='North Tone, Signal MC, Orbit - Infinity (Other Remix)'
+        if bad_proof=='no_verified': payload.pop('verified_recording')
+        if bad_proof=='fingerprint': payload['fingerprint']='unverified'
+        con.execute('INSERT INTO youtube_pending_work(work_id,track_id,video_id,payload_json,state,created_at,updated_at,output_path) VALUES (?,?,?,?,?,?,?,?)',
+            ('finished',owner,'wrong123456' if bad_proof=='video' else 'local123456','malformed' if bad_proof=='malformed' else json.dumps(payload),
+             'prepared' if bad_proof=='state' else 'completed','fixture','fixture',str(path)+'wrong' if bad_proof=='path' else str(path)))
+    assert satisfaction(config,source_id)[0]==('satisfied' if bad_proof is None else 'ambiguous')
+
+
+@pytest.mark.parametrize('tag_artist,tag_title', [('North Tone, Other Artist, Orbit','Infinity'),
+    ('North Tone, Orbit','Infinity'),('North Tone, Signal MC, Orbit, Extra Artist','Infinity'),
+    ('North Tone, Signal MC, Orbit','Infinity (Other Remix)'),('',''),
+    ('North Tone, Signal MC, Orbit',''),('','Infinity')])
+def test_completed_work_cannot_hide_contradictory_actual_tags(tmp_path,monkeypatch,tag_artist,tag_title):
+    config,source_id,_,path=seed(tmp_path,'North Tone & Orbit & Signal MC - Infinity [local123456].mp3',
+        source_artist='North Tone & Orbit & Signal MC',source_title='Infinity')
+    monkeypatch.setattr(youtube_local,'_tag_values',lambda path: (tag_artist,tag_title))
+    payload={'source_artist':'North Tone & Orbit & Signal MC','source_title':'Infinity',
+             'candidate':credited_candidate(),'verified_recording':credited_candidate()}
+    with connect(config) as con,transaction(con):
+        payload['fingerprint']=source_fingerprint(con.execute('SELECT * FROM tracks WHERE id=?',(source_id,)).fetchone())
+        con.execute('INSERT INTO youtube_pending_work(work_id,track_id,video_id,payload_json,state,created_at,updated_at,output_path) VALUES (?,?,?,?,?,?,?,?)',
+            ('finished',source_id,'local123456',json.dumps(payload),'completed','fixture','fixture',str(path)))
+    assert satisfaction(config,source_id,persist=True)[0]=='ambiguous'
+
+
+@pytest.mark.parametrize('target_title,tag_title,expected', [('Infinity (Original Mix)','Infinity','satisfied'),
+    ('Infinity (Other Remix)','Infinity','none'),('Infinity (Other Remix)','Infinity (Other Remix)','ambiguous')])
+def test_completed_owner_credit_proof_can_satisfy_equivalent_foreign_source_without_transfer(tmp_path,monkeypatch,target_title,tag_title,expected):
+    config,owner_id,_,path=seed(tmp_path,'North Tone & Orbit & Signal MC - Infinity [local123456].mp3',
+        source_artist='North Tone & Orbit & Signal MC',source_title='Infinity')
+    monkeypatch.setattr(youtube_local,'_tag_values',lambda path: ('North Tone, Signal MC, Orbit',tag_title))
+    with connect(config) as con,transaction(con):
+        owner=con.execute('SELECT * FROM tracks WHERE id=?',(owner_id,)).fetchone()
+        target=ensure_track(con,artist='Orbit, Signal MC, North Tone',title=target_title)
+        payload={'source_artist':owner['display_artist'],'source_title':owner['display_title'],
+                 'fingerprint':source_fingerprint(owner),
+                 'candidate':credited_candidate(),'verified_recording':credited_candidate()}
+        con.execute('INSERT INTO youtube_pending_work(work_id,track_id,video_id,payload_json,state,created_at,updated_at,output_path) VALUES (?,?,?,?,?,?,?,?)',
+            ('finished',owner_id,'local123456',json.dumps(payload),'completed','fixture','fixture',str(path)))
+    status,asset=satisfaction(config,target['id'])
+    assert status==expected
+    if asset:
+        assert asset['track_id']==owner_id
+    with connect(config) as con:
+        assert con.execute('SELECT track_id FROM youtube_assets').fetchone()[0]==owner_id
+
+
+def test_credit_cache_does_not_reuse_proof_after_owner_input_changes(tmp_path,monkeypatch):
+    config,source_id,_,path=seed(tmp_path,'North Tone & Orbit & Signal MC - Infinity [local123456].mp3',
+        source_artist='North Tone & Orbit & Signal MC',source_title='Infinity')
+    monkeypatch.setattr(youtube_local,'_tag_values',lambda path: ('North Tone, Signal MC, Orbit','Infinity'))
+    with connect(config) as con,transaction(con):
+        source=con.execute('SELECT * FROM tracks WHERE id=?',(source_id,)).fetchone()
+        payload={'source_artist':source['display_artist'],'source_title':source['display_title'],
+                 'fingerprint':source_fingerprint(source),'candidate':credited_candidate(),'verified_recording':credited_candidate()}
+        con.execute('INSERT INTO youtube_pending_work(work_id,track_id,video_id,payload_json,state,created_at,updated_at,output_path) VALUES (?,?,?,?,?,?,?,?)',
+            ('finished',source_id,'local123456',json.dumps(payload),'completed','fixture','fixture',str(path)))
+    cache={}
+    assert satisfaction(config,source_id,cache=cache)[0]=='satisfied'
+    with connect(config) as con,transaction(con):
+        con.execute('UPDATE tracks SET display_artist=? WHERE id=?',('Orbit & North Tone & Signal MC',source_id))
+    assert satisfaction(config,source_id,cache=cache)[0]=='ambiguous'
+
+
 @pytest.mark.parametrize('filename,source_title,expected', [
     ('Synthetic Artist - Night Signal (Original Mix) [local123456].mp3', 'Night Signal', 'satisfied'),
     ('Synthetic Artist - Night Signal [local123456].mp3', 'Night Signal (Extended Mix)', 'satisfied'),
@@ -43,7 +132,7 @@ def test_actual_local_metadata_controls_satisfaction_even_for_own_association(tm
     status, asset = satisfaction(config, source_id, persist=True)
     assert status == expected and asset is not None
     with connect(config) as con:
-        assert association_allows_absence(con, asset) is (expected == 'satisfied')
+        assert association_allows_absence(config, con, asset) is (expected == 'satisfied')
         assert con.execute('SELECT status FROM tracks WHERE id=?', (source_id,)).fetchone()[0] == 'wanted'
     assert path.exists()
 
@@ -201,7 +290,12 @@ def test_cross_source_filter_avoids_unrelated_full_comparisons_without_skipping_
         calls.append(args)
         return original(*args, **kwargs)
     monkeypatch.setattr(youtube_local, 'compare_recordings', counted)
-    assert satisfaction(config, source_id)[0] == 'none'
+    with connect(config) as con:
+        source=con.execute('SELECT * FROM tracks WHERE id=?',(source_id,)).fetchone()
+        queries=[]
+        con.set_trace_callback(queries.append)
+        assert local_satisfaction(config,con,source)[0]=='none'
+    assert not any('SELECT * FROM tracks WHERE id=' in query or 'FROM youtube_pending_work' in query for query in queries)
     assert calls == []
     renamed = path.with_name('Synthetic Artist - Night Signal (Hard Refix) [local123456].mp3')
     path.rename(renamed)
@@ -264,3 +358,32 @@ def test_relative_music_directory_still_confirms_genuinely_missing_verified_asse
         assert con.execute('SELECT status FROM tracks WHERE id=?', (source_id,)).fetchone()[0] == 'excluded'
         asset = con.execute('SELECT * FROM youtube_assets WHERE track_id=?', (source_id,)).fetchone()
         assert asset['file_exists'] == 0 and asset['status'] == 'deleted'
+
+
+def test_saved_different_evidence_cannot_authorize_missing_file_after_threshold_change(tmp_path):
+    from hcr_sync.youtube_local import association_is_different
+    from hcr_sync.youtube_sync import _current_authorized
+    from hcr_sync.youtube_queue import source_fingerprint
+    config,source_id,_,path=seed(tmp_path,'Synthetic Artist - Night Signal (Other Remix) [local123456].mp3')
+    with connect(config) as con,transaction(con):
+        source=con.execute('SELECT * FROM tracks WHERE id=?',(source_id,)).fetchone()
+        assert local_satisfaction(config,con,source,persist=True)[0]=='different'
+        asset=con.execute('SELECT * FROM youtube_assets WHERE track_id=?',(source_id,)).fetchone()
+        row={'track_id':source_id,'source_fingerprint':source_fingerprint(source)}
+    path.unlink()
+    with connect(config) as con:
+        assert association_is_different(config,con,asset)
+        assert _current_authorized(config,con,row)
+        config.values['HCR_YOUTUBE_MATCH_THRESHOLD']='.95'
+        assert not association_is_different(config,con,asset)
+        assert not _current_authorized(config,con,row)
+        # Older unbound decisions also preserve the missing-file hold.
+        config.values['HCR_YOUTUBE_MATCH_THRESHOLD']='.90'
+        from hcr_sync.db import get_state
+        import json
+        key=f'youtube_local_evidence:{asset["id"]}'
+        evidence=json.loads(get_state(con,key))
+        evidence.pop('threshold')
+        set_state(con,key,json.dumps(evidence))
+        assert not association_is_different(config,con,asset)
+        assert not _current_authorized(config,con,row)

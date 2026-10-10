@@ -5,11 +5,41 @@ import json
 from .db import get_state, set_state
 from .identity import duplicate_title_tokens
 from .local_files import inspect_audio_file, _tag_values
-from .youtube_matching import compare_recordings, _title
+from .youtube_matching import compare_recordings, evaluate_candidate, _title
+from .youtube_adapter import YouTubeCandidate
+from .youtube_queue import source_fingerprint
+
+
+def _completed_recording(con, asset, item, owner, threshold):
+    if not asset['youtube_video_id'] or not item or item.youtube_video_id != asset['youtube_video_id']:
+        return None
+    if owner is None:
+        return None
+    for work in con.execute("SELECT payload_json FROM youtube_pending_work WHERE state='completed' AND track_id=? AND video_id=? AND output_path=? ORDER BY updated_at DESC,work_id",
+                            (owner['id'],asset['youtube_video_id'],asset['file_path'])):
+        try:
+            payload=json.loads(work['payload_json'])
+        except (json.JSONDecodeError,TypeError):
+            continue
+        if not isinstance(payload,dict) or payload.get('fingerprint') != source_fingerprint(owner) or payload.get('source_artist') != owner['display_artist'] or payload.get('source_title') != owner['display_title']:
+            continue
+        candidate=payload.get('verified_recording')
+        if not isinstance(candidate,dict) or candidate.get('video_id') != asset['youtube_video_id']:
+            continue
+        names=candidate.get('artist_names')
+        if isinstance(names,(list,tuple)) and all(isinstance(name,str) and name.strip() for name in names):
+            try:
+                recording=YouTubeCandidate(**candidate)
+            except TypeError:
+                continue
+            if evaluate_candidate(owner['display_artist'],owner['display_title'],recording,threshold=threshold).accepted:
+                return recording
+    return None
 
 
 def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=None, persist=False):
     cache = cache if cache is not None else {}
+    threshold = config.float('HCR_YOUTUBE_MATCH_THRESHOLD')
     rows = con.execute("SELECT * FROM youtube_assets WHERE file_exists=1 AND status='downloaded' AND file_path IS NOT NULL ORDER BY track_id=? DESC,id", (track['id'],)).fetchall()
     source_tokens = duplicate_title_tokens(_title(track['display_title']).base)
     ambiguous = None
@@ -25,7 +55,7 @@ def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=No
             if row['track_id']==track['id']:
                 ambiguous=row
                 if persist:
-                    set_state(con,f'youtube_local_evidence:{row["id"]}',json.dumps({'status':'ambiguous','source':[track['display_artist'],track['display_title']]}))
+                    set_state(con,f'youtube_local_evidence:{row["id"]}',json.dumps({'status':'ambiguous','threshold':threshold,'source':[track['display_artist'],track['display_title']]}))
             continue
         if not path.is_file():
             continue
@@ -35,9 +65,32 @@ def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=No
             cache[key] = (inspect_audio_file(path),_tag_values(path))
         item,tags = cache[key]
         own = row['track_id'] == track['id']
-        token_key = ('title_tokens', key)
+        if not own:
+            # Cheap cached title checks precede owner/work queries. Tags can
+            # keep a truncated publication plausible, but cannot authorize it.
+            for projection,evidence_title in ((False,item.title if item else ''),(True,tags[1])):
+                token_key = ('title_tokens', key, projection)
+                if token_key not in cache:
+                    cache[token_key] = duplicate_title_tokens(_title(evidence_title).base)
+            if not any(source_tokens and tokens and
+                       len(source_tokens & tokens) / len(source_tokens) >= .75 and
+                       len(source_tokens & tokens) / len(tokens) >= .75
+                       for tokens in (cache[('title_tokens',key,False)],cache[('title_tokens',key,True)])):
+                continue
+        owner=con.execute('SELECT * FROM tracks WHERE id=?',(row['track_id'],)).fetchone()
+        recording_key = ('completed_recording', row['id'], row['track_id'], row['youtube_video_id'], key,
+                      source_fingerprint(owner) if owner else None, threshold)
+        if recording_key not in cache:
+            cache[recording_key] = _completed_recording(con,row,item,owner,threshold)
+        recording = cache[recording_key]
+        credits = recording.artist_names if recording else ()
+        # Exact completed output attribution recognizes publication names even
+        # when sanitizing or truncating them loses the original source text.
+        source_projection = recording is not None
+        token_key = ('title_tokens', key, source_projection)
         if token_key not in cache:
-            cache[token_key] = duplicate_title_tokens(_title(item.title).base) if item else set()
+            evidence_title = tags[1] if source_projection else (item.title if item else '')
+            cache[token_key] = duplicate_title_tokens(_title(evidence_title).base)
         candidate_tokens = cache[token_key]
         plausible = bool(source_tokens and candidate_tokens and
                          len(source_tokens & candidate_tokens) / len(source_tokens) >= .75 and
@@ -46,20 +99,28 @@ def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=No
         if not own and not plausible:
             continue
         status = 'different'
-        if item and item.artist and item.title:
-            decision = compare_recordings(track['display_artist'], track['display_title'], item.artist, item.title)
+        artist,title = (item.artist,item.title) if item else ('','')
+        projected = bool(source_projection and tags[0] and tags[1])
+        if source_projection and not projected:
+            status = 'ambiguous'
+        elif projected or (item and item.artist and item.title):
+            if projected:
+                artist,title = tags
+            owner_tags_agree = not projected or compare_recordings(owner['display_artist'],owner['display_title'],
+                                                                   *tags,artist_names=credits,threshold=threshold).accepted
+            decision = compare_recordings(track['display_artist'], track['display_title'], artist, title, artist_names=credits,threshold=threshold)
             if decision.accepted:
-                status = 'satisfied'
-                if tags[0] and tags[1] and not compare_recordings(track['display_artist'],track['display_title'],*tags).accepted:
+                status = 'ambiguous' if not owner_tags_agree else 'satisfied'
+                if tags[0] and tags[1] and not compare_recordings(track['display_artist'],track['display_title'],*tags,artist_names=credits,threshold=threshold).accepted:
                     status = 'ambiguous'
-            elif decision.reason in {'artist_evidence', 'ambiguous_credits', 'missing_artist'}:
+            elif (projected and own) or not owner_tags_agree or decision.reason in {'artist_evidence', 'ambiguous_credits', 'missing_artist', 'metadata_conflict'}:
                 # Only plausible title evidence can hold unrelated sources.
                 if own or plausible:
                     status = 'ambiguous'
         elif own or (item and plausible):
             status = 'ambiguous'
         if persist and own:
-            evidence = {'status': status, 'artist': item.artist if item else '', 'title': item.title if item else '', 'source': [track['display_artist'],track['display_title']], 'stat': list(key)}
+            evidence = {'status': status, 'threshold': threshold, 'artist': artist, 'title': title, 'source': [track['display_artist'],track['display_title']], 'stat': list(key)}
             set_state(con, f'youtube_local_evidence:{row["id"]}', json.dumps(evidence, separators=(',',':')))
         if status == 'satisfied':
             satisfied = row
@@ -76,17 +137,17 @@ def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=No
     return ('different', different) if different is not None else ('none', None)
 
 
-def association_allows_absence(con, asset):
+def association_allows_absence(config, con, asset):
     """Negative inspection evidence must not become a destructive removal vote."""
     evidence = get_state(con, f'youtube_local_evidence:{asset["id"]}')
     if evidence:
         evidence=json.loads(evidence)
         track=con.execute('SELECT display_artist,display_title FROM tracks WHERE id=?',(asset['track_id'],)).fetchone()
-        return bool(track and evidence.get('status') == 'satisfied' and evidence.get('source') == [track['display_artist'],track['display_title']])
+        return bool(track and evidence.get('status') == 'satisfied' and evidence.get('threshold') == config.float('HCR_YOUTUBE_MATCH_THRESHOLD') and evidence.get('source') == [track['display_artist'],track['display_title']])
     return False  # A legacy association alone cannot authorize destructive absence.
 
 
-def association_is_different(con,asset):
+def association_is_different(config,con,asset):
     evidence=json.loads(get_state(con,f'youtube_local_evidence:{asset["id"]}','{}'))
     track=con.execute('SELECT display_artist,display_title FROM tracks WHERE id=?',(asset['track_id'],)).fetchone()
-    return bool(track and evidence.get('status')=='different' and evidence.get('source')==[track['display_artist'],track['display_title']])
+    return bool(track and evidence.get('status')=='different' and evidence.get('threshold') == config.float('HCR_YOUTUBE_MATCH_THRESHOLD') and evidence.get('source')==[track['display_artist'],track['display_title']])

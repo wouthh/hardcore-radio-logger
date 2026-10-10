@@ -245,7 +245,7 @@ def _cascade_local(con, config: Config, track_id: int, summary: ReconcileSummary
     )
     manual_requested=bool(con.execute("SELECT 1 FROM exclusions WHERE track_id=? AND source='manual'",(track_id,)).fetchone())
     for row in rows:
-        identified=association_allows_absence(con,row)
+        identified=association_allows_absence(config,con,row)
         if not identified and not manual_requested:
             continue
         old_path = Path(row["file_path"])
@@ -412,7 +412,7 @@ def reconcile(
                 "SELECT * FROM youtube_assets WHERE file_exists = 1 AND status = 'downloaded' AND file_path IS NOT NULL"
             )
         )
-        confirmed_local = [asset for asset in known_local if association_allows_absence(con,asset)]
+        confirmed_local = [asset for asset in known_local if association_allows_absence(config,con,asset)]
         missing_known_local_count = sum(1 for asset in confirmed_local if os.path.abspath(asset["file_path"]) not in current_paths)
         local_refusal = _local_scan_guard(
             config,
@@ -443,7 +443,7 @@ def reconcile(
                                 dedupe_key=f"local_delete_suspicion_cleared:{asset['track_id']}:{asset['id']}",
                             )
                     continue
-                if not association_allows_absence(con,asset):
+                if not association_allows_absence(config,con,asset):
                     continue
                 summary.planned.append(PlannedAction(asset["track_id"], "local_deleted", asset["file_path"]))
                 if not apply:

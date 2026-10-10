@@ -1,11 +1,12 @@
 """Evidence-based YouTube comparisons without treating uploader names as credits."""
 from dataclasses import dataclass, replace
+from collections import Counter
 import math
 import re
 
 from .identity import compact_text, duplicate_title_tokens, match_confidence, normalize_for_match, parse_artist_title
 from .recording_comparison import (BRACKET_SUFFIX, DASH_SUFFIX, VERSION_MARKER, TitleComparison,
-    comparison_title, comparison_artists, compatible_titles)
+    comparison_title, comparison_artists, compatible_titles, credited_names)
 
 PRESENTATION_LABELS = frozenset({'official audio', 'official video', 'official music video', 'music video',
     'lyrics', 'lyric', 'lyric video', 'lyrics video', 'hq', 'hd', 'official'})
@@ -65,7 +66,11 @@ def compare_recordings(source_artist, source_title, candidate_artist, candidate_
     if not compact_text(source_artist) or not (compact_text(candidate_artist) or artist_names):
         return decision
     credits = _credits(candidate_artist, artist_names)
-    artists = comparison_artists(source_artist, candidate_artist, credits)
+    if artist_names and compact_text(candidate_artist):
+        visible = credited_names(candidate_artist, credits, semicolon=True)
+        if visible is None or Counter(visible) != Counter(normalize_for_match(name) for name in credits):
+            return replace(decision, reason='metadata_conflict')
+    artists = comparison_artists(source_artist, candidate_artist, credits, semicolon=bool(artist_names))
     if artists is None:
         reason = 'ambiguous_credits' if any(separator in source_artist or separator in candidate_artist
                     for separator in (' & ', ',')) else 'artist_evidence'

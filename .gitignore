@@ -98,3 +98,7 @@ dist/
 systemd/rendered/
 *.service.local
 *.timer.local
+
+# Owned YouTube staging and partial downloads
+.hcr-youtube-work/
+download-tmp/

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import os
 import subprocess
 from contextlib import contextmanager
 from pathlib import Path
@@ -44,4 +45,5 @@ def sync_lock(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         fcntl.flock(handle, fcntl.LOCK_EX)
-        yield
+        os.set_inheritable(handle.fileno(), True)
+        yield handle

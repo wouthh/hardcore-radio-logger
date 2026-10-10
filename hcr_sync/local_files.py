@@ -161,7 +161,11 @@ def import_local_files(config: Config, *, apply: bool, establish_baseline: bool)
         return summary
     with connect(config) as con:
         with transaction(con):
+            reserved={row['video_id'] for row in con.execute("SELECT video_id FROM youtube_pending_work WHERE state NOT IN ('completed','cancelled')")}
             for item in scanned:
+                if item.youtube_video_id in reserved:
+                    summary.skipped+=1
+                    continue
                 existing_asset = _existing_asset_for_local_file(con, item)
                 moved_asset = None
                 if existing_asset:
@@ -182,7 +186,7 @@ def import_local_files(config: Config, *, apply: bool, establish_baseline: bool)
                         youtube_url=f"https://www.youtube.com/watch?v={item.youtube_video_id}" if item.youtube_video_id else "",
                         file_path=str(item.path),
                         file_exists=True,
-                        match_confidence=1.0,
+                        match_confidence=existing_asset["match_confidence"] if existing_asset else 1.0,
                         status="downloaded",
                         downloaded_at=None,
                     )

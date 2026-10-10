@@ -398,3 +398,17 @@ def test_failed_scan_keeps_one_request_budget_and_continues_local_pipeline(tmp_p
         assert constructed == [True]
         assert client.budget.used == len(calls) == 13
         assert events == ['radio','youtube']
+
+
+def test_youtube_sync_preflights_legacy_downloader_before_recovery(monkeypatch, tmp_path):
+    from hcr_sync.cli import cmd_youtube
+    config = make_config(tmp_path)
+    calls = []
+    def fail_preflight(_config):
+        raise LegacyDownloaderActive("legacy downloader active")
+    monkeypatch.setattr("hcr_sync.cli.assert_legacy_downloader_safe", fail_preflight)
+    monkeypatch.setattr("hcr_sync.cli.recover_youtube_pending", lambda *a, **k: calls.append("recovery"))
+    args = SimpleNamespace(youtube_command="sync", apply=True, complete_idless_local=None)
+    with pytest.raises(LegacyDownloaderActive):
+        cmd_youtube(args, config)
+    assert calls == []

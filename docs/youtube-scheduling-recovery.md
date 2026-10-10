@@ -1,0 +1,38 @@
+# YouTube scheduling recovery
+
+Legacy YouTube review assets could suppress future searches permanently. The explicit scheduling repair previews evidence without changing the database or contacting a provider. Applying it requires the normal writer lock and an explicit new SQLite backup in an owner-only directory. The backup is verified before the transaction and retained on success or failure; deletion needs separate authorization.
+
+Only source-attributed `youtube_sync` algorithmic events qualify: historical score-only `ambiguous_youtube_match` events, the exact below-threshold reason, or structured `youtube_download_failed` evidence. Manual exclusions, deletion suspicion, ownership conflicts, placeholder/non-track sources and unknown origins remain held. Missing source metadata alone does not invalidate a proven historical algorithmic origin. Local satisfaction uses recording evidence; a database association or existing file alone is insufficient.
+
+Repair initializes the retry search lane with zero new attempt counters and preserves all asset, confidence, event, exclusion and source history. Its first due time is the seed timestamp plus 24 hours plus a deterministic SHA-256 canonical-source jitter of less than six days. Existing initialized schedules are preserved. An unclassified legacy hold may be converted only with the current source fingerprint; an existing later due time never moves earlier. Repeated repair therefore does not reseed completed initialization.
+
+The preview separates verified local satisfaction, algorithmic recovery, preserved schedules, manual/ownership holds and uncertain evidence. Historical attempt totals cannot be reconstructed from deduplicated events; queue counts describe attempts since initialization. A scheduling repair does not approve an uncertain recording or release a provider pause.
+
+## Runtime policy
+
+The automatic threshold remains 90%, with 45% artist and 55% title weighting. Generic trailing versions and exact YouTube presentation labels compare consistently on both sides. Meaningful remixers, years, live/acoustic/cover/refix distinctions must agree regardless of score. Uploader names cannot supply missing artist credits. Whole credited names are retained; structured artist lists or an explicit matching MC credit can corroborate comma/ampersand list punctuation. Ambiguous compounds and contradictory metadata remain rejected.
+
+Three persistent lanes cycle equally: first search, due search retry, qualified download. Within each lane the oldest eligibility and attempt precede source ID. Empty lanes yield; a nonempty lane blocked by the current run's allowance retains its cursor for the next run. Completed search decisions and ready-download intent commit with scheduling and rotation. Interrupted work retains its original slot until recovery classifies its outcome.
+
+Defaults are `HCR_YOUTUBE_SEARCH_LIMIT=2`, `HCR_YOUTUBE_DOWNLOAD_LIMIT=1`, and `HCR_YOUTUBE_RUN_TIMEOUT_SECONDS=240`. Searches reserve 50 seconds (45 execution plus termination); downloads reserve 140 seconds (120 execution, 15 verification, and termination). Run timeout must be at least 140 seconds, and invocation limits positive. These bound subprocess starts and elapsed work, **not underlying HTTP requests**. Socket timeout is 15 seconds and implicit yt-dlp retries/configuration are disabled.
+
+A completed unsuccessful match retries after seven days first, fourteen thereafter. Search and download transient streaks are separate: 15 minutes, one hour, four hours, twelve hours, then 24 hours. Qualified candidates are reused and rescored for up to seven days. An individually unavailable video, or five candidate-specific failures, invalidates its evidence and schedules a new search after 24 hours.
+
+Provider access restrictions pause for an estimated twelve hours, then permit one normal queued operation as a probe; failed probes increase to 24, 48, then 72 hours. Two transport failures on distinct sources within thirty minutes pause for one hour, with failed probes increasing to two, four, then six hours. Successful provider work clears the pause streak. Trustworthy surfaced future retry times are respected; the CLI does not expose reliable response headers. Missing/broken local tools require an operator hold; `youtube resume --apply` verifies local tools and clears only this configuration hold, never an unexpired provider restriction.
+
+Recoverable YouTube failures produce a degraded summary and allow independent Spotify work. Database, integrity, and unsafe filesystem evidence remain failures. Latest decision evidence is bounded to 12 KiB per source; unchanged skips do not emit recurring source events. Verbose auditing stays disabled.
+
+## Interrupted downloads and local evidence
+
+A committed intent reserves the video identity before dispatch. Downloaders inherit the existing sync lock, use owned process groups, and stage on the music filesystem. After-move receipts identify the exact output; arbitrary newly created files are never accepted. Verification checks identity, paths, artist/version metadata, nonempty audio, decoded duration (120–480 seconds), and complete decoding. Publication uses an atomic no-overwrite link. Asset/provenance, queue completion and rotation commit together.
+
+Offline recovery precedes local imports and reconciliation. An identifiable staged or published output is verified without another provider call. Partials, missing output, changed authorization, conflicting ownership and archive-without-output evidence remain recoverable or held. Importers respect pending reservations. Recovery does not clear the archive, transfer ownership, merge sources, or claim exactly-once downloads. Files and earlier associations are retained when matching evidence differs or remains ambiguous; their absence cannot become a destructive confirmation vote.
+
+Repair preview:
+
+```sh
+python -m hcr_sync youtube repair-scheduling --dry-run
+python -m hcr_sync youtube repair-scheduling --apply --backup /private/owner-only/new-backup.sqlite
+```
+
+Before production repair/install, stop the timer, finish active work, acquire the sync lock, and retain verified database/configuration/archive rollback evidence. Verify preservation and integrity before resuming. Before new activity, a failed maintenance gate can restore its quiescent backup; after file/provider activity, preserve current state and repair forward instead of blindly restoring stale snapshots.

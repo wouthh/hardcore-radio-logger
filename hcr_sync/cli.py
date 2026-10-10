@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import sqlite3
 import sys
+from pathlib import Path
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
@@ -19,7 +20,7 @@ from .reconcile import manual_exclude, reconcile
 from .report import build_report, format_report
 from .spotify_sync import SpotifyAssociationConflict, SpotifySummary, backfill_spotify, scan_spotify_playlist, spotify_auth, sync_spotify
 from .system import LegacyDownloaderActive, assert_legacy_downloader_safe, sync_lock
-from .youtube_sync import sync_youtube
+from .youtube_sync import sync_youtube, recover_youtube_pending
 
 
 def add_apply_args(parser: argparse.ArgumentParser) -> None:
@@ -141,8 +142,30 @@ def cmd_spotify(args: argparse.Namespace, config: Config) -> int:
 
 
 def cmd_youtube(args: argparse.Namespace, config: Config) -> int:
+    if args.youtube_command == 'repair-scheduling':
+        import json
+        from .youtube_repair import repair_scheduling
+        print(json.dumps(repair_scheduling(config,apply=is_apply(args),backup_path=args.backup),indent=2))
+        return 0
+    if args.youtube_command == 'resume':
+        from .youtube_adapter import local_tool_check
+        from .youtube_queue import pause_state
+        from .db import set_state
+        local_tool_check(config)
+        with connect(config) as con:
+            pause=pause_state(con)
+            if not pause.get('operator_required'):
+                raise ValueError('resume only clears a tool configuration hold; provider pauses expire normally')
+            if is_apply(args):
+                with transaction(con):
+                    set_state(con,'youtube_provider_pause','{}')
+        print('youtube_resume tools_verified=true applied='+str(is_apply(args)))
+        return 0
     if args.youtube_command == "sync":
-        summary = sync_youtube(config, apply=is_apply(args), complete_idless_local=args.complete_idless_local)
+        if is_apply(args):
+            assert_legacy_downloader_safe(config)
+        recover_youtube_pending(config, apply=is_apply(args))
+        summary = sync_youtube(config, apply=is_apply(args), complete_idless_local=args.complete_idless_local, lock_handle=getattr(args,"_sync_lock_handle",None))
         print_kv("youtube_sync", summary)
         return 0
     return 2
@@ -212,7 +235,7 @@ def cmd_run_once(args: argparse.Namespace, config: Config) -> int:
     apply = is_apply(args)
     if apply:
         assert_legacy_downloader_safe(config)
-    with sync_lock(config.sync_lock_path):
+    with sync_lock(config.sync_lock_path) as lock_handle:
         if config.bool("HCR_RUN_POLLER"):
             try:
                 changed, track = poll_radio(config, apply=apply)
@@ -223,6 +246,8 @@ def cmd_run_once(args: argparse.Namespace, config: Config) -> int:
                 print(f"poll_radio changed={changed} track={track}")
         import_summary = import_logger(config, apply=apply)
         print_kv("import_logger", import_summary)
+        recovery = recover_youtube_pending(config, apply=apply)
+        print_kv("youtube_recovery",recovery)
         local_summary = import_local_files(config, apply=apply, establish_baseline=False)
         print_kv("scan_local", local_summary)
         spotify_snapshot = None
@@ -271,7 +296,7 @@ def cmd_run_once(args: argparse.Namespace, config: Config) -> int:
             print("SKIPPED spotify_sync reason=fatal_reconcile_refusal")
             print(format_report(build_report(config)))
             return 1
-        yt_summary = sync_youtube(config, apply=apply, complete_idless_local=args.complete_idless_local)
+        yt_summary = sync_youtube(config, apply=apply, complete_idless_local=args.complete_idless_local,lock_handle=lock_handle)
         print_kv("youtube_sync", yt_summary)
         sp_summary = sync_spotify(config, apply=apply, client=spotify_client)
         print_kv("spotify_sync", sp_summary)
@@ -327,6 +352,11 @@ def build_parser() -> argparse.ArgumentParser:
     youtube_sync_parser = youtube_sub.add_parser("sync")
     add_apply_args(youtube_sync_parser)
     youtube_sync_parser.add_argument("--complete-idless-local", action="store_true", default=None)
+    youtube_repair_parser = youtube_sub.add_parser('repair-scheduling')
+    add_apply_args(youtube_repair_parser)
+    youtube_repair_parser.add_argument('--backup',type=Path)
+    youtube_resume_parser = youtube_sub.add_parser('resume')
+    add_apply_args(youtube_resume_parser)
     youtube_parser.set_defaults(func=cmd_youtube)
 
     rec_parser = sub.add_parser("reconcile")
@@ -367,7 +397,8 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(args.config)
     try:
         lock_needed = is_apply(args) and args.command != "run-once"
-        with sync_lock(config.sync_lock_path) if lock_needed else nullcontext():
+        with sync_lock(config.sync_lock_path) if lock_needed else nullcontext() as lock_handle:
+            args._sync_lock_handle=lock_handle
             return args.func(args, config)
     except LegacyDownloaderActive as exc:
         print(f"error: {exc}", file=sys.stderr)

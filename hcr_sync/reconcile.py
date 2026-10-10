@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -232,17 +233,25 @@ def _trash_file(config: Config, path: Path) -> Path | None:
 
 
 def _cascade_local(con, config: Config, track_id: int, summary: ReconcileSummary) -> None:
+    from .youtube_local import local_satisfaction, association_allows_absence
+    track=con.execute("SELECT * FROM tracks WHERE id=?",(track_id,)).fetchone()
+    if track:
+        local_satisfaction(config,con,track,persist=True)
     rows = list(
         con.execute(
             "SELECT * FROM youtube_assets WHERE track_id = ? AND file_exists = 1 AND file_path IS NOT NULL",
             (track_id,),
         )
     )
+    manual_requested=bool(con.execute("SELECT 1 FROM exclusions WHERE track_id=? AND source='manual'",(track_id,)).fetchone())
     for row in rows:
+        identified=association_allows_absence(con,row)
+        if not identified and not manual_requested:
+            continue
         old_path = Path(row["file_path"])
         existed_before = old_path.exists()
         is_audio_path = old_path.suffix.casefold() in AUDIO_EXTENSIONS
-        moved_to = _trash_file(config, old_path)
+        moved_to = _trash_file(config, old_path) if identified else None
         touched_file = moved_to is not None or (existed_before and is_audio_path and not old_path.exists())
         if moved_to:
             event_type = "local_file_moved_to_trash"
@@ -390,13 +399,21 @@ def reconcile(
         if _spotify_cooldown_active(con):
             skip_spotify = True
             spotify_client = None
-        current_paths = {str(path) for path in audio_paths(config.music_dir)}
+        from .youtube_local import local_satisfaction, association_allows_absence
+        if apply:
+            with transaction(con):
+                cache={}
+                for track in con.execute("SELECT DISTINCT t.* FROM tracks t JOIN youtube_assets y ON y.track_id=t.id WHERE y.file_exists=1 AND y.status='downloaded'").fetchall():
+                    local_satisfaction(config,con,track,cache=cache,persist=True)
+        # Compare location spellings without resolving symlinks or rewriting provenance.
+        current_paths = {os.path.abspath(path) for path in audio_paths(config.music_dir)}
         known_local = list(
             con.execute(
                 "SELECT * FROM youtube_assets WHERE file_exists = 1 AND status = 'downloaded' AND file_path IS NOT NULL"
             )
         )
-        missing_known_local_count = sum(1 for asset in known_local if asset["file_path"] not in current_paths)
+        confirmed_local = [asset for asset in known_local if association_allows_absence(con,asset)]
+        missing_known_local_count = sum(1 for asset in confirmed_local if os.path.abspath(asset["file_path"]) not in current_paths)
         local_refusal = _local_scan_guard(
             config,
             con,
@@ -410,7 +427,7 @@ def reconcile(
             summary.refused.append(f"local: {local_refusal}")
         else:
             for asset in known_local:
-                if asset["file_path"] in current_paths:
+                if os.path.abspath(asset["file_path"]) in current_paths:
                     if apply and asset["suspected_missing_at"]:
                         with transaction(con):
                             con.execute(
@@ -425,6 +442,8 @@ def reconcile(
                                 {"file_path": asset["file_path"]},
                                 dedupe_key=f"local_delete_suspicion_cleared:{asset['track_id']}:{asset['id']}",
                             )
+                    continue
+                if not association_allows_absence(con,asset):
                     continue
                 summary.planned.append(PlannedAction(asset["track_id"], "local_deleted", asset["file_path"]))
                 if not apply:
@@ -455,13 +474,15 @@ def reconcile(
                         },
                         dedupe_key=f"local_file_deleted_by_user:{asset['track_id']}:{asset['id']}",
                     )
-                    mark_excluded(con, track_id=asset["track_id"], source="local_deleted", reason="local file missing")
-                    _cascade_spotify(con, config, asset["track_id"], summary, spotify_client)
+                    still_local=any(other['track_id']==asset['track_id'] and other['id']!=asset['id'] and os.path.abspath(other['file_path']) in current_paths for other in confirmed_local)
+                    if not still_local:
+                        mark_excluded(con, track_id=asset["track_id"], source="local_deleted", reason="local file missing")
+                        _cascade_spotify(con, config, asset["track_id"], summary, spotify_client)
                     con.execute(
                         "UPDATE youtube_assets SET file_exists = 0, status = 'deleted', updated_at = ? WHERE id = ?",
                         (now_utc(), asset["id"]),
                     )
-                    summary.excluded_local += 1
+                    summary.excluded_local += int(not still_local)
             if apply:
                 with transaction(con):
                     _cascade_excluded_local(con, config, summary)

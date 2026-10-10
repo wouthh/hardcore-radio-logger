@@ -194,7 +194,8 @@ def verify_output(config, candidate, path, source_artist, source_title, receipt=
     if tags.get("artist") and tags.get("title"):
         tagged = YouTubeCandidate(title=f"{tags['artist']} - {tags['title']}", url=candidate.url,
                                   video_id=candidate.video_id, channel="", duration=round(duration),
-                                  artist=str(tags["artist"]), track=str(tags["title"]))
+                                  artist=str(tags["artist"]), track=str(tags["title"]),
+                                  artist_names=actual.artist_names)
         _metadata_decision(config, source_artist, source_title, tagged)
     return {"video_id": candidate.video_id, "path": str(path), "duration": duration,
             "title": title, "artist": artist, "receipt": receipt}

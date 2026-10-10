@@ -84,6 +84,33 @@ def test_structured_credits_allow_title_only_video():
     assert result.accepted and result.score == 1.0
 
 
+def test_structured_three_credits_corroborate_reordered_comma_and_ampersand_displays():
+    result=evaluate_candidate('North Tone & Orbit & Signal MC','Infinity',
+        video('Orbit, Signal MC, North Tone - Infinity',artist='North Tone, Orbit, Signal MC',
+              artist_names=('North Tone','Signal MC','Orbit'),track='Infinity'))
+    assert result.accepted and result.score==1
+
+
+@pytest.mark.parametrize('raw', ['North Tone, Other Artist, Orbit', 'North Tone, Orbit',
+    'North Tone, Signal MC, Orbit, Extra Artist', 'North Tone, Signal MC, Orbit, Orbit'])
+@pytest.mark.parametrize('field', ['artist','heading'])
+def test_structured_names_cannot_hide_wrong_missing_extra_or_duplicate_visible_credit(raw,field):
+    kwargs=dict(artist='North Tone, Signal MC, Orbit',artist_names=('North Tone','Signal MC','Orbit'),track='Infinity')
+    heading='North Tone, Signal MC, Orbit'
+    if field=='artist': kwargs['artist']=raw
+    else: heading=raw
+    result=evaluate_candidate('North Tone & Orbit & Signal MC','Infinity',video(f'{heading} - Infinity',**kwargs))
+    assert not result.accepted and result.reason=='metadata_conflict'
+
+
+@pytest.mark.parametrize('name,display', [('Signal & Noise','Signal, Noise'),('Earth, Wind & Fire','Earth & Wind & Fire')])
+def test_structured_compound_credit_is_not_expanded_into_separate_people(name,display):
+    valid=evaluate_candidate(name,'Infinity',video(f'{name} - Infinity',artist_names=(name,)))
+    assert valid.accepted
+    invalid=evaluate_candidate(name,'Infinity',video(f'{display} - Infinity',artist_names=(name,)))
+    assert not invalid.accepted and invalid.reason=='metadata_conflict'
+
+
 @pytest.mark.parametrize('kwargs,reason', [({'is_live': True}, 'live'), ({'duration': None}, 'duration'),
     ({'duration': 119}, 'duration'), ({'duration': 481}, 'duration'), ({'duration': True}, 'duration'),
     ({'duration': float('nan')}, 'duration'), ({'description': 'full DJ set compilation'}, 'bad_video')])

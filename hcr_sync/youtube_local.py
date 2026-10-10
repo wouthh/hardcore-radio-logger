@@ -5,7 +5,36 @@ import json
 from .db import get_state, set_state
 from .identity import duplicate_title_tokens
 from .local_files import inspect_audio_file, _tag_values
-from .youtube_matching import compare_recordings, _title
+from .youtube_matching import compare_recordings, evaluate_candidate, _title
+from .youtube_adapter import YouTubeCandidate
+from .youtube_queue import source_fingerprint
+
+
+def _completed_credits(con, asset, item, owner):
+    if not asset['youtube_video_id'] or not item or item.youtube_video_id != asset['youtube_video_id']:
+        return ()
+    if owner is None:
+        return ()
+    for work in con.execute("SELECT payload_json FROM youtube_pending_work WHERE state='completed' AND track_id=? AND video_id=? AND output_path=? ORDER BY updated_at DESC,work_id",
+                            (owner['id'],asset['youtube_video_id'],asset['file_path'])):
+        try:
+            payload=json.loads(work['payload_json'])
+        except (json.JSONDecodeError,TypeError):
+            continue
+        if not isinstance(payload,dict) or payload.get('fingerprint') != source_fingerprint(owner) or payload.get('source_artist') != owner['display_artist'] or payload.get('source_title') != owner['display_title']:
+            continue
+        candidate=payload.get('candidate')
+        if not isinstance(candidate,dict) or candidate.get('video_id') != asset['youtube_video_id']:
+            continue
+        names=candidate.get('artist_names')
+        if isinstance(names,(list,tuple)) and names and all(isinstance(name,str) and name.strip() for name in names):
+            try:
+                recording=YouTubeCandidate(**candidate)
+            except TypeError:
+                continue
+            if evaluate_candidate(owner['display_artist'],owner['display_title'],recording).accepted:
+                return tuple(names)
+    return ()
 
 
 def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=None, persist=False):
@@ -45,14 +74,20 @@ def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=No
         # Full version/credit checks are needed only for plausible cross-source files.
         if not own and not plausible:
             continue
+        owner=con.execute('SELECT * FROM tracks WHERE id=?',(row['track_id'],)).fetchone()
+        credit_key = ('completed_credits', row['id'], row['track_id'], row['youtube_video_id'], key,
+                      source_fingerprint(owner) if owner else None)
+        if credit_key not in cache:
+            cache[credit_key] = _completed_credits(con,row,item,owner)
+        credits = cache[credit_key]
         status = 'different'
         if item and item.artist and item.title:
-            decision = compare_recordings(track['display_artist'], track['display_title'], item.artist, item.title)
+            decision = compare_recordings(track['display_artist'], track['display_title'], item.artist, item.title, artist_names=credits)
             if decision.accepted:
                 status = 'satisfied'
-                if tags[0] and tags[1] and not compare_recordings(track['display_artist'],track['display_title'],*tags).accepted:
+                if tags[0] and tags[1] and not compare_recordings(track['display_artist'],track['display_title'],*tags,artist_names=credits).accepted:
                     status = 'ambiguous'
-            elif decision.reason in {'artist_evidence', 'ambiguous_credits', 'missing_artist'}:
+            elif decision.reason in {'artist_evidence', 'ambiguous_credits', 'missing_artist', 'metadata_conflict'}:
                 # Only plausible title evidence can hold unrelated sources.
                 if own or plausible:
                     status = 'ambiguous'

@@ -1,5 +1,5 @@
 """Real disposable audio proves staged output and crash-safe publication."""
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 import os
 import shutil
@@ -187,6 +187,56 @@ def test_truncated_audio_cannot_use_original_duration_header(setup):
     output.write_bytes(raw[:len(raw) // 2])
     with pytest.raises(UnsafeDownloadOutput):
         verify_output(config, CANDIDATE, output, 'Artist', 'Song', receipt)
+
+
+def three_credit_output(config,audio,tag_artist='North Tone, Signal MC, Orbit',tag_title='Infinity'):
+    candidate=replace(CANDIDATE,title='North Tone, Signal MC, Orbit - Infinity',artist='North Tone, Signal MC, Orbit',
+                      artist_names=('North Tone','Signal MC','Orbit'),track='Infinity')
+    tagged=audio.parent/'tagged.mp3'
+    subprocess.run(['ffmpeg','-v','error','-i',str(audio),'-c:a','copy','-metadata',f'artist={tag_artist}',
+                    '-metadata',f'title={tag_title}',str(tagged)],check=True,timeout=15)
+    path=prepare_download(config,'job1')/'output.mp3'
+    shutil.copyfile(tagged,path)
+    receipt={'video_id':candidate.video_id,'title':candidate.title,'artist':candidate.artist,
+             'artist_names':candidate.artist_names,'track':candidate.track,'duration':125,'filepath':str(path)}
+    (path.parent/'receipt.jsonl').write_text(json.dumps(receipt)+'\n')
+    with connect(config) as con,transaction(con):
+        con.execute('UPDATE youtube_pending_work SET stage_dir=?,output_path=?',(str(path.parent),str(path)))
+    return candidate,path,receipt
+
+
+def test_three_verified_credits_publish_and_satisfy_second_run_without_new_provider_work(setup):
+    from hcr_sync.db import upsert_youtube_asset
+    from hcr_sync.youtube_queue import source_fingerprint
+    from hcr_sync.youtube_sync import sync_youtube
+    config,audio=setup
+    candidate,path,receipt=three_credit_output(config,audio)
+    artist='North Tone & Orbit & Signal MC'
+    assert verify_output(config,candidate,path,artist,'Infinity',receipt)['artist']==candidate.artist
+    published=publish_output(config,candidate,work(config),artist,'Infinity')
+    with connect(config) as con,transaction(con):
+        con.execute("UPDATE tracks SET status='excluded'")
+        source=ensure_track(con,artist=artist,title='Infinity')
+        payload={'candidate':asdict(candidate),'source_artist':artist,'source_title':'Infinity',
+                 'fingerprint':source_fingerprint(source)}
+        con.execute("UPDATE youtube_pending_work SET state='completed',track_id=?,payload_json=?",(source['id'],json.dumps(payload)))
+        upsert_youtube_asset(con,track_id=source['id'],youtube_video_id=candidate.video_id,file_path=str(published),
+                             file_exists=True,status='downloaded',match_confidence=1)
+    class NoProvider:
+        def search(self,*args): pytest.fail('verified local output must satisfy without search')
+        def download(self,*args): pytest.fail('verified local output must satisfy without download')
+    assert sync_youtube(config,apply=True,client=NoProvider()).already_local==1
+    assert sync_youtube(config,apply=True,client=NoProvider()).already_local==1
+
+
+@pytest.mark.parametrize('tag_artist,tag_title', [('North Tone, Other Artist, Orbit','Infinity'),
+    ('North Tone, Orbit','Infinity'),('North Tone, Signal MC, Orbit, Extra Artist','Infinity'),
+    ('North Tone, Signal MC, Orbit','Infinity (Other Remix)')])
+def test_receipt_credit_list_cannot_hide_conflicting_real_mp3_tags(setup,tag_artist,tag_title):
+    config,audio=setup
+    candidate,path,receipt=three_credit_output(config,audio,tag_artist,tag_title)
+    with pytest.raises(UnsafeDownloadOutput,match='requested recording'):
+        verify_output(config,candidate,path,'North Tone & Orbit & Signal MC','Infinity',receipt)
 
 
 def test_crash_before_link_rejects_compatible_destination_with_different_inode(setup, monkeypatch):

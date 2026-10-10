@@ -353,3 +353,62 @@ def test_configured_threshold_is_shared_by_verified_completion_local_tags_and_ca
     config.values['HCR_YOUTUBE_MATCH_THRESHOLD']='0.50'
     with connect(config) as con:
         assert local_satisfaction(config,con,source)[0]=='ambiguous'
+
+
+@pytest.mark.parametrize('current_threshold,legacy', [('.88',False),('.90',False),('.95',False),('.88',True)])
+def test_reconcile_absence_requires_the_threshold_that_verified_local_audio(setup,current_threshold,legacy):
+    from hcr_sync.db import get_state, set_state, upsert_youtube_asset
+    from hcr_sync.reconcile import reconcile
+    from hcr_sync.youtube_local import local_satisfaction
+    from hcr_sync.youtube_matching import evaluate_candidate
+    config,audio=setup
+    source_title='Silver Midnight Signals Drift Transformation'
+    recording_title='Silver Midnight Signals Drift'
+    candidate=replace(CANDIDATE,title=f'Artist - {recording_title}',artist='Artist',
+                      artist_names=('Artist',),track=recording_title)
+    decision=evaluate_candidate('Artist',source_title,candidate,threshold=.88)
+    assert decision.accepted and decision.score==pytest.approx(.89)
+    assert not evaluate_candidate('Artist',source_title,candidate,threshold=.90).accepted
+    path=config.music_dir/f'Artist - {recording_title} [{candidate.video_id}].mp3'
+    subprocess.run(['ffmpeg','-v','error','-i',str(audio),'-c:a','copy','-metadata',f'title={recording_title}',str(path)],
+                   check=True,timeout=15)
+    # Keep the scan healthy independently of the removed association.
+    present=config.music_dir/'Unrelated - Present.mp3'
+    shutil.copyfile(audio,present)
+    config.values['HCR_YOUTUBE_MATCH_THRESHOLD']='.88'
+    with connect(config) as con,transaction(con):
+        source=ensure_track(con,artist='Artist',title=source_title)
+        upsert_youtube_asset(con,track_id=source['id'],youtube_video_id=candidate.video_id,file_path=str(path),
+                             file_exists=True,status='downloaded',match_confidence=decision.score)
+        assert local_satisfaction(config,con,source,persist=True)[0]=='satisfied'
+        asset=con.execute('SELECT * FROM youtube_assets WHERE track_id=?',(source['id'],)).fetchone()
+        evidence_key=f'youtube_local_evidence:{asset["id"]}'
+        evidence=json.loads(get_state(con,evidence_key))
+        assert evidence['threshold']==.88
+        if legacy:
+            evidence.pop('threshold')
+            set_state(con,evidence_key,json.dumps(evidence))
+        set_state(con,'local_baseline_complete','true')
+        set_state(con,'last_local_scan_count','1')
+    path.unlink()
+    config.values['HCR_YOUTUBE_MATCH_THRESHOLD']=current_threshold
+    first=reconcile(config,apply=True,skip_spotify=True)
+    second=reconcile(config,apply=True,skip_spotify=True)
+    assert not first.refused and not second.refused
+    authorized=current_threshold=='.88' and not legacy
+    assert first.suspected_local==int(authorized)
+    assert second.suspected_local==0
+    assert second.excluded_local==int(authorized)
+    assert bool(first.planned)==bool(second.planned)==authorized
+    with connect(config) as con:
+        assert con.execute('SELECT status FROM tracks WHERE id=?',(source['id'],)).fetchone()[0]==('excluded' if authorized else 'wanted')
+        asset=con.execute('SELECT * FROM youtube_assets WHERE track_id=?',(source['id'],)).fetchone()
+        if not authorized:
+            assert asset['suspected_missing_at'] is None and asset['file_exists']==1
+            assert asset['status']=='downloaded' and asset['match_confidence']==decision.score
+            assert not con.execute('SELECT 1 FROM exclusions WHERE track_id=?',(source['id'],)).fetchone()
+            assert not con.execute("SELECT 1 FROM events WHERE event_type IN ('suspected_local_delete','local_file_deleted_by_user','local_file_deleted','local_file_moved_to_trash')").fetchone()
+        else:
+            assert asset['file_exists']==0 and asset['status']=='deleted'
+        assert json.loads(get_state(con,evidence_key))==evidence
+    assert present.is_file()

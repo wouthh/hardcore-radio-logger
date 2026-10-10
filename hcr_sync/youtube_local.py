@@ -55,7 +55,7 @@ def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=No
             if row['track_id']==track['id']:
                 ambiguous=row
                 if persist:
-                    set_state(con,f'youtube_local_evidence:{row["id"]}',json.dumps({'status':'ambiguous','source':[track['display_artist'],track['display_title']]}))
+                    set_state(con,f'youtube_local_evidence:{row["id"]}',json.dumps({'status':'ambiguous','threshold':threshold,'source':[track['display_artist'],track['display_title']]}))
             continue
         if not path.is_file():
             continue
@@ -106,7 +106,7 @@ def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=No
         elif own or (item and plausible):
             status = 'ambiguous'
         if persist and own:
-            evidence = {'status': status, 'artist': artist, 'title': title, 'source': [track['display_artist'],track['display_title']], 'stat': list(key)}
+            evidence = {'status': status, 'threshold': threshold, 'artist': artist, 'title': title, 'source': [track['display_artist'],track['display_title']], 'stat': list(key)}
             set_state(con, f'youtube_local_evidence:{row["id"]}', json.dumps(evidence, separators=(',',':')))
         if status == 'satisfied':
             satisfied = row
@@ -123,17 +123,17 @@ def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=No
     return ('different', different) if different is not None else ('none', None)
 
 
-def association_allows_absence(con, asset):
+def association_allows_absence(config, con, asset):
     """Negative inspection evidence must not become a destructive removal vote."""
     evidence = get_state(con, f'youtube_local_evidence:{asset["id"]}')
     if evidence:
         evidence=json.loads(evidence)
         track=con.execute('SELECT display_artist,display_title FROM tracks WHERE id=?',(asset['track_id'],)).fetchone()
-        return bool(track and evidence.get('status') == 'satisfied' and evidence.get('source') == [track['display_artist'],track['display_title']])
+        return bool(track and evidence.get('status') == 'satisfied' and evidence.get('threshold') == config.float('HCR_YOUTUBE_MATCH_THRESHOLD') and evidence.get('source') == [track['display_artist'],track['display_title']])
     return False  # A legacy association alone cannot authorize destructive absence.
 
 
-def association_is_different(con,asset):
+def association_is_different(config,con,asset):
     evidence=json.loads(get_state(con,f'youtube_local_evidence:{asset["id"]}','{}'))
     track=con.execute('SELECT display_artist,display_title FROM tracks WHERE id=?',(asset['track_id'],)).fetchone()
-    return bool(track and evidence.get('status')=='different' and evidence.get('source')==[track['display_artist'],track['display_title']])
+    return bool(track and evidence.get('status')=='different' and evidence.get('threshold') == config.float('HCR_YOUTUBE_MATCH_THRESHOLD') and evidence.get('source')==[track['display_artist'],track['display_title']])

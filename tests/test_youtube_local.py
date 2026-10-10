@@ -132,7 +132,7 @@ def test_actual_local_metadata_controls_satisfaction_even_for_own_association(tm
     status, asset = satisfaction(config, source_id, persist=True)
     assert status == expected and asset is not None
     with connect(config) as con:
-        assert association_allows_absence(con, asset) is (expected == 'satisfied')
+        assert association_allows_absence(config, con, asset) is (expected == 'satisfied')
         assert con.execute('SELECT status FROM tracks WHERE id=?', (source_id,)).fetchone()[0] == 'wanted'
     assert path.exists()
 
@@ -353,3 +353,32 @@ def test_relative_music_directory_still_confirms_genuinely_missing_verified_asse
         assert con.execute('SELECT status FROM tracks WHERE id=?', (source_id,)).fetchone()[0] == 'excluded'
         asset = con.execute('SELECT * FROM youtube_assets WHERE track_id=?', (source_id,)).fetchone()
         assert asset['file_exists'] == 0 and asset['status'] == 'deleted'
+
+
+def test_saved_different_evidence_cannot_authorize_missing_file_after_threshold_change(tmp_path):
+    from hcr_sync.youtube_local import association_is_different
+    from hcr_sync.youtube_sync import _current_authorized
+    from hcr_sync.youtube_queue import source_fingerprint
+    config,source_id,_,path=seed(tmp_path,'Synthetic Artist - Night Signal (Other Remix) [local123456].mp3')
+    with connect(config) as con,transaction(con):
+        source=con.execute('SELECT * FROM tracks WHERE id=?',(source_id,)).fetchone()
+        assert local_satisfaction(config,con,source,persist=True)[0]=='different'
+        asset=con.execute('SELECT * FROM youtube_assets WHERE track_id=?',(source_id,)).fetchone()
+        row={'track_id':source_id,'source_fingerprint':source_fingerprint(source)}
+    path.unlink()
+    with connect(config) as con:
+        assert association_is_different(config,con,asset)
+        assert _current_authorized(config,con,row)
+        config.values['HCR_YOUTUBE_MATCH_THRESHOLD']='.95'
+        assert not association_is_different(config,con,asset)
+        assert not _current_authorized(config,con,row)
+        # Older unbound decisions also preserve the missing-file hold.
+        config.values['HCR_YOUTUBE_MATCH_THRESHOLD']='.90'
+        from hcr_sync.db import get_state
+        import json
+        key=f'youtube_local_evidence:{asset["id"]}'
+        evidence=json.loads(get_state(con,key))
+        evidence.pop('threshold')
+        set_state(con,key,json.dumps(evidence))
+        assert not association_is_different(config,con,asset)
+        assert not _current_authorized(config,con,row)

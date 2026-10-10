@@ -78,6 +78,7 @@ class SpotifyTrack:
     album: str = ""
     isrc: str = ""
     metadata_ambiguous: bool = False
+    artist_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -114,6 +115,7 @@ def _spotify_track_from_playlist_item(item: dict) -> SpotifyTrack | None:
         title=title,
         duration_ms=track.get("duration_ms"),
         artist_ids=tuple(str(item["id"]) for item in artists if item.get("id")),
+        artist_names=tuple(str(item.get("name") or "") for item in artists),
         album=str((track.get("album") or {}).get("name") or ""),
         isrc=str((track.get("external_ids") or {}).get("isrc") or ""),
         metadata_ambiguous=not title or not artist,

@@ -317,6 +317,7 @@ def test_playlist_item_parser_accepts_spotify_item_shape():
         artist="Artist",
         title="Song",
         duration_ms=180000,
+        artist_names=("Artist",),
     )
 
 
@@ -627,7 +628,7 @@ def test_spotify_sync_rejects_named_remix_when_source_is_not_remix(tmp_path):
     assert asset is not None
 
 
-def test_spotify_sync_allows_bracketed_subtitle_when_core_title_matches(tmp_path):
+def test_spotify_sync_retains_unmatched_bracketed_qualifier(tmp_path):
     config = make_config(tmp_path)
     init_db(config)
     client = FakeSpotify(search_tracks=[SpotifyTrack(uri="spotify:track:mind", track_id="mind", artist="Drokz", title="The Mind (Signs Of Life)")])
@@ -637,8 +638,9 @@ def test_spotify_sync_allows_bracketed_subtitle_when_core_title_matches(tmp_path
 
     summary = sync_spotify(config, apply=True, client=client)
 
-    assert summary.added == 1
-    assert client.added == ["spotify:track:mind"]
+    assert summary.added == 0
+    assert summary.review == 1
+    assert client.added == []
 
 
 def test_spotify_sync_skips_existing_review_asset_without_search(tmp_path):
@@ -731,7 +733,7 @@ def test_spotify_sync_does_not_readd_removed_tentative_match(tmp_path):
     assert client.added == []
 
 
-def test_spotify_sync_retries_old_review_once_then_keeps_terminal_review(tmp_path):
+def test_spotify_sync_retries_old_review_then_defers_unrelated_artist(tmp_path):
     config = make_config(tmp_path, HCR_SPOTIFY_TENTATIVE_ADD_THRESHOLD="0.85")
     init_db(config)
     low_match = SpotifyTrack(uri="spotify:track:low", track_id="low", artist="Other", title="Title")
@@ -765,7 +767,7 @@ def test_spotify_sync_retries_old_review_once_then_keeps_terminal_review(tmp_pat
         payload = json.loads(con.execute("SELECT payload_json FROM events WHERE event_type = 'ambiguous_spotify_match'").fetchone()["payload_json"])
         assert payload["reason"] == "below tentative threshold or not found"
         assert payload["match_status"] == "review"
-        assert payload["score"] == 0.55
+        assert payload["score"] == 0.0
 
 
 def test_spotify_sync_respects_per_run_limit(tmp_path):

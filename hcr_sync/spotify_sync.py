@@ -25,12 +25,13 @@ from .db import (
 from .identity import (
     canonical_key,
     compact_text,
-    duplicate_title_tokens,
+    token_set,
     likely_same_recording,
     match_confidence,
     normalize_for_match,
     radio_metadata_placeholder,
 )
+from .spotify_matching import comparison_artists, comparison_title, compatible_titles
 
 NON_TRACK_RE = re.compile(
     r"\b("
@@ -52,7 +53,6 @@ GENERIC_VERSION_SUFFIX_RE = re.compile(
     r"\s+-\s+(?:original|extended|radio|radio edit|edit|album|single|full)(?:\s+(?:mix|version|edit))?$",
     re.I,
 )
-REMIX_RE = re.compile(r"\bremix\b", re.I)
 MAIN_ARTIST_SPLIT_RE = re.compile(r"\s+(?:&|\+|x|and|vs\.?|feat\.?|ft\.?|featuring)\s+|[,/|]", re.I)
 SPOTIFY_FIRST_RETRY_DAYS = 7
 SPOTIFY_STEADY_RETRY_DAYS = 14
@@ -156,21 +156,26 @@ def _spotify_search_queries(artist: str, title: str) -> list[str]:
 def _spotify_match_score(track, candidate: SpotifyTrack) -> float:
     if looks_like_non_track(candidate.artist, candidate.title):
         return 0.0
-    source_tokens = duplicate_title_tokens(track["display_title"])
-    candidate_tokens = duplicate_title_tokens(_core_spotify_title(candidate.title))
+    source_title = comparison_title(track["display_title"])
+    candidate_title = comparison_title(candidate.title)
+    if not compatible_titles(source_title, candidate_title):
+        return 0.0
+    artists = comparison_artists(track["display_artist"], candidate.artist, candidate.artist_names)
+    if artists is None:
+        return 0.0
+    source_tokens = token_set(source_title.base)
+    candidate_tokens = token_set(candidate_title.base)
     if not source_tokens or not candidate_tokens:
         return 0.0
     overlap = len(source_tokens & candidate_tokens) / max(1, len(source_tokens))
     reverse_overlap = len(source_tokens & candidate_tokens) / max(1, len(candidate_tokens))
     if overlap < 0.75 or reverse_overlap < 0.75:
         return 0.0
-    if REMIX_RE.search(candidate.title) and not REMIX_RE.search(track["display_title"]):
-        return 0.0
     return match_confidence(
-        artist=track["display_artist"],
-        title=track["display_title"],
-        candidate_artist=candidate.artist,
-        candidate_title=candidate.title,
+        artist=artists[0],
+        title=source_title.text,
+        candidate_artist=artists[1],
+        candidate_title=candidate_title.text,
     )
 
 

@@ -189,11 +189,47 @@ CREATE TABLE IF NOT EXISTS spotify_pending_work (
 """
 
 
+YOUTUBE_QUEUE_SCHEMA = (
+    """CREATE TABLE IF NOT EXISTS youtube_schedule (
+        track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE RESTRICT,
+        source_fingerprint TEXT NOT NULL,
+        phase TEXT NOT NULL DEFAULT 'first_search',
+        next_eligible_at TEXT NOT NULL,
+        search_attempts INTEGER NOT NULL DEFAULT 0,
+        download_attempts INTEGER NOT NULL DEFAULT 0,
+        unsuccessful_matches INTEGER NOT NULL DEFAULT 0,
+        search_failures INTEGER NOT NULL DEFAULT 0,
+        download_failures INTEGER NOT NULL DEFAULT 0,
+        last_search_at TEXT, last_download_at TEXT,
+        candidate_json TEXT, candidate_at TEXT, hold_origin TEXT,
+        legacy_evidence_at TEXT, decision_json TEXT, updated_at TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS youtube_pending_work (
+        work_id TEXT PRIMARY KEY,
+        track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE RESTRICT,
+        video_id TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'prepared',
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        process_pid INTEGER, process_start TEXT, stage_dir TEXT,
+        output_path TEXT, error_json TEXT
+    )""",
+    """CREATE UNIQUE INDEX IF NOT EXISTS idx_youtube_active_video
+        ON youtube_pending_work(video_id)
+        WHERE state NOT IN ('completed', 'cancelled')""",
+    "CREATE INDEX IF NOT EXISTS idx_youtube_due ON youtube_schedule(phase,next_eligible_at)",
+)
+
+
 def migrate_db(con: sqlite3.Connection) -> None:
     if not _table_exists(con, "spotify_assets"):
         return
 
+    for statement in YOUTUBE_QUEUE_SCHEMA:
+        con.execute(statement)
     con.execute(PENDING_WORK_SCHEMA)
+    if _table_exists(con, "schema_migrations"):
+        con.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (5, ?)", (now_utc(),))
     if _table_exists(con, "schema_migrations"):
         con.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (4, ?)", (now_utc(),))
 

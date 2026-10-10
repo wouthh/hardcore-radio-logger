@@ -94,3 +94,17 @@ def test_real_adapter_normalized_search_reaches_verified_download(setup):
         assert row['file_exists']==1 and row['match_confidence']==1
         assert con.execute('SELECT state FROM youtube_pending_work').fetchone()[0]=='completed'
         assert con.execute('SELECT search_attempts FROM youtube_schedule').fetchone()[0]==1
+
+
+def test_real_adapter_failed_search_is_counted_in_degraded_summary(setup):
+    config, audio = setup
+    with connect(config) as con, transaction(con):
+        con.execute('DELETE FROM youtube_pending_work')
+    executable = audio.parent / 'failed-search'
+    executable.write_text('#!/usr/bin/python3\nimport sys\nsys.exit(1)\n')
+    executable.chmod(0o700)
+    config.values['HCR_YTDLP_BIN'] = str(executable)
+    summary = sync_youtube(config, apply=True, client=YtDlpClient(config))
+    assert summary.searched == summary.search_invocations == 1
+    assert summary.download_starts == summary.downloaded == 0
+    assert summary.degraded and summary.deferred == 1

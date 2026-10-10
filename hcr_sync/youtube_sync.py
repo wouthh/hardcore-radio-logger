@@ -559,11 +559,11 @@ def sync_youtube(config: Config, *, apply: bool, client: YouTubeClientProtocol|N
                 else:
                     summary.downloaded+=int(completed)
                     summary.review+=int(not completed)
-            summary.search_invocations=client.search_invocations-initial_searches if isinstance(client,YtDlpClient) else summary.searched
-            if isinstance(client,YtDlpClient):
-                summary.download_starts=client.download_invocations-initial_downloads
             if probing:
                 break
+        summary.search_invocations=client.search_invocations-initial_searches if isinstance(client,YtDlpClient) else summary.searched
+        if isinstance(client,YtDlpClient):
+            summary.download_starts=client.download_invocations-initial_downloads
         summary.due=con.execute("SELECT COUNT(*) FROM youtube_schedule q JOIN tracks t ON t.id=q.track_id WHERE t.status='wanted' AND q.phase IN ('first_search','search_retry','download') AND q.next_eligible_at<=?",(stamp(now),)).fetchone()[0]
         summary.deferred=con.execute("SELECT COUNT(*) FROM youtube_schedule WHERE phase IN ('first_search','search_retry','download') AND next_eligible_at>?",(stamp(now),)).fetchone()[0]
         summary.pending=con.execute("SELECT COUNT(*) FROM youtube_pending_work WHERE state NOT IN ('completed','cancelled')").fetchone()[0]

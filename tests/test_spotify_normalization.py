@@ -92,6 +92,9 @@ def test_meaningful_version_conflicts_cannot_pass_long_shared_title(tmp_path, so
     ("Signal", "Signal & Noise", ("Signal & Noise",), False),
     ("Signal, Noise & Rhythm", "Signal, Noise & Rhythm", ("Signal, Noise & Rhythm",), True),
     ("Signal", "Signal, Noise & Rhythm", ("Signal, Noise & Rhythm",), False),
+    ("Signal & Noise & MC Rhythm", "Signal & Noise, MC Rhythm", ("Signal & Noise", "MC Rhythm"), True),
+    ("Signal, Noise & MC Rhythm", "Signal, Noise, MC Rhythm", ("Signal, Noise", "MC Rhythm"), True),
+    ("Signal & Noise & MC Rhythm", "Signal & Noise", ("Signal & Noise",), False),
     ("Synthetic Artist and MC Signal", "Synthetic Artist, MC Signal", ("Synthetic Artist", "MC Signal"), False),
     ("Synthetic Artist x MC Signal", "Synthetic Artist, MC Signal", ("Synthetic Artist", "MC Signal"), False),
 ])

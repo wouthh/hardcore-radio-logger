@@ -68,17 +68,21 @@ def comparison_artists(source: str, candidate: str, artist_names=()) -> tuple[st
     credits = tuple(normalize_for_match(name) for name in names)
     if not credits or any(not credit for credit in credits):
         return None
-    whole_source = normalize_for_match(source)
-    if whole_source in credits:
-        return whole_source, ' '.join(credits)
     source_credits = []
-    for group in re.split(r'\s*,\s*', source):
-        normalized = normalize_for_match(group)
-        if normalized in credits:
-            source_credits.append(normalized)
+    remaining = compact_text(source)
+    while remaining:
+        boundaries = [(match.start(), match.end()) for match in re.finditer(r',|\s+&\s+', remaining)]
+        # Consume a complete known compound credit before interpreting its
+        # internal punctuation as a separator between people.
+        for end, next_start in [(len(remaining), len(remaining)), *reversed(boundaries)]:
+            name = normalize_for_match(remaining[:end])
+            if name in credits:
+                source_credits.append(name)
+                remaining = remaining[next_start:].strip()
+                break
         else:
-            source_credits.extend(normalize_for_match(part) for part in re.split(r'\s+&\s+', group))
-    if not source_credits or any(not name or name not in credits for name in source_credits):
+            return None
+    if not source_credits:
         return None
     return ' '.join(source_credits), ' '.join(credits)
 

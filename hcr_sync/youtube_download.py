@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import time
+from dataclasses import asdict
 
 from .db import connect, now_utc, transaction
 from .youtube_adapter import YouTubeCandidate, YouTubeFailure, VIDEO_ID_RE, run_process
@@ -198,7 +199,7 @@ def verify_output(config, candidate, path, source_artist, source_title, receipt=
                                   artist_names=actual.artist_names)
         _metadata_decision(config, source_artist, source_title, tagged)
     return {"video_id": candidate.video_id, "path": str(path), "duration": duration,
-            "title": title, "artist": artist, "receipt": receipt}
+            "title": title, "artist": artist, "receipt": receipt, "verified_recording": asdict(actual)}
 
 
 def publish_output(config, candidate, work, source_artist, source_title) -> Path:
@@ -213,26 +214,29 @@ def publish_output(config, candidate, work, source_artist, source_title) -> Path
         # Legacy synthetic clients provide an exact, already published file.
         if receipt is not None:
             raise UnsafeDownloadOutput("Recorded download output is unexpected")
-        verify_output(config, candidate, source, source_artist, source_title)
-        return source
-    if source == target and target.exists():
+        verified = verify_output(config, candidate, source, source_artist, source_title)
+        target = source
+    elif source == target and target.exists():
         if work.get("stage_dir") or receipt is not None:
             staged_source = _inside(config, stage / "output.mp3")
             if not staged_source.is_file() or not os.path.samefile(staged_source, target):
                 raise UnsafeDownloadOutput("Published destination is not the staged hard link")
         # Explicit direct-output clients have no staged publication to recover.
-        verify_output(config, candidate, target, source_artist, source_title, receipt)
-        return target
-    source = stage / "output.mp3"
-    verify_output(config, candidate, source, source_artist, source_title, receipt)
-    if target.exists() and not os.path.samefile(source, target):
-        raise UnsafeDownloadOutput("Publication would overwrite an existing music file")
+        verified = verify_output(config, candidate, target, source_artist, source_title, receipt)
+    else:
+        source = stage / "output.mp3"
+        verified = verify_output(config, candidate, source, source_artist, source_title, receipt)
+        if target.exists() and not os.path.samefile(source, target):
+            raise UnsafeDownloadOutput("Publication would overwrite an existing music file")
     # Commit the deterministic destination before the atomic no-overwrite link.
     with connect(config) as con, transaction(con):
-        cursor = con.execute("UPDATE youtube_pending_work SET output_path=?,updated_at=? WHERE work_id=?",
-                             (str(target), now_utc(), work["work_id"]))
-        if cursor.rowcount != 1:
+        stored = con.execute("SELECT payload_json FROM youtube_pending_work WHERE work_id=?",(work['work_id'],)).fetchone()
+        if stored is None:
             raise UnsafeDownloadOutput("Publication has no durable work intent")
+        payload = json.loads(stored['payload_json'])
+        payload['verified_recording'] = verified['verified_recording']
+        con.execute("UPDATE youtube_pending_work SET output_path=?,payload_json=?,updated_at=? WHERE work_id=?",
+                    (str(target),json.dumps(payload),now_utc(),work['work_id']))
     if not target.exists():
         try:
             os.link(source, target, follow_symlinks=False)

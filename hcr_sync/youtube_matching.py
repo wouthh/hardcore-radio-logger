@@ -67,10 +67,10 @@ def compare_recordings(source_artist, source_title, candidate_artist, candidate_
         return decision
     credits = _credits(candidate_artist, artist_names)
     if artist_names and compact_text(candidate_artist):
-        visible = credited_names(candidate_artist, credits)
+        visible = credited_names(candidate_artist, credits, semicolon=True)
         if visible is None or Counter(visible) != Counter(normalize_for_match(name) for name in credits):
             return replace(decision, reason='metadata_conflict')
-    artists = comparison_artists(source_artist, candidate_artist, credits)
+    artists = comparison_artists(source_artist, candidate_artist, credits, semicolon=bool(artist_names))
     if artists is None:
         reason = 'ambiguous_credits' if any(separator in source_artist or separator in candidate_artist
                     for separator in (' & ', ',')) else 'artist_evidence'

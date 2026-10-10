@@ -106,6 +106,8 @@ def test_crash_before_or_after_publication_recovers_exact_destination(setup, mon
         publish_output(config, CANDIDATE, work(config), 'Artist', 'Song')
     recorded = work(config)
     assert recorded['output_path'] == str(config.music_dir / 'Artist - Song [abcdefghijk].mp3')
+    assert json.loads(recorded['payload_json'])['verified_recording']['video_id']==CANDIDATE.video_id
+    assert json.loads(recorded['payload_json'])['candidate']==json.loads(json.dumps(asdict(CANDIDATE)))
     monkeypatch.setattr('hcr_sync.youtube_download.os.link', real_link)
     result = publish_output(config, CANDIDATE, recorded, 'Artist', 'Song')
     assert result.exists() and os.path.samefile(source, result)
@@ -178,6 +180,7 @@ def test_legacy_exact_attributed_file_uses_real_audio_tags(setup):
     recorded = work(config)
     recorded['output_path'] = str(output)
     assert publish_output(config, CANDIDATE, recorded, 'Artist', 'Song') == output
+    assert json.loads(work(config)['payload_json'])['verified_recording']['artist']=='Artist'
 
 
 def test_truncated_audio_cannot_use_original_duration_header(setup):
@@ -205,21 +208,39 @@ def three_credit_output(config,audio,tag_artist='North Tone, Signal MC, Orbit',t
     return candidate,path,receipt
 
 
-def test_three_verified_credits_publish_and_satisfy_second_run_without_new_provider_work(setup):
+@pytest.mark.parametrize('stale_search', [False,True])
+@pytest.mark.parametrize('tag_separator', [', ','; '])
+def test_three_verified_credits_publish_and_satisfy_second_run_without_new_provider_work(setup,stale_search,tag_separator):
     from hcr_sync.db import upsert_youtube_asset
     from hcr_sync.youtube_queue import source_fingerprint
     from hcr_sync.youtube_sync import sync_youtube
+    from hcr_sync.youtube_matching import evaluate_candidate
     config,audio=setup
-    candidate,path,receipt=three_credit_output(config,audio)
-    artist='North Tone & Orbit & Signal MC'
-    assert verify_output(config,candidate,path,artist,'Infinity',receipt)['artist']==candidate.artist
-    published=publish_output(config,candidate,work(config),artist,'Infinity')
+    candidate,path,receipt=three_credit_output(config,audio,tag_separator.join(('North Tone','Signal MC','Orbit')))
+    artist='North Tone & Signal MC' if stale_search else 'North Tone & Orbit & Signal MC'
+    selected=replace(candidate,artist_names=('North Tone','Signal MC'),artist='North Tone, Signal MC',title='North Tone, Signal MC - Infinity') if stale_search else candidate
+    assert evaluate_candidate(artist,'Infinity',selected).accepted
+    assert evaluate_candidate(artist,'Infinity',candidate).accepted
+    assert verify_output(config,selected,path,artist,'Infinity',receipt)['artist']==candidate.artist
     with connect(config) as con,transaction(con):
         con.execute("UPDATE tracks SET status='excluded'")
         source=ensure_track(con,artist=artist,title='Infinity')
-        payload={'candidate':asdict(candidate),'source_artist':artist,'source_title':'Infinity',
+        payload={'candidate':asdict(selected),'source_artist':artist,'source_title':'Infinity',
                  'fingerprint':source_fingerprint(source)}
-        con.execute("UPDATE youtube_pending_work SET state='completed',track_id=?,payload_json=?",(source['id'],json.dumps(payload)))
+        con.execute("UPDATE youtube_pending_work SET track_id=?,payload_json=?",(source['id'],json.dumps(payload)))
+    published=publish_output(config,selected,work(config),artist,'Infinity')
+    stored=json.loads(work(config)['payload_json'])
+    assert stored['candidate']==json.loads(json.dumps(asdict(selected)))
+    assert stored['verified_recording']['artist_names']==['North Tone','Signal MC','Orbit']
+    if tag_separator=='; ':
+        from mutagen.easyid3 import EasyID3
+        tags=EasyID3(published)
+        tags['artist']=['North Tone','Signal MC','Orbit']
+        tags.save(v2_version=4)
+        from hcr_sync.local_files import _tag_values
+        assert _tag_values(published)[0]=='North Tone; Signal MC; Orbit'
+    with connect(config) as con,transaction(con):
+        con.execute("UPDATE youtube_pending_work SET state='completed'")
         upsert_youtube_asset(con,track_id=source['id'],youtube_video_id=candidate.video_id,file_path=str(published),
                              file_exists=True,status='downloaded',match_confidence=1)
     class NoProvider:
@@ -227,11 +248,18 @@ def test_three_verified_credits_publish_and_satisfy_second_run_without_new_provi
         def download(self,*args): pytest.fail('verified local output must satisfy without download')
     assert sync_youtube(config,apply=True,client=NoProvider()).already_local==1
     assert sync_youtube(config,apply=True,client=NoProvider()).already_local==1
+    from hcr_sync.db import get_state
+    with connect(config) as con:
+        asset=con.execute('SELECT id FROM youtube_assets WHERE track_id=?',(source['id'],)).fetchone()
+        evidence=json.loads(get_state(con,f'youtube_local_evidence:{asset["id"]}'))
+        assert evidence['artist']==tag_separator.join(('North Tone','Signal MC','Orbit'))
+        assert evidence['title']=='Infinity'
 
 
 @pytest.mark.parametrize('tag_artist,tag_title', [('North Tone, Other Artist, Orbit','Infinity'),
     ('North Tone, Orbit','Infinity'),('North Tone, Signal MC, Orbit, Extra Artist','Infinity'),
-    ('North Tone, Signal MC, Orbit','Infinity (Other Remix)')])
+    ('North Tone, Signal MC, Orbit','Infinity (Other Remix)'),
+    ('North Tone; Other Artist; Orbit','Infinity'),('North Tone; Signal MC; Orbit; Extra Artist','Infinity')])
 def test_receipt_credit_list_cannot_hide_conflicting_real_mp3_tags(setup,tag_artist,tag_title):
     config,audio=setup
     candidate,path,receipt=three_credit_output(config,audio,tag_artist,tag_title)

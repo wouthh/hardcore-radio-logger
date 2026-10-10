@@ -111,6 +111,24 @@ def test_structured_compound_credit_is_not_expanded_into_separate_people(name,di
     assert not invalid.accepted and invalid.reason=='metadata_conflict'
 
 
+@pytest.mark.parametrize('display,accepted', [('North Tone; Signal MC; Orbit',True),
+    ('North Tone; Other Artist; Orbit',False),('North Tone; Signal MC; Orbit; Extra Artist',False),
+    ('North Tone; Orbit',False)])
+def test_explicit_structured_credits_corroborate_semicolon_display_without_hiding_conflicts(display,accepted):
+    result=evaluate_candidate('North Tone & Orbit & Signal MC','Infinity',
+        video(f'{display} - Infinity',artist=display,artist_names=('North Tone','Signal MC','Orbit')))
+    assert result.accepted is accepted
+
+
+def test_known_semicolon_compound_name_remains_whole_and_spotify_parser_unchanged():
+    from hcr_sync.recording_comparison import comparison_artists,credited_names
+    assert credited_names('North; South; Orbit',('North; South','Orbit'),semicolon=True)==('north south','orbit')
+    assert comparison_artists('North; South','North, South',('North','South')) is None
+    assert credited_names('North; East; Orbit',('North; South','Orbit'),semicolon=True) is None
+    assert not evaluate_candidate('North; South & Orbit','Infinity',
+        video('North; Orbit - Infinity',artist_names=('North; South','Orbit'))).accepted
+
+
 @pytest.mark.parametrize('kwargs,reason', [({'is_live': True}, 'live'), ({'duration': None}, 'duration'),
     ({'duration': 119}, 'duration'), ({'duration': 481}, 'duration'), ({'duration': True}, 'duration'),
     ({'duration': float('nan')}, 'duration'), ({'description': 'full DJ set compilation'}, 'bad_video')])

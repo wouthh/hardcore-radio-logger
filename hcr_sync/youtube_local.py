@@ -23,7 +23,7 @@ def _completed_credits(con, asset, item, owner):
             continue
         if not isinstance(payload,dict) or payload.get('fingerprint') != source_fingerprint(owner) or payload.get('source_artist') != owner['display_artist'] or payload.get('source_title') != owner['display_title']:
             continue
-        candidate=payload.get('candidate')
+        candidate=payload.get('verified_recording')
         if not isinstance(candidate,dict) or candidate.get('video_id') != asset['youtube_video_id']:
             continue
         names=candidate.get('artist_names')
@@ -81,20 +81,31 @@ def local_satisfaction(config, con, track, *, require_youtube_id=False, cache=No
             cache[credit_key] = _completed_credits(con,row,item,owner)
         credits = cache[credit_key]
         status = 'different'
+        artist,title = (item.artist,item.title) if item else ('','')
         if item and item.artist and item.title:
-            decision = compare_recordings(track['display_artist'], track['display_title'], item.artist, item.title, artist_names=credits)
+            # Publication names are a projection of the source, which may have
+            # fewer credits than the actual accepted recording. Exact owner
+            # filenames can defer to present tags corroborated by verification.
+            source_projection = bool(credits and owner and item.artist==owner['display_artist'] and
+                                     item.title==owner['display_title'])
+            projected = bool(source_projection and tags[0] and tags[1])
+            if projected:
+                artist,title = tags
+            owner_tags_agree = not projected or compare_recordings(owner['display_artist'],owner['display_title'],
+                                                                   *tags,artist_names=credits).accepted
+            decision = compare_recordings(track['display_artist'], track['display_title'], artist, title, artist_names=credits)
             if decision.accepted:
-                status = 'satisfied'
+                status = 'ambiguous' if (source_projection and not projected) or not owner_tags_agree else 'satisfied'
                 if tags[0] and tags[1] and not compare_recordings(track['display_artist'],track['display_title'],*tags,artist_names=credits).accepted:
                     status = 'ambiguous'
-            elif decision.reason in {'artist_evidence', 'ambiguous_credits', 'missing_artist', 'metadata_conflict'}:
+            elif (projected and own) or not owner_tags_agree or decision.reason in {'artist_evidence', 'ambiguous_credits', 'missing_artist', 'metadata_conflict'}:
                 # Only plausible title evidence can hold unrelated sources.
                 if own or plausible:
                     status = 'ambiguous'
         elif own or (item and plausible):
             status = 'ambiguous'
         if persist and own:
-            evidence = {'status': status, 'artist': item.artist if item else '', 'title': item.title if item else '', 'source': [track['display_artist'],track['display_title']], 'stat': list(key)}
+            evidence = {'status': status, 'artist': artist, 'title': title, 'source': [track['display_artist'],track['display_title']], 'stat': list(key)}
             set_state(con, f'youtube_local_evidence:{row["id"]}', json.dumps(evidence, separators=(',',':')))
         if status == 'satisfied':
             satisfied = row

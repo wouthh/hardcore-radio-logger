@@ -62,7 +62,7 @@ def comparison_title(title: str) -> TitleComparison:
     return TitleComparison(normalize_for_match(title), tuple(sorted(set(versions))))
 
 
-def credited_names(text: str, artist_names) -> tuple[str, ...] | None:
+def credited_names(text: str, artist_names, *, semicolon=False) -> tuple[str, ...] | None:
     """Parse display punctuation against known whole credits, including compounds."""
     credits = tuple(normalize_for_match(name) for name in artist_names)
     if not credits or any(not credit for credit in credits):
@@ -70,7 +70,8 @@ def credited_names(text: str, artist_names) -> tuple[str, ...] | None:
     source_credits = []
     remaining = compact_text(text)
     while remaining:
-        boundaries = [(match.start(), match.end()) for match in re.finditer(r',|\s+&\s+', remaining)]
+        separators = r'[,;]|\s+&\s+' if semicolon else r',|\s+&\s+'
+        boundaries = [(match.start(), match.end()) for match in re.finditer(separators, remaining)]
         # Consume a complete known compound credit before interpreting its
         # internal punctuation as a separator between people.
         for end, next_start in [(len(remaining), len(remaining)), *reversed(boundaries)]:
@@ -86,10 +87,10 @@ def credited_names(text: str, artist_names) -> tuple[str, ...] | None:
     return tuple(source_credits)
 
 
-def comparison_artists(source: str, candidate: str, artist_names=()) -> tuple[str, str] | None:
+def comparison_artists(source: str, candidate: str, artist_names=(), *, semicolon=False) -> tuple[str, str] | None:
     """Use whole provider credits before interpreting source list punctuation."""
     names = tuple(artist_names) or tuple(re.split(r'\s*,\s*', candidate))
-    source_credits = credited_names(source, names)
+    source_credits = credited_names(source, names, semicolon=semicolon)
     if source_credits is None:
         return None
     return ' '.join(source_credits), ' '.join(normalize_for_match(name) for name in names)

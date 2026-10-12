@@ -1,5 +1,6 @@
 """VPN split-tunnel relaunch selects a running provider and otherwise falls back."""
 import subprocess
+import sys
 
 import pytest
 
@@ -25,14 +26,20 @@ def test_auto_selects_running_mullvad_and_off_skips_detection():
     run, calls = fake_run(0)
     assert vpn.select_provider("auto", which=installed, run=run) == "mullvad"
     assert vpn.select_provider("Mullvad", which=installed, run=run) == "mullvad"
-    assert calls == [["mullvad", "status"]] * 2
+    assert calls == [["mullvad", "status"], ["mullvad-exclude", sys.executable, "-c", ""]] * 2
     assert vpn.select_provider("off", which=installed, run=run) is None
-    assert len(calls) == 2
+    assert len(calls) == 4
 
 
 @pytest.mark.parametrize("returncode", [1, None])
 def test_stopped_or_hanging_daemon_falls_back(returncode):
     run, _ = fake_run(returncode)
+    assert vpn.select_provider("auto", which=installed, run=run) is None
+
+
+def test_launcher_that_cannot_enter_split_tunnel_falls_back():
+    def run(command, **kwargs):
+        return subprocess.CompletedProcess(command, 1 if command[0] == "mullvad-exclude" else 0)
     assert vpn.select_provider("auto", which=installed, run=run) is None
 
 

@@ -23,8 +23,14 @@ def _usable(name: str, *, which=shutil.which, run=subprocess.run) -> bool:
     status, launcher = PROVIDERS[name]
     if not which(status[0]) or not which(launcher[0]):
         return False
+    # The launcher can exec fine yet fail to enter the split tunnel (no cgroup support or
+    # permission, daemon mismatch) and exit without running the sync, so probe it first.
+    probe = [*launcher, sys.executable, "-c", ""]
     try:
-        return run(status, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False).returncode == 0
+        return all(
+            run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False).returncode == 0
+            for command in (status, probe)
+        )
     except (OSError, subprocess.SubprocessError):
         return False
 

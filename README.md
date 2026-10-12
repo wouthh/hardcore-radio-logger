@@ -207,7 +207,7 @@ Only enable systemd after `doctor` passes, Spotify auth exists, and the dry-run 
 
 ## Running Outside A VPN
 
-Spotify and YouTube often rate-limit or block VPN exit addresses. With `HCR_VPN_BYPASS=auto` (the default), `python -m hcr_sync` checks for a running VPN that supports split tunneling and relaunches itself through that VPN's launcher, so radio polling, Spotify requests and YouTube downloads use the normal connection while the rest of the system stays on the VPN. Without a running supported VPN, or when the launcher cannot start, the sync runs on the default route and logs one `vpn_bypass` line. Set `HCR_VPN_BYPASS=off` to keep all traffic in the tunnel, or name a provider to try only that one.
+Spotify and YouTube often rate-limit or block VPN exit addresses. With `HCR_VPN_BYPASS=auto` (the default), `python -m hcr_sync` checks for a running VPN that supports split tunneling and relaunches itself through that VPN's launcher, so radio polling, Spotify requests and YouTube downloads use the normal connection while the rest of the system stays on the VPN. Without a running supported VPN, or when the launcher cannot start or fails a trial run of a no-op command, the sync runs on the default route and logs one `vpn_bypass` line. Set `HCR_VPN_BYPASS=off` to keep all traffic in the tunnel, or name a provider to try only that one.
 
 Supported providers: `mullvad` (requires the Mullvad daemon and `mullvad-exclude`). Other VPNs can be added in `hcr_sync/vpn.py` as a status command plus a split-tunnel launcher prefix.
 

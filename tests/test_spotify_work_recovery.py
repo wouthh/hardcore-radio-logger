@@ -466,3 +466,50 @@ def test_uncertain_addition_after_rejected_attempt_preserves_fourteen_day_schedu
     with connect(config) as con:
         payload = json.loads(con.execute('SELECT payload_json FROM spotify_pending_work').fetchone()[0])
         assert datetime.fromisoformat(payload['retry_at'].replace('Z', '+00:00')) > datetime.now(timezone.utc) + timedelta(days=13)
+
+
+def test_acknowledged_write_missing_from_later_playlist_retries_and_unblocks_queue(tmp_path):
+    from datetime import datetime, timezone
+
+    config, track_id = seed(tmp_path, state='acknowledged')
+    other = SpotifyTrack('spotify:track:other', 'other', 'Other Artist', 'Other Song')
+    with connect(config) as con, transaction(con):
+        row = con.execute('SELECT id,payload_json FROM spotify_pending_work').fetchone()
+        payload = json.loads(row['payload_json'])
+        payload['acknowledgement'] = {'snapshot_id': 'acknowledged'}
+        con.execute("UPDATE spotify_pending_work SET payload_json=?,updated_at='2001-01-01T00:00:00Z' WHERE id=?",
+                    (json.dumps(payload), row['id']))
+        other_id = ensure_track(con, artist='Other Artist', title='Other Song', status='wanted')['id']
+        spotify_work.save_work(con, 'playlist', other_id, 'add',
+                               {'candidate': asdict(other), 'score': 1.0, 'confident': True,
+                                'searched_at': '2026-01-01T00:00:00Z'}, work_key=other.uri)
+    responses = snapshot_responses(False, 'later') + [response({'snapshot_id': 'other-added'})]
+    responses += [response(metadata(1, 'other-added')),
+                  response({'total': 1, 'offset': 0, 'next': None,
+                            'items': [item(id='other', uri=other.uri, name='Other Song', artists=[{'id': 'a', 'name': 'Other Artist'}])]}),
+                  response(metadata(1, 'other-added'))]
+    with spotify_http(tmp_path, responses) as (client, calls), connect(config) as con:
+        result = spotify_work.recover_pending(con, config, client)
+        assert [call['body'] for call in calls if call['method'] == 'POST'] == [{'uris': [other.uri]}]
+        assert result.added == 1 and result.pending == 1
+        row = con.execute("SELECT state,payload_json FROM spotify_pending_work WHERE track_id=?", (track_id,)).fetchone()
+        payload = json.loads(row['payload_json'])
+        assert row['state'] == 'ready' and 'acknowledgement' not in payload
+        assert payload['retry_at'] > datetime.now(timezone.utc).isoformat()
+        assert con.execute("SELECT count(*) FROM events WHERE event_type='spotify_write_not_retained' AND track_id=?",
+                           (track_id,)).fetchone()[0] == 1
+        assert con.execute('SELECT count(*) FROM spotify_playlist_recordings WHERE track_id=?', (track_id,)).fetchone()[0] == 0
+        assert con.execute('SELECT in_playlist FROM spotify_playlist_recordings WHERE track_id=?', (other_id,)).fetchone()[0] == 1
+
+
+def test_recent_acknowledged_write_missing_from_same_playlist_version_stays_pending(tmp_path):
+    config, track_id = seed(tmp_path, state='acknowledged')
+    with connect(config) as con, transaction(con):
+        row = con.execute('SELECT id,payload_json FROM spotify_pending_work').fetchone()
+        payload = json.loads(row['payload_json'])
+        payload['acknowledgement'] = {'snapshot_id': 'later'}
+        con.execute('UPDATE spotify_pending_work SET payload_json=? WHERE id=?', (json.dumps(payload), row['id']))
+    with spotify_http(tmp_path, snapshot_responses(False, 'later')) as (client, calls), connect(config) as con:
+        result = spotify_work.recover_pending(con, config, client)
+        assert result.deferred == 1 and all(call['method'] == 'GET' for call in calls)
+    assert work_state(config) == ('add', 'acknowledged', track_id)

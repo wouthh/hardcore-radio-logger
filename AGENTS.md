@@ -24,6 +24,7 @@ This project is a SQLite-backed sync system for Hardcore Radio observations, a l
 - ID-less local audio completion must stay explicit (`--complete-idless-local` or config opt-in); normal timer runs should not suddenly download replacements for every imported local file.
 - If `HCR_RUN_POLLER=false`, an external logger producer must continue writing the configured logger files.
 - A legacy downloader must not run at the same time as `youtube sync --apply` or `run-once --apply` unless explicitly allowed.
+- `python -m hcr_sync` relaunches itself through a running VPN's split-tunnel launcher (`HCR_VPN_BYPASS=auto`, Mullvad for now) and falls back to the default route; keep providers generic in `hcr_sync/vpn.py`, and never exec a launcher from tests.
 - `HCR_AUDIT_VERBOSE=true` is a temporary diagnostic mode that records per-poll and per-import audit events. Keep it generic and do not log secrets.
 
 ## Privacy And Git Hygiene

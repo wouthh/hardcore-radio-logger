@@ -160,7 +160,8 @@ def test_real_spotipy_transport_preserves_response(tmp_path, status):
         server.shutdown(); server.server_close(); thread.join()
 
 
-@pytest.mark.parametrize('artist,title', [('tijdelijk niet beschikbaar', 'Nummerinformatie'), ('  TIJDELIJK\nNIET BESCHIKBAAR ', ' Nummerinformatie ')])
+@pytest.mark.parametrize('artist,title', [('tijdelijk niet beschikbaar', 'Nummerinformatie'), ('  TIJDELIJK\nNIET BESCHIKBAAR ', ' Nummerinformatie '),
+                                          ('Unknown Artist #12', 'Unknown Title #12 (Original Mix)'), ('Unknown Artist #05', 'Unknown Title #05')])
 def test_placeholder_cannot_be_polled_or_searched(tmp_path, artist, title):
     html = f'<div class="track"><span class="artist">{artist}</span><span class="title">{title}</span></div>'
     with pytest.raises(PollSourceUnavailable, match='placeholder_track_metadata'):
@@ -235,3 +236,10 @@ def test_due_retries_use_oldest_attempt_not_oldest_due_date(tmp_path):
     client = EchoSpotify()
     sync_spotify(config, apply=True, client=client)
     assert client.search_calls == [('First', 'Song')]
+
+
+def test_real_artist_or_title_containing_unknown_is_not_a_placeholder():
+    from hcr_sync.identity import radio_metadata_placeholder
+    assert not radio_metadata_placeholder('Unknown Artist', 'Song')
+    assert not radio_metadata_placeholder('Unknown Artist #12', 'Real Song')
+    assert not radio_metadata_placeholder('Angerfist', 'Unknown Title #3')

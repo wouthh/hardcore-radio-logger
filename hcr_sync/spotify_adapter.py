@@ -141,7 +141,7 @@ class SpotipyClient:
             raise ValueError("Budgeted Spotify requests require request and status retries to be zero")
         try:
             import spotipy
-            from spotipy.oauth2 import SpotifyOAuth
+            from spotipy.oauth2 import CacheFileHandler, SpotifyOAuth
         except ImportError as exc:
             raise RuntimeError("Spotipy is not installed; install requirements.txt first") from exc
         self.sp = spotipy.Spotify(
@@ -150,7 +150,7 @@ class SpotipyClient:
                 client_secret=config.get("HCR_SPOTIFY_CLIENT_SECRET"),
                 redirect_uri=config.get("HCR_SPOTIFY_REDIRECT_URI"),
                 scope=config.spotify_scopes,
-                cache_path=str(config.path("HCR_SPOTIFY_TOKEN_CACHE")),
+                cache_handler=CacheFileHandler(cache_path=str(config.path("HCR_SPOTIFY_TOKEN_CACHE"))),
                 open_browser=True,
             ),
             requests_session=_BudgetedSession(self.budget),

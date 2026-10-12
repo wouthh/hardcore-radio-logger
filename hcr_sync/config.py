@@ -62,6 +62,7 @@ DEFAULTS: dict[str, str] = {
     "HCR_RECONCILE_REQUIRE_TWO_PASSES": "true",
     "HCR_RECONCILE_MAX_EXCLUSIONS": "25",
     "HCR_AUDIT_VERBOSE": "false",
+    "HCR_VPN_BYPASS": "auto",
 }
 
 

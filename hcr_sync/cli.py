@@ -391,10 +391,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, vpn_bypass: bool = False) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     config = load_config(args.config)
+    if vpn_bypass:
+        from .vpn import relaunch_outside_tunnel
+        relaunch_outside_tunnel(config.get("HCR_VPN_BYPASS"), [sys.executable, "-m", "hcr_sync", *sys.argv[1:]])
     try:
         lock_needed = is_apply(args) and args.command != "run-once"
         with sync_lock(config.sync_lock_path) if lock_needed else nullcontext() as lock_handle:

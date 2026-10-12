@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from .db import add_event, get_state, now_utc, set_state, transaction, upsert_spotify_asset, upsert_spotify_playlist_recording
 from .spotify_adapter import BudgetDeferred, PlaylistSnapshot, SpotifyTrack
+
+# Playlist reads shortly after a write may still predate it.
+ACKNOWLEDGED_SETTLE = timedelta(hours=1)
 
 
 def save_work(con, playlist_id, track_id, kind, payload, *, work_key='', state='ready'):
@@ -204,6 +207,25 @@ def recover_pending(con, config, client, snapshot=None, *, dispatch=True):
                 # An unexclude cancels removal; dispatched intents still need evidence.
                 with transaction(con):
                     con.execute('DELETE FROM spotify_pending_work WHERE id=?', (row['id'],))
+                continue
+            acknowledged_snapshot = (payload.get('acknowledgement') or {}).get('snapshot_id')
+            settled = (datetime.now(timezone.utc) - ACKNOWLEDGED_SETTLE).replace(microsecond=0).isoformat().replace('+00:00', 'Z')
+            if (snapshot.identified and row['state'] == 'acknowledged'
+                    and snapshot.snapshot_id != acknowledged_snapshot and row['updated_at'] <= settled):
+                # A later playlist version lacks the acknowledged write. Retry after the
+                # failed-write backoff instead of holding every queued write behind it.
+                from .spotify_sync import _next_spotify_retry_at
+                payload['failure_attempts'] = payload.get('failure_attempts', 0) + 1
+                payload['retry_at'] = _next_spotify_retry_at(datetime.now(timezone.utc), payload['failure_attempts'])
+                payload.pop('acknowledgement', None)
+                with transaction(con):
+                    save_work(con, playlist_id, row['track_id'], row['kind'], payload, work_key=row['work_key'], state='ready')
+                    add_event(con, row['track_id'], 'spotify_write_not_retained', 'spotify_recovery', {
+                        'playlist_id': playlist_id, 'operation': row['kind'], 'spotify_track_uri': uri,
+                        'acknowledged_snapshot_id': acknowledged_snapshot, 'observed_snapshot_id': snapshot.snapshot_id,
+                        'retry_at': payload['retry_at'],
+                    })
+                result.deferred += 1
                 continue
             if snapshot.identified and row['state'] == 'dispatched':
                 # Verified non-effect clears uncertainty, but not the retry delay.

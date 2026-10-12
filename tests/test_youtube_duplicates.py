@@ -83,7 +83,7 @@ def test_youtube_sync_skips_existing_local_near_duplicate_before_search(tmp_path
         assert con.execute("SELECT count(*) FROM youtube_schedule WHERE phase='held' AND hold_origin='local_satisfied'").fetchone()[0] == 2
 
 
-def test_youtube_sync_marks_unknown_placeholder_review_without_search(tmp_path):
+def test_youtube_sync_holds_numbered_unknown_radio_placeholder_without_search(tmp_path):
     config = make_config(tmp_path)
     init_db(config)
     with connect(config) as con:
@@ -97,10 +97,9 @@ def test_youtube_sync_marks_unknown_placeholder_review_without_search(tmp_path):
     assert client.searches == []
     assert client.downloads == []
     with connect(config) as con:
-        asset = con.execute("SELECT * FROM youtube_assets WHERE status='review'").fetchone()
-        event = con.execute("SELECT * FROM events WHERE event_type='ambiguous_youtube_match'").fetchone()
-    assert asset is not None
-    assert event is not None
+        # Radio metadata placeholders are held like the unavailable-information text, not queued for review.
+        assert tuple(con.execute("SELECT phase, hold_origin FROM youtube_schedule").fetchone()) == ("held", "non_track")
+        assert con.execute("SELECT 1 FROM youtube_assets WHERE status='review'").fetchone() is None
 
 
 def test_youtube_sync_marks_source_non_track_review_without_search(tmp_path):

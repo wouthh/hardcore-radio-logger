@@ -69,8 +69,12 @@ def canonical_key(artist: str, title: str) -> str:
     return f"{normalized_artist}::{normalized_title}"
 
 
+# The broadcaster's "no information" text and its numbered "Unknown Artist #NN" fillers.
+RADIO_PLACEHOLDER_RE = re.compile(r"tijdelijk niet beschikbaar::nummerinformatie|unknown artist \d+::unknown title \d+(?: .*)?")
+
+
 def radio_metadata_placeholder(artist: str, title: str) -> bool:
-    return canonical_key(artist, title) == "tijdelijk niet beschikbaar::nummerinformatie"
+    return bool(RADIO_PLACEHOLDER_RE.fullmatch(canonical_key(artist, title)))
 
 
 def fingerprint(value: str) -> str:

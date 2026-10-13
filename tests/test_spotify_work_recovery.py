@@ -513,3 +513,47 @@ def test_recent_acknowledged_write_missing_from_same_playlist_version_stays_pend
         result = spotify_work.recover_pending(con, config, client)
         assert result.deferred == 1 and all(call['method'] == 'GET' for call in calls)
     assert work_state(config) == ('add', 'acknowledged', track_id)
+
+
+def seed_adds(tmp_path, names):
+    config = Config(dict(DEFAULTS, HCR_DB_PATH=str(tmp_path / 'music.sqlite'),
+                         HCR_SPOTIFY_PLAYLIST_ID='playlist', HCR_SPOTIFY_ENABLED='true'))
+    init_db(config)
+    with connect(config) as con, transaction(con):
+        for name in names:
+            track_id = ensure_track(con, artist='Artist', title=name, status='wanted')['id']
+            candidate = SpotifyTrack(f'spotify:track:{name}', name, 'Artist', name)
+            spotify_work.save_work(con, 'playlist', track_id, 'add', {'candidate': asdict(candidate), 'score': 1.0,
+                                   'confident': True, 'searched_at': '2026-01-01T00:00:00Z'}, work_key=candidate.uri)
+    return config
+
+
+def playlist(names, version):
+    return [response(metadata(len(names), version)),
+            response({'total': len(names), 'offset': 0, 'next': None,
+                      'items': [item(id=name, uri=f'spotify:track:{name}', name=name) for name in names]}),
+            response(metadata(len(names), version))]
+
+
+def test_queued_adds_share_one_write_and_one_verification_read(tmp_path):
+    names = ['one', 'two', 'three']
+    config = seed_adds(tmp_path, names)
+    responses = playlist([], 'before') + [response({'snapshot_id': 'after'})] + playlist(names, 'after')
+    with spotify_http(tmp_path, responses) as (client, calls), connect(config) as con:
+        result = spotify_work.recover_pending(con, config, client)
+        assert (result.added, result.acknowledged, result.pending) == (3, 3, 0)
+        assert [call['body'] for call in calls if call['method'] == 'POST'] == [{'uris': [f'spotify:track:{name}' for name in names]}]
+        assert client.budget.used == len(calls) == 7
+
+
+def test_rejected_batch_is_split_so_one_bad_uri_does_not_hold_the_rest(tmp_path):
+    config = seed_adds(tmp_path, ['bad', 'good'])
+    rejected = response({'error': {'status': 400, 'message': 'synthetic invalid uri'}}, status=400)
+    responses = playlist([], 'before') + [rejected, rejected, response({'snapshot_id': 'after'})] + playlist(['good'], 'after')
+    with spotify_http(tmp_path, responses) as (client, calls), connect(config) as con:
+        result = spotify_work.recover_pending(con, config, client)
+        assert [call['body']['uris'] for call in calls if call['method'] == 'POST'] == [
+            ['spotify:track:bad', 'spotify:track:good'], ['spotify:track:bad'], ['spotify:track:good']]
+        assert result.added == 1 and result.failure is None
+        state, payload = con.execute("SELECT state,payload_json FROM spotify_pending_work").fetchone()
+        assert state == 'ready' and json.loads(payload)['candidate']['track_id'] == 'bad'

@@ -1322,6 +1322,7 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
             lanes[lane].append((track, asset, work))
         searched = 0
         sync_limit = config.int('HCR_SPOTIFY_SYNC_LIMIT')
+        new_matches = False
         while (lanes['first'] or lanes['retry']) and (sync_limit <= 0 or searched < sync_limit):
             wanted_lane = cycle[cursor]
             lane = wanted_lane if lanes[wanted_lane] else ('retry' if wanted_lane == 'first' else 'first')
@@ -1388,6 +1389,10 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
             attempts = 0 if matched else _spotify_search_attempts(asset) + 1
             next_at = None if matched else _next_spotify_retry_at(searched_dt, attempts)
             conflict = _spotify_candidate_used_by_other_track(con, playlist_id=playlist_id, track_id=track['id'], spotify_track_id=best.track_id) if matched else None
+            if matched and not conflict:
+                # Adds are batched at the end of the run, so a queued add already claims the recording.
+                conflict = con.execute("SELECT track_id, NULL AS id FROM spotify_pending_work WHERE playlist_id=? AND kind='add' AND work_key=? AND track_id!=? LIMIT 1",
+                                       (playlist_id, best.uri, track['id'])).fetchone()
             if not matched or conflict:
                 summary.review += 1
             if not apply:
@@ -1425,19 +1430,18 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                         'confident': confident, 'score': best_score, 'searched_at': searched_at, 'source': fingerprint}, work_key=best.uri)
             summary.first_time += int(lane == 'first')
             summary.retries += int(lane == 'retry')
-            if matched and not conflict:
-                pending = recover_pending(con, config, client, snapshot)
-                snapshot = None
-                summary.added += pending.added
-                summary.tentative_added += pending.tentative_added
-                summary.acknowledged += pending.acknowledged
-                summary.pending = pending.pending
-                summary.budget_deferred += pending.deferred
-                if pending.rate_limited:
-                    summary.rate_limited = True
-                    break
-                if pending.failure:
-                    raise pending.failure
+            new_matches = new_matches or (matched and not conflict)
+        if new_matches and not summary.rate_limited:
+            # All of this run's matches share one batched write and one verification read.
+            pending = recover_pending(con, config, client, snapshot)
+            summary.added += pending.added
+            summary.tentative_added += pending.tentative_added
+            summary.acknowledged += pending.acknowledged
+            summary.pending = pending.pending
+            summary.budget_deferred += pending.deferred
+            summary.rate_limited = summary.rate_limited or pending.rate_limited
+            if pending.failure and not pending.rate_limited:
+                raise pending.failure
         summary.skipped += len(lanes['first']) + len(lanes['retry'])
         if budget:
             summary.requests = budget.used

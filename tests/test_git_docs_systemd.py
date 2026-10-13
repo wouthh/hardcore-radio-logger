@@ -43,4 +43,5 @@ def test_systemd_templates_are_templates_not_rendered_local_units():
     assert "{{PROJECT_DIR}}" in service
     assert "{{ENV_FILE}}" in service
     assert 'ExecStart="{{PYTHON_BIN}}" -m hcr_sync run-once --apply' in service
+    assert "TimeoutStartSec=30min" in service
     assert "hcr-sync.service" in timer

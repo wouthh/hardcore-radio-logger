@@ -221,6 +221,8 @@ systemctl --user list-timers hcr-sync.timer
 journalctl --user -u hcr-sync.service -f
 ```
 
+The service is a oneshot: when a run outlasts the 5-minute interval, the timer does not start a second copy, and manual `run-once --apply` runs wait on the shared sync lock. `TimeoutStartSec=30min` stops a hung run so later timer runs continue; interrupted work resumes from its durable intents.
+
 The installer uses `.venv/bin/python` automatically when it exists. Set `PYTHON_BIN=/path/to/python` before running the installer to override that.
 
 After editing the env file, restart the service or wait for the next timer run. After editing service or timer files, run:

@@ -10,6 +10,8 @@ from .spotify_adapter import BudgetDeferred, PlaylistSnapshot, SpotifyTrack
 
 # Playlist reads shortly after a write may still predate it.
 ACKNOWLEDGED_SETTLE = timedelta(hours=1)
+# Spotify accepts up to 100 URIs per add; one verification read then covers them all.
+ADD_BATCH = 100
 
 
 def save_work(con, playlist_id, track_id, kind, payload, *, work_key='', state='ready'):
@@ -158,6 +160,120 @@ def recover_pending(con, config, client, snapshot=None, *, dispatch=True):
         result.rate_limited = True
         return result
     rows = list(con.execute("SELECT * FROM spotify_pending_work WHERE playlist_id=? AND kind!='search' ORDER BY CASE WHEN state='ready' THEN 1 ELSE 0 END, id", (playlist_id,)))
+    batch = []
+
+    def fail(row, payload, source, add, exc, write_in_flight, remember_limit=True):
+        """Record a failed request for one intent; True when later intents may continue."""
+        status = getattr(exc, 'http_status', None)
+        if _is_rate_limited(exc):
+            if remember_limit:
+                _remember_spotify_rate_limit(con, config, exc, event_source='spotify_sync' if add else 'spotify_recovery')
+            result.rate_limited = True
+        # Failed reads cannot turn acknowledged writes into rejected writes.
+        current = con.execute('SELECT state FROM spotify_pending_work WHERE id=?', (row['id'],)).fetchone()
+        if write_in_flight and current and current['state'] == 'dispatched':
+            if status is None or status >= 500:
+                from .spotify_sync import _next_spotify_retry_at
+                if add:
+                    from .spotify_sync import _spotify_search_attempts
+                    asset = con.execute('SELECT * FROM spotify_assets WHERE track_id=? AND playlist_id=?', (row['track_id'], playlist_id)).fetchone()
+                    payload['failure_attempts'] = _spotify_search_attempts(asset) + 1
+                else:
+                    payload['failure_attempts'] = payload.get('failure_attempts', 0) + 1
+                payload['retry_after_verification'] = _next_spotify_retry_at(datetime.now(timezone.utc), payload['failure_attempts'])
+                with transaction(con):
+                    save_work(con, playlist_id, row['track_id'], row['kind'], payload, work_key=row['work_key'], state='dispatched')
+            if status is not None and 400 <= status < 500:
+                with transaction(con):
+                    payload['retry_at'] = get_state(con, 'spotify_rate_limited_until', '') if status == 429 else ''
+                    save_work(con, playlist_id, row['track_id'], row['kind'], payload, work_key=row['work_key'], state='ready')
+            if not add and status is not None and 400 <= status < 500 and status != 429:
+                from .spotify_sync import _next_spotify_retry_at
+                payload['failure_attempts'] = payload.get('failure_attempts', 0) + 1
+                payload['retry_at'] = _next_spotify_retry_at(datetime.now(timezone.utc), payload['failure_attempts'])
+                with transaction(con):
+                    save_work(con, playlist_id, row['track_id'], row['kind'], payload, work_key=row['work_key'])
+                    add_event(con, row['track_id'], 'spotify_request_failed', 'spotify_recovery', {
+                        'playlist_id': playlist_id, 'operation': 'remove', 'http_status': status,
+                        'retry_at': payload['retry_at'], 'error_type': type(exc).__name__,
+                    })
+            if add:
+                asset = con.execute('SELECT * FROM spotify_assets WHERE track_id=? AND playlist_id=?', (row['track_id'], playlist_id)).fetchone()
+                _remember_failed_spotify_attempt(con, config, source, asset, exc, operation='add')
+                if status is None or status >= 500:
+                    schedule = con.execute('SELECT search_next_at FROM spotify_assets WHERE track_id=? AND playlist_id=?', (row['track_id'], playlist_id)).fetchone()
+                    payload['retry_after_verification'] = schedule['search_next_at']
+                    with transaction(con):
+                        save_work(con, playlist_id, row['track_id'], row['kind'], payload, work_key=row['work_key'], state='dispatched')
+                if status in {400, 404}:
+                    asset = con.execute('SELECT search_next_at FROM spotify_assets WHERE track_id=? AND playlist_id=?', (row['track_id'], playlist_id)).fetchone()
+                    with transaction(con):
+                        payload['retry_at'] = asset['search_next_at']
+                        save_work(con, playlist_id, row['track_id'], row['kind'], payload, work_key=row['work_key'])
+        if status in {400, 404}:
+            result.deferred += 1
+            return True
+        result.failure = exc
+        return False
+
+    def post_adds(items):
+        """Write one batch; a rejected batch is split to isolate the rejected URI."""
+        budget = getattr(client, "budget", None)
+        if budget and budget.remaining <= budget.reserve:
+            result.deferred += len(items)
+            return []
+        with transaction(con):
+            for row, *_ in items:
+                con.execute("UPDATE spotify_pending_work SET state='dispatched',updated_at=? WHERE id=?", (now_utc(), row['id']))
+            invalidate_snapshot(con, playlist_id)
+        try:
+            acknowledgement = client.add_tracks(playlist_id, [uri for _, _, _, uri, _ in items])
+        except Exception as exc:
+            if getattr(exc, 'http_status', None) in {400, 404} and len(items) > 1:
+                with transaction(con):
+                    for row, *_ in items:
+                        con.execute("UPDATE spotify_pending_work SET state='ready',updated_at=? WHERE id=?", (now_utc(), row['id']))
+                middle = len(items) // 2
+                first = post_adds(items[:middle])
+                return first + (post_adds(items[middle:]) if not result.failure and not result.rate_limited else [])
+            for index, (row, payload, source, _, _) in enumerate(items):
+                fail(row, payload, source, True, exc, True, remember_limit=index == 0)
+            return []
+        try:
+            with transaction(con):
+                for row, payload, *_ in items:
+                    payload['acknowledgement'] = acknowledgement
+                    save_work(con, playlist_id, row['track_id'], 'add', payload, work_key=row['work_key'], state='acknowledged')
+        except Exception as exc:
+            # The intents stay dispatched; the next playlist read settles them.
+            result.failure = exc
+            return []
+        result.acknowledged += len(items)
+        return items
+
+    def dispatch_adds(items):
+        written = post_adds(items)
+        if not written:
+            return
+        # Verification shares the invocation budget and can finish next run.
+        try:
+            verification = obtain_snapshot(con, config, client, protected=False)
+        except BudgetDeferred:
+            result.deferred += len(written)
+            return
+        except Exception as exc:
+            row, payload, source, _, _ = written[0]
+            fail(row, payload, source, True, exc, False)
+            return
+        present = {item.track_id for item in verification.tracks}
+        for row, payload, _, _, target_id in written:
+            if verification.complete and target_id in present:
+                if _finalize_pending(con, config, row, payload):
+                    result.added += 1
+                    result.tentative_added += int(not payload['confident'])
+            else:
+                result.deferred += 1
+
     for row in rows:
         if row['state'] == 'ready' and con.execute("SELECT 1 FROM spotify_pending_work WHERE playlist_id=? AND kind!='search' AND state!='ready'", (playlist_id,)).fetchone():
             result.deferred += 1
@@ -244,6 +360,12 @@ def recover_pending(con, config, client, snapshot=None, *, dispatch=True):
                     con.execute('DELETE FROM spotify_pending_work WHERE id=?', (row['id'],))
                 continue
             # A fresh, fully identified scan is required before dispatch/re-dispatch.
+            if add:
+                if len(batch) < ADD_BATCH:
+                    batch.append((row, payload, source, uri, target_id))
+                else:
+                    result.deferred += 1
+                continue
             budget = getattr(client, "budget", None)
             if budget and budget.remaining <= budget.reserve:
                 raise BudgetDeferred()
@@ -273,55 +395,11 @@ def recover_pending(con, config, client, snapshot=None, *, dispatch=True):
             result.deferred += 1
             break
         except Exception as exc:
-            status = getattr(exc, 'http_status', None)
-            if _is_rate_limited(exc):
-                _remember_spotify_rate_limit(con, config, exc, event_source='spotify_sync' if add else 'spotify_recovery')
-                result.rate_limited = True
-            # Failed reads cannot turn acknowledged writes into rejected writes.
-            current = con.execute('SELECT state FROM spotify_pending_work WHERE id=?', (row['id'],)).fetchone()
-            if write_in_flight and current and current['state'] == 'dispatched':
-                if status is None or status >= 500:
-                    from .spotify_sync import _next_spotify_retry_at
-                    if add:
-                        from .spotify_sync import _spotify_search_attempts
-                        asset = con.execute('SELECT * FROM spotify_assets WHERE track_id=? AND playlist_id=?', (row['track_id'], playlist_id)).fetchone()
-                        payload['failure_attempts'] = _spotify_search_attempts(asset) + 1
-                    else:
-                        payload['failure_attempts'] = payload.get('failure_attempts', 0) + 1
-                    payload['retry_after_verification'] = _next_spotify_retry_at(datetime.now(timezone.utc), payload['failure_attempts'])
-                    with transaction(con):
-                        save_work(con, playlist_id, row['track_id'], row['kind'], payload, work_key=row['work_key'], state='dispatched')
-                if status is not None and 400 <= status < 500:
-                    with transaction(con):
-                        payload['retry_at'] = get_state(con, 'spotify_rate_limited_until', '') if status == 429 else ''
-                        save_work(con, playlist_id, row['track_id'], row['kind'], payload, work_key=row['work_key'], state='ready')
-                if not add and status is not None and 400 <= status < 500 and status != 429:
-                    from .spotify_sync import _next_spotify_retry_at
-                    payload['failure_attempts'] = payload.get('failure_attempts', 0) + 1
-                    payload['retry_at'] = _next_spotify_retry_at(datetime.now(timezone.utc), payload['failure_attempts'])
-                    with transaction(con):
-                        save_work(con, playlist_id, row['track_id'], row['kind'], payload, work_key=row['work_key'])
-                        add_event(con, row['track_id'], 'spotify_request_failed', 'spotify_recovery', {
-                            'playlist_id': playlist_id, 'operation': 'remove', 'http_status': status,
-                            'retry_at': payload['retry_at'], 'error_type': type(exc).__name__,
-                        })
-                if add:
-                    asset = con.execute('SELECT * FROM spotify_assets WHERE track_id=? AND playlist_id=?', (row['track_id'], playlist_id)).fetchone()
-                    _remember_failed_spotify_attempt(con, config, source, asset, exc, operation='add')
-                    if status is None or status >= 500:
-                        schedule = con.execute('SELECT search_next_at FROM spotify_assets WHERE track_id=? AND playlist_id=?', (row['track_id'], playlist_id)).fetchone()
-                        payload['retry_after_verification'] = schedule['search_next_at']
-                        with transaction(con):
-                            save_work(con, playlist_id, row['track_id'], row['kind'], payload, work_key=row['work_key'], state='dispatched')
-                    if status in {400, 404}:
-                        asset = con.execute('SELECT search_next_at FROM spotify_assets WHERE track_id=? AND playlist_id=?', (row['track_id'], playlist_id)).fetchone()
-                        with transaction(con):
-                            payload['retry_at'] = asset['search_next_at']
-                            save_work(con, playlist_id, row['track_id'], row['kind'], payload, work_key=row['work_key'])
-            if status in {400, 404}:
-                result.deferred += 1
+            if fail(row, payload, source, add, exc, write_in_flight):
                 continue
-            result.failure = exc
             break
+    else:
+        if batch:
+            dispatch_adds(batch)
     result.pending = con.execute("SELECT COUNT(*) FROM spotify_pending_work WHERE playlist_id=? AND kind!='search'", (playlist_id,)).fetchone()[0]
     return result

@@ -49,7 +49,7 @@ class EchoSpotify:
         return PlaylistSnapshot(playlist, "synthetic", list(self.tracks))
 
     def add_tracks(self, playlist, uris):
-        if uris == ['spotify:track:First'] and self.operation == 'add':
+        if 'spotify:track:First' in uris and self.operation == 'add':
             self.fail()
         self.added.extend(uris)
         self.tracks += [SpotifyTrack(uri=uri, track_id=uri.split(":")[-1], artist=uri.split(":")[-1], title="Song") for uri in uris]
@@ -220,7 +220,14 @@ def test_first_rate_limited_attempt_creates_schedule_and_rotates(tmp_path, opera
         con.execute("UPDATE spotify_assets SET search_next_at='2000-01-01T00:00:00Z'"); con.commit()
     healthy = EchoSpotify()
     sync_spotify(config, apply=True, client=healthy)
-    assert healthy.search_calls == ([('Second', 'Song'), ('First', 'Song')] if operation == 'search' else [('Second', 'Song')])
+    if operation == 'search':
+        assert healthy.search_calls == [('Second', 'Song'), ('First', 'Song')]
+    else:
+        # Both matches were found before the batched write hit the limit: no search repeats,
+        # and both queued adds keep the recorded cooldown.
+        assert healthy.search_calls == [] and healthy.added == []
+        with connect(config) as con:
+            assert con.execute("SELECT count(*) FROM spotify_pending_work WHERE kind='add' AND state='ready'").fetchone()[0] == 2
 
 
 def test_due_retries_use_oldest_attempt_not_oldest_due_date(tmp_path):

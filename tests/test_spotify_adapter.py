@@ -192,6 +192,15 @@ def test_large_snapshot_extends_budget_by_its_own_cost(tmp_path):
         assert client.budget.remaining == 9 - 1
 
 
+def test_failed_snapshot_gives_back_unused_scan_allowance(tmp_path):
+    responses = [response({"error": {"message": "synthetic"}}, status=500)]
+    with spotify_http(tmp_path, responses, budget=RequestBudget(9, reserve=6)) as (client, calls):
+        meta = {"snapshot_id": "v1", "total": 1000}
+        with pytest.raises(Exception):
+            client.playlist_snapshot("playlist", metadata=meta)
+        assert client.budget.limit == 9 and client.budget.used == len(calls) == 1
+
+
 @pytest.mark.parametrize("broken", [
     {"total": 2, "offset": 0, "items": [item()], "next": None},
     {"total": 1, "offset": 1, "items": [item()], "next": None},

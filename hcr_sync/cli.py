@@ -149,12 +149,12 @@ def cmd_youtube(args: argparse.Namespace, config: Config) -> int:
         return 0
     if args.youtube_command == 'resume':
         from .youtube_adapter import local_tool_check
-        from .youtube_queue import pause_state
+        from .youtube_queue import TOOL_HOLDS, pause_state
         from .db import set_state
         local_tool_check(config)
         with connect(config) as con:
             pause=pause_state(con)
-            if not pause.get('operator_required'):
+            if pause.get('kind') not in TOOL_HOLDS:
                 raise ValueError('resume only clears a tool configuration hold; provider pauses expire normally')
             if is_apply(args):
                 with transaction(con):

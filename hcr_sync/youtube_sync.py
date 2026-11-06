@@ -34,7 +34,7 @@ CATALOG_SEGMENT_RE = re.compile(
 from .youtube_adapter import YouTubeCandidate, YtDlpClient, YouTubeFailure
 from .youtube_matching import evaluate_candidate
 from .youtube_local import local_satisfaction, association_is_different
-from .youtube_queue import (LANES, advance, choose, decision_json, failed, pause_active,
+from .youtube_queue import (TOOL_HOLDS, LANES, advance, choose, decision_json, failed, pause_active,
     pause_state, save_schedule, source_fingerprint, stamp, succeeded)
 from .youtube_download import publish_output, process_is_alive, read_receipt, UnsafeDownloadOutput
 from .db import get_state, set_state
@@ -390,7 +390,7 @@ def recover_youtube_pending(config, *, apply=True):
                     failed(con,row,evidence['lane'],YouTubeFailure('transient','interrupted search has no completed response'),now)
         works=con.execute("SELECT * FROM youtube_pending_work WHERE state NOT IN ('completed','cancelled','held') ORDER BY created_at,work_id").fetchall()
         pause = pause_active(con, now)
-        if pause and pause.get('operator_required'):
+        if pause and pause['kind'] in TOOL_HOLDS:
             summary.pending = len(works)
             summary.degraded = pause['kind']
             summary.pause_until = pause.get('until', '')

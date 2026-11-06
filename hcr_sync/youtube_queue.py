@@ -10,6 +10,8 @@ from .db import get_state, set_state
 
 LANES = ('first_search', 'search_retry', 'download')
 BACKOFF_SECONDS = (900, 3600, 14400, 43200, 86400)
+# Local tool failures pause provider work; the timed pause expires and the next run retries.
+TOOL_HOLDS = frozenset({'missing_tool', 'configuration'})
 
 
 def source_fingerprint(track):
@@ -65,7 +67,7 @@ def pause_state(con):
 
 def pause_active(con, now):
     state = pause_state(con)
-    return state if state.get('operator_required') or (state.get('until') and state['until']>stamp(now)) else None
+    return state if state.get('until') and state['until']>stamp(now) else None
 
 
 def succeeded(con):
@@ -85,7 +87,7 @@ def failed(con, row, lane, failure, now):
     if not downloading:
         fields['phase'] = 'search_retry'
     state = pause_state(con)
-    provider = category in {'restriction','missing_tool','configuration'}
+    provider = category=='restriction' or category in TOOL_HOLDS
     if category == 'transport':
         history = json.loads(get_state(con,'youtube_transport_failures','[]'))
         cutoff = stamp(now-timedelta(minutes=30))
@@ -102,7 +104,7 @@ def failed(con, row, lane, failure, now):
         until = stamp(now+timedelta(hours=hours))
         if failure.retry_at and failure.retry_at>until:
             until=failure.retry_at
-        set_state(con,'youtube_provider_pause',json.dumps({'kind':category,'until':until,'streak':previous+1,'operator_required':category in {'missing_tool','configuration'},'estimated':not bool(failure.retry_at),'reason':failure.detail}))
+        set_state(con,'youtube_provider_pause',json.dumps({'kind':category,'until':until,'streak':previous+1,'estimated':not bool(failure.retry_at),'reason':failure.detail}))
         fields['next_eligible_at'] = until
         # Provider restrictions are not candidate-specific failure evidence.
         fields[streak_field] = row[streak_field]

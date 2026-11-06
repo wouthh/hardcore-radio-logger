@@ -92,12 +92,14 @@ def test_restart_observed_presence_finishes_add_without_post(tmp_path, state):
 
 def test_verification_budget_exhaustion_retains_acknowledged_intent(tmp_path):
     config, track_id = seed(tmp_path)
-    budget = RequestBudget(9, used=5)
+    # The before-scan extends the limit by its own cost (9 -> 11); the write then
+    # spends the rest, so the verification read is deferred.
+    budget = RequestBudget(9, used=7)
     responses = snapshot_responses(False, 'before') + [response({'snapshot_id': 'after'})]
     with spotify_http(tmp_path, responses, budget=budget) as (client, calls), connect(config) as con:
         result = spotify_work.recover_pending(con, config, client)
         assert result.added == 0 and result.acknowledged == result.pending == result.deferred == 1
-        assert budget.used == 9 and len(calls) == 4
+        assert budget.used == budget.limit == 11 and len(calls) == 4
         assert sum(call['method'] == 'POST' for call in calls) == 1
     assert work_state(config) == ('add', 'acknowledged', track_id)
     assert_membership(config, track_id, False)

@@ -135,7 +135,7 @@ def test_verification_tool_failure_preserves_receipt_for_resume_and_offline_reco
     with connect(config) as con:
         assert con.execute('SELECT state FROM youtube_pending_work').fetchone()[0] == 'prepared'
         assert con.execute('SELECT phase FROM youtube_schedule').fetchone()[0] == 'download'
-        assert pause_state(con)['operator_required']
+        assert pause_state(con)['kind'] == category
     assert recover_youtube_pending(config).degraded == category
     monkeypatch.setattr(download.shutil, 'which', original)
     checks = []

@@ -58,24 +58,6 @@ def obtain_snapshot(con, config, client, *, protected=True, apply=True):
         cached = cached_snapshot(con, playlist_id)
         if cached and cached.complete and cached.snapshot_id == meta['snapshot_id'] and cached.total == meta['total']:
             return cached
-        required = 2 + max(1, (meta['total'] + 49) // 50)
-        scan_only_key = f'spotify_scan_only_spent:{playlist_id}'
-        scan_only = protected and required + 6 > budget.limit
-        if required > budget.limit or (scan_only and get_state(con, scan_only_key, '') == 'true'):
-            if apply:
-                with transaction(con):
-                    set_state(con, f'spotify_degraded:{playlist_id}', json.dumps({
-                        'reason': 'snapshot_budget', 'required_scan_budget': required,
-                        'required_work_budget': required + 6, 'configured_budget': budget.limit,
-                        'snapshot_id': meta['snapshot_id'],
-                        'recovery': f'Set HCR_SPOTIFY_REQUEST_BUDGET to at least {required + 6}; run spotify scan --apply',
-                    }, sort_keys=True))
-            raise BudgetDeferred(required=required + (6 if protected else 0))
-        if scan_only:
-            budget.reserve = 0
-            if apply:
-                with transaction(con):
-                    set_state(con, scan_only_key, 'true')
         snapshot = client.playlist_snapshot(playlist_id, metadata=meta)
         if snapshot.complete and apply:
             with transaction(con):

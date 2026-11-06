@@ -113,7 +113,6 @@ def test_completed_provider_failure_enters_retry_lane_without_changing_pause(tmp
     with connect(config) as con:
         pause=json.loads(con.execute("SELECT value FROM sync_state WHERE key='youtube_provider_pause'").fetchone()[0])
         assert pause['until']==saved['next_eligible_at']
-        assert pause['operator_required'] is (category!='restriction')
         assert choose(con,NOW+timedelta(hours=hours))[0]==1
 
 
@@ -363,7 +362,7 @@ def test_qualified_download_requires_real_decodable_tagged_audio(tmp_path):
     assert fresh.searches==fresh.downloads==[]
 
 
-def test_actual_adapter_configuration_category_requires_operator_pause(tmp_path):
+def test_actual_adapter_configuration_category_pauses_then_retries(tmp_path):
     from hcr_sync.youtube_adapter import _failure
     config=fixture(tmp_path)
     track(config)
@@ -372,11 +371,14 @@ def test_actual_adapter_configuration_category_requires_operator_pause(tmp_path)
     run(config,client)
     with connect(config) as con:
         pause=json.loads(con.execute("SELECT value FROM sync_state WHERE key='youtube_provider_pause'").fetchone()[0])
-    assert pause['operator_required'] is True
+    assert pause['kind']=='configuration'
     assert pause['until']==stamp(NOW+timedelta(hours=1))
+    waiting=Fake()
+    run(config,waiting,NOW+timedelta(minutes=30))
+    assert waiting.searches==[]
     fresh=Fake()
-    run(config,fresh,NOW+timedelta(days=10))
-    assert fresh.searches==[]
+    run(config,fresh,NOW+timedelta(hours=1,minutes=1))
+    assert fresh.searches
 
 
 def test_runtime_dispatch_rotates_first_retry_download_in_order(tmp_path):

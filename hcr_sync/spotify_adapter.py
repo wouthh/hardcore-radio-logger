@@ -18,11 +18,6 @@ class BudgetDeferred(RuntimeError):
         super().__init__("Spotify request budget deferred work")
 
 
-class SnapshotOversized(BudgetDeferred):
-    def __init__(self, required: int):
-        super().__init__(required)
-
-
 @dataclass
 class RequestBudget:
     limit: int = 20
@@ -170,8 +165,9 @@ class SpotipyClient:
         meta = self.playlist_metadata(playlist_id) if metadata is None else _snapshot_metadata(metadata)
         total = meta["total"]
         required = 2 + max(1, ceil(total / 50))
-        if required - 1 > self.budget.remaining - self.budget.reserve:
-            raise SnapshotOversized(required)
+        # A full read grows with the playlist; it extends the budget by its own
+        # cost so a large playlist cannot starve searches and writes.
+        self.budget.limit += required - 1
         tracks: list[SpotifyTrack] = []
         identified = True
         offset = 0

@@ -61,77 +61,24 @@ class SearchOnlySpotify:
         pytest.fail("search-only fixture must not dispatch additions")
 
 
-def test_impossible_scans_do_not_repeat_pages_or_starve_new_sources(tmp_path):
+def test_large_playlist_scan_never_starves_source_progress(tmp_path):
     config = config_for(tmp_path)
-    for index in range(3):
-        source_id = seed(config, f"Source{index}")
-        responses = [response(metadata(1000))] + empty_searches(2)
-        with spotify_http(tmp_path, responses) as (client, calls):
-            scanned = scan_spotify_playlist(config, apply=True, client=client)
-            assert scanned.budget_deferred == 1
-            synced = sync_spotify(config, apply=True, client=client)
-            assert synced.first_time == 1
-            assert client.budget.used == len(calls) == 3
-            assert not any(urlsplit(call["path"]).path.endswith("/items") for call in calls)
-        with connect(config) as con:
-            degraded = json.loads(get_state(con, "spotify_degraded:playlist"))
-            assert degraded["required_scan_budget"] == 22
-            assert degraded["required_work_budget"] == 28
-            assert degraded["configured_budget"] == 20
-            assert "28" in degraded["recovery"]
-            assert con.execute("SELECT search_last_at FROM spotify_assets WHERE track_id=?", (source_id,)).fetchone()[0]
-            assert get_state(con, "spotify_membership:playlist", "") == ""
-
-
-def test_raising_budget_recovers_scan_then_reuses_only_verified_cache(tmp_path):
-    config = config_for(tmp_path)
-    with spotify_http(tmp_path, [response(metadata(1000))]) as (client, calls):
-        assert scan_spotify_playlist(config, apply=True, client=client).budget_deferred == 1
-        assert len(calls) == 1
     source_id = seed(config, "Source")
-    config.values["HCR_SPOTIFY_REQUEST_BUDGET"] = "28"
     responses = [response(metadata(1000))]
     responses += [response(page(1000, offset)) for offset in range(0, 1000, 50)]
     responses += [response(metadata(1000))] + empty_searches(2)
-    with spotify_http(tmp_path, responses, budget=RequestBudget(28)) as (client, calls):
+    with spotify_http(tmp_path, responses) as (client, calls):
         scanned = scan_spotify_playlist(config, apply=True, client=client)
-        assert scanned.seen == 1000
-        assert sync_spotify(config, apply=True, client=client, snapshot=scanned._snapshot).first_time == 1
+        assert scanned.seen == 1000 and scanned.budget_deferred == 0
+        synced = sync_spotify(config, apply=True, client=client, snapshot=scanned._snapshot)
+        assert synced.first_time == 1 and synced.budget_deferred == 0
         assert len(calls) == client.budget.used == 24
     with connect(config) as con:
         assert get_state(con, "spotify_degraded:playlist") == ""
         assert con.execute("SELECT search_last_at FROM spotify_assets WHERE track_id=?", (source_id,)).fetchone()[0]
-    with spotify_http(tmp_path, [response(metadata(1000))], budget=RequestBudget(28)) as (client, calls):
+    with spotify_http(tmp_path, [response(metadata(1000))]) as (client, calls):
         assert scan_spotify_playlist(config, apply=True, client=client).seen == 1000
         assert len(calls) == client.budget.used == 1
-
-
-def test_scan_only_does_not_restart_on_changed_versions_before_source_progress(tmp_path):
-    config = config_for(tmp_path)
-    source_id = seed(config, "EQUAL2 & PSYCHOWEAPON", "HARDCORE LIFESTYLE (Extended Mix)")
-    responses = [response(metadata(650))]
-    responses += [response(page(650, offset)) for offset in range(0, 650, 50)]
-    responses += [response(metadata(650))] + empty_searches(3)
-    with spotify_http(tmp_path, responses) as (client, calls):
-        scanned = scan_spotify_playlist(config, apply=True, client=client)
-        assert scanned.seen == 650 and client.budget.used == 15
-        synced = sync_spotify(config, apply=True, client=client, snapshot=scanned._snapshot)
-        assert synced.first_time == 0 and synced.budget_deferred == 1
-        assert len(calls) == client.budget.used == 18
-        first_queries = queries(calls)
-    with connect(config) as con:
-        assert get_state(con, "spotify_scan_only_spent:playlist") == "true"
-        pending = con.execute("SELECT payload_json FROM spotify_pending_work WHERE track_id=? AND kind='search'", (source_id,)).fetchone()
-        assert json.loads(pending[0])["next_query"] == 3
-    with spotify_http(tmp_path, [response(metadata(650, "v2"))] + empty_searches(1)) as (client, calls):
-        assert scan_spotify_playlist(config, apply=True, client=client).budget_deferred == 1
-        assert sync_spotify(config, apply=True, client=client).first_time == 1
-        assert len(calls) == client.budget.used == 2
-        assert len(first_queries + queries(calls)) == len(set(first_queries + queries(calls))) == 4
-        assert not any(urlsplit(call["path"]).path.endswith("/items") for call in calls)
-    with connect(config) as con:
-        assert get_state(con, "spotify_scan_only_spent:playlist") == "false"
-        assert con.execute("SELECT search_last_at FROM spotify_assets WHERE track_id=?", (source_id,)).fetchone()[0]
 
 
 def test_partial_queries_resume_after_budget_restart_without_attempt_or_cursor_loss(tmp_path):

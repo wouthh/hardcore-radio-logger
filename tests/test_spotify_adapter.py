@@ -10,7 +10,7 @@ import requests
 
 from hcr_sync.config import Config, DEFAULTS
 from hcr_sync.spotify_adapter import (
-    BudgetDeferred, RequestBudget, SnapshotOversized, SpotipyClient,
+    BudgetDeferred, RequestBudget, SpotipyClient,
     _spotify_track_from_playlist_item,
 )
 
@@ -182,14 +182,14 @@ def test_pre_read_metadata_is_not_requested_twice(tmp_path):
         assert client.budget.used == len(calls) == 3
 
 
-@pytest.mark.parametrize("total,reserve,required", [(1000, 0, 22), (51, 6, 4)])
-def test_oversized_snapshot_stops_before_first_page(tmp_path, total, reserve, required):
-    responses = [response(metadata(total))]
-    with spotify_http(tmp_path, responses, budget=RequestBudget(9, reserve=reserve)) as (client, calls):
-        with pytest.raises(SnapshotOversized) as caught:
-            client.playlist_snapshot("playlist")
-        assert caught.value.required == required
-        assert client.budget.used == len(calls) == 1
+def test_large_snapshot_extends_budget_by_its_own_cost(tmp_path):
+    responses = [response(metadata(1000))]
+    responses += [response(page(1000, offset)) for offset in range(0, 1000, 50)]
+    responses += [response(metadata(1000))]
+    with spotify_http(tmp_path, responses, budget=RequestBudget(9, reserve=6)) as (client, calls):
+        assert client.playlist_snapshot("playlist").total == 1000
+        assert client.budget.used == len(calls) == 22
+        assert client.budget.remaining == 9 - 1
 
 
 @pytest.mark.parametrize("broken", [

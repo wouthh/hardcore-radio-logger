@@ -1405,7 +1405,6 @@ def sync_spotify(config: Config, *, apply: bool, client: SpotifyClientProtocol |
                 _save_search_schedule(con, playlist_id, track['id'], searched_at=searched_at, attempts=attempts, next_at=next_at, confidence=0.0 if conflict else (best_score if not matched else None))
                 cursor = (cursor + 1) % len(cycle) if both else 0
                 set_state(con, cursor_key, str(cursor))
-                set_state(con, f'spotify_scan_only_spent:{playlist_id}', 'false')
                 con.execute("DELETE FROM spotify_pending_work WHERE playlist_id=? AND track_id=? AND kind='search'", (playlist_id, track['id']))
                 add_event(con, track['id'], 'spotify_search_completed', 'spotify_sync', {
                     'playlist_id': playlist_id, 'lane': lane, 'spotify_search_last_at': searched_at,

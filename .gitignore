@@ -102,3 +102,4 @@ systemd/rendered/
 # Owned YouTube staging and partial downloads
 .hcr-youtube-work/
 download-tmp/
+/graft/

@@ -167,43 +167,49 @@ class SpotipyClient:
         required = 2 + max(1, ceil(total / 50))
         # A full read grows with the playlist; it extends the budget by its own
         # cost so a large playlist cannot starve searches and writes.
-        self.budget.limit += required - 1
-        tracks: list[SpotifyTrack] = []
-        identified = True
-        offset = 0
-        while True:
-            page = self.sp.playlist_items(
-                playlist_id,
-                offset=offset,
-                limit=50,
-                fields="items(track(id,uri,name,duration_ms,artists(id,name),album(name),external_ids(isrc),type),item(id,uri,name,duration_ms,artists(id,name),album(name),external_ids(isrc),type)),next,total,offset",
-            )
-            if not isinstance(page, dict):
-                raise RuntimeError("Spotify playlist pagination was incomplete")
-            items = page.get("items")
-            if (not isinstance(items, list) or type(page.get("total")) is not int
-                    or page["total"] != total or type(page.get("offset")) is not int
-                    or page["offset"] != offset or len(items) != min(50, total - offset)
-                    or "next" not in page
-                    or page["next"] is not None and not isinstance(page["next"], str)):
-                raise RuntimeError("Spotify playlist pagination was incomplete")
-            for item in items:
-                track = _spotify_track_from_playlist_item(item)
-                if track is not None:
-                    tracks.append(track)
-                    identified = identified and bool(track.track_id and track.uri)
-                else:
-                    raw = item.get("track") or item.get("item") if isinstance(item, dict) else None
-                    if not isinstance(raw, dict) or raw.get("type") not in {"episode"}:
-                        identified = False
-            offset += len(items)
-            if bool(page["next"]) != (offset < total):
-                raise RuntimeError("Spotify playlist pagination was incomplete")
-            if offset >= total:
-                break
-        final_meta = self.playlist_metadata(playlist_id)
-        if final_meta != meta:
-            raise RuntimeError("Spotify playlist changed during pagination")
+        extension = required - 1
+        self.budget.limit += extension
+        try:
+            tracks: list[SpotifyTrack] = []
+            identified = True
+            offset = 0
+            while True:
+                page = self.sp.playlist_items(
+                    playlist_id,
+                    offset=offset,
+                    limit=50,
+                    fields="items(track(id,uri,name,duration_ms,artists(id,name),album(name),external_ids(isrc),type),item(id,uri,name,duration_ms,artists(id,name),album(name),external_ids(isrc),type)),next,total,offset",
+                )
+                if not isinstance(page, dict):
+                    raise RuntimeError("Spotify playlist pagination was incomplete")
+                items = page.get("items")
+                if (not isinstance(items, list) or type(page.get("total")) is not int
+                        or page["total"] != total or type(page.get("offset")) is not int
+                        or page["offset"] != offset or len(items) != min(50, total - offset)
+                        or "next" not in page
+                        or page["next"] is not None and not isinstance(page["next"], str)):
+                    raise RuntimeError("Spotify playlist pagination was incomplete")
+                for item in items:
+                    track = _spotify_track_from_playlist_item(item)
+                    if track is not None:
+                        tracks.append(track)
+                        identified = identified and bool(track.track_id and track.uri)
+                    else:
+                        raw = item.get("track") or item.get("item") if isinstance(item, dict) else None
+                        if not isinstance(raw, dict) or raw.get("type") not in {"episode"}:
+                            identified = False
+                offset += len(items)
+                if bool(page["next"]) != (offset < total):
+                    raise RuntimeError("Spotify playlist pagination was incomplete")
+                if offset >= total:
+                    break
+            final_meta = self.playlist_metadata(playlist_id)
+            if final_meta != meta:
+                raise RuntimeError("Spotify playlist changed during pagination")
+        except BaseException:
+            # A failed read keeps no unused allowance for searches and writes.
+            self.budget.limit = max(self.budget.limit - extension, self.budget.used)
+            raise
         return PlaylistSnapshot(playlist_id, meta["snapshot_id"], tracks, identified=identified, total=total)
 
     @staticmethod

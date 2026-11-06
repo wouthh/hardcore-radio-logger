@@ -73,6 +73,8 @@ git diff --cached --name-only
 
 Stage source files only.
 
+The full gate is declared in `.prloop.json` (the pytest suite in a fresh `.venv`). Measured 2026-11-06: about 2 minutes wall time, under one core, peak RSS about 90 MB, so it runs as a light gate.
+
 <!-- trail:start -->
 ## Trail — repo context graph
 

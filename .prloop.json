@@ -1,0 +1,2 @@
+{ "gate": ".venv/bin/python -m pytest -q -p no:cacheprovider", "gateWeight": "light", "merge": "rebase",
+  "setup": "python3 -m venv .venv && .venv/bin/pip install -q -r requirements.txt" }

@@ -54,7 +54,7 @@ python -m hcr_sync backfill-local --dry-run
 python -m hcr_sync backfill-local --apply
 ```
 
-Backfill establishes the local baseline and does not infer deletions. Ongoing scans use:
+Backfill establishes the local baseline and does not infer deletions. Apply-mode scans also remove downloader side files at the top level of the folder (images, `.webm`, `.part` and `.ytdl` files whose names end in a bracketed YouTube video ID) following `HCR_DELETE_MODE`; files without that ID suffix are never touched. Ongoing scans use:
 
 ```bash
 python -m hcr_sync scan-local --dry-run

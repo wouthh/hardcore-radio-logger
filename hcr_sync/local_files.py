@@ -14,6 +14,9 @@ from .identity import compact_text, parse_artist_title
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".flac", ".opus", ".ogg", ".wav", ".aac"}
 VIDEO_ID_RE = re.compile(r"\[([A-Za-z0-9_-]{6,})\](?:\.[^.]+)?$")
 PLAYLIST_NAME = "All tracks.m3u8"
+# Downloader side files (thumbnails, unconverted or partial media) named after a YouTube video.
+LEFTOVER_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".webm", ".part", ".ytdl"}
+LEFTOVER_RE = re.compile(r"\[[A-Za-z0-9_-]{11}\](?:\.[A-Za-z0-9]+)+$")
 
 
 @dataclass
@@ -23,6 +26,18 @@ class LocalSummary:
     assets_upserted: int = 0
     skipped: int = 0
     baseline_complete: bool = False
+    leftovers_removed: int = 0
+
+
+def remove_download_leftovers(config: Config) -> int:
+    """Remove top-level downloader side files so they never sync to players."""
+    from .reconcile import _trash_file  # reconcile imports this module
+    removed = 0
+    for path in config.music_dir.iterdir() if config.music_dir.is_dir() else ():
+        if path.suffix.casefold() in LEFTOVER_EXTENSIONS and LEFTOVER_RE.search(path.name):
+            _trash_file(config, path, LEFTOVER_EXTENSIONS)
+            removed += not path.exists()
+    return removed
 
 
 @dataclass(frozen=True)
@@ -179,6 +194,7 @@ def import_local_files(config: Config, *, apply: bool, establish_baseline: bool)
         summary.assets_upserted = len(scanned)
         summary.baseline_complete = establish_baseline
         return summary
+    summary.leftovers_removed = remove_download_leftovers(config)
     with connect(config) as con:
         with transaction(con):
             reserved={row['video_id'] for row in con.execute("SELECT video_id FROM youtube_pending_work WHERE state NOT IN ('completed','cancelled')")}

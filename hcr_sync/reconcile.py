@@ -212,12 +212,12 @@ def _path_is_inside(path: Path, directory: Path) -> bool:
     return True
 
 
-def _trash_file(config: Config, path: Path) -> Path | None:
+def _trash_file(config: Config, path: Path, suffixes=AUDIO_EXTENSIONS) -> Path | None:
     if not path.exists():
         return None
     if not _path_is_inside(path, config.music_dir):
         return None
-    if not path.is_file() or path.suffix.casefold() not in AUDIO_EXTENSIONS:
+    if not path.is_file() or path.suffix.casefold() not in suffixes:
         return None
     if config.get("HCR_DELETE_MODE") == "delete":
         path.unlink()

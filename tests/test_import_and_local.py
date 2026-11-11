@@ -359,3 +359,24 @@ def test_playlist_lists_every_audio_file_and_rewrites_only_on_change(tmp_path):
     assert write_playlist(music) is True
     assert "A Song" not in playlist.read_text(encoding="utf-8")
     assert sorted(path.name for path in music.iterdir() if path.name.startswith(".") and path.is_file()) == []
+
+
+@pytest.mark.parametrize("mode", ["trash", "delete"])
+def test_local_scan_removes_downloader_leftovers_but_keeps_music_and_other_files(tmp_path, mode):
+    config = make_config(tmp_path, HCR_DELETE_MODE=mode)
+    init_db(config)
+    music = config.music_dir
+    music.mkdir()
+    leftovers = ["Song [abcdefghijk].jpg", "Gone [bcdefghijkl].webp", "Gone [bcdefghijkl].webm",
+                 "Partial [cdefghijklm].f251.webm.part", "Partial [cdefghijklm].webm.ytdl"]
+    kept = ["Song [abcdefghijk].mp3", "cover.jpg", "Live set.webm", "Notes [abcdefghijk].txt"]
+    for name in leftovers + kept:
+        (music / name).write_bytes(b"x")
+    summary = import_local_files(config, apply=False, establish_baseline=False)
+    assert summary.leftovers_removed == 0 and all((music / name).exists() for name in leftovers)
+    summary = import_local_files(config, apply=True, establish_baseline=False)
+    assert summary.leftovers_removed == len(leftovers)
+    assert sorted(path.name for path in music.iterdir() if path.is_file()) == sorted(kept)
+    trashed = sorted(path.name for path in config.trash_dir.iterdir()) if config.trash_dir.exists() else []
+    assert trashed == (sorted(leftovers) if mode == "trash" else [])
+    assert import_local_files(config, apply=True, establish_baseline=False).leftovers_removed == 0

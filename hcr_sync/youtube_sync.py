@@ -386,7 +386,11 @@ def recover_youtube_pending(config, *, apply=True):
     with connect(config) as con:
         # Finished stages left by earlier versions would otherwise sync as stray output.mp3 copies.
         stages=config.music_dir/'.hcr-youtube-work'
-        for stage in (stages.iterdir() if stages.is_dir() else ()):
+        try:
+            leftovers=list(stages.iterdir()) if stages.is_dir() else []
+        except OSError:
+            leftovers=[]  # optional sweep; retried on the next recovery pass
+        for stage in leftovers:
             finished=con.execute("SELECT * FROM youtube_pending_work WHERE work_id=? AND state IN ('completed','cancelled')",(stage.name,)).fetchone()
             if finished:
                 discard_stage(config,finished)

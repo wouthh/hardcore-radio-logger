@@ -40,6 +40,7 @@ def test_real_adapter_scheduler_recovers_remote_completion_before_local_commit(s
     monkeypatch.setattr(sync,'_complete_download',original)
     recovered=recover_youtube_pending(config)
     assert recovered.downloaded==1
+    assert not any((config.music_dir/'.hcr-youtube-work').iterdir())
     # An executable that would fail proves restart performs no provider work.
     config.values['HCR_YTDLP_BIN']=str(audio.parent/'missing')
     assert recover_youtube_pending(config).downloaded==0
@@ -94,6 +95,9 @@ def test_real_adapter_normalized_search_reaches_verified_download(setup):
         assert row['file_exists']==1 and row['match_confidence']==1
         assert con.execute('SELECT state FROM youtube_pending_work').fetchone()[0]=='completed'
         assert con.execute('SELECT search_attempts FROM youtube_schedule').fetchone()[0]==1
+        published=con.execute('SELECT file_path FROM youtube_assets').fetchone()[0]
+    # Only the published file may reach synced devices; the stage is gone.
+    assert Path(published).is_file() and not any((config.music_dir/'.hcr-youtube-work').iterdir())
 
 
 def test_real_adapter_failed_search_is_counted_in_degraded_summary(setup):

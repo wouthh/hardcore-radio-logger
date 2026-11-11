@@ -13,7 +13,7 @@ from .config import Config, load_config
 from .db import connect, ensure_track, get_state, init_db, track_by_id, transaction, unexclude_track
 from .doctor import format_doctor, run_doctor
 from .identity import canonical_key
-from .local_files import import_local_files
+from .local_files import import_local_files, write_playlist
 from .logger_importer import import_logger
 from .poller import PollSourcesUnavailable, poll_radio, record_poll_unavailable
 from .reconcile import manual_exclude, reconcile
@@ -300,6 +300,8 @@ def cmd_run_once(args: argparse.Namespace, config: Config) -> int:
         print_kv("youtube_sync", yt_summary)
         sp_summary = sync_spotify(config, apply=apply, client=spotify_client)
         print_kv("spotify_sync", sp_summary)
+        if apply:
+            print(f"playlist changed={write_playlist(config.music_dir)}")
         print(format_report(build_report(config)))
     return 1 if apply and fatal_reconcile_refusals(rec_summary.refused) else 0
 

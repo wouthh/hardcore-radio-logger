@@ -644,3 +644,30 @@ yt_dlp.main()
         assert verified['title']==heading
         assert verified['artist']==(receipt['artist'] or '')
         assert verified['track']==(receipt['track'] or '')
+
+
+def test_recovery_removes_finished_stages_only_while_the_music_folder_keeps_the_audio(setup):
+    from hcr_sync.youtube_sync import recover_youtube_pending
+    config, audio = setup
+    staged, _ = stage(config, audio)
+    published = publish_output(config, CANDIDATE, work(config), 'Artist', 'Song')
+    partials = prepare_partials(config, 'job1')
+    def set_state(state):
+        with connect(config) as con, transaction(con):
+            con.execute('UPDATE youtube_pending_work SET state=?', (state,))
+    set_state('held')
+    recover_youtube_pending(config)
+    assert staged.is_file()
+    set_state('completed')
+    published.unlink()
+    recover_youtube_pending(config)
+    assert staged.is_file()
+    os.link(staged, published)
+    recover_youtube_pending(config)
+    assert not staged.parent.exists() and not partials.exists()
+    assert published.read_bytes() == audio.read_bytes()
+    cancelled = prepare_download(config, 'job1')
+    (cancelled / 'output-before-metadata.mp3').write_bytes(b'unfinished')
+    set_state('cancelled')
+    recover_youtube_pending(config)
+    assert not cancelled.exists() and published.is_file()

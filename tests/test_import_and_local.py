@@ -339,3 +339,22 @@ def test_local_scan_reuses_existing_asset_by_youtube_id_instead_of_tags(tmp_path
         assert con.execute("SELECT COUNT(*) AS count FROM youtube_assets").fetchone()["count"] == 1
         asset = con.execute("SELECT * FROM youtube_assets").fetchone()
         assert asset["track_id"] == 1
+
+
+def test_playlist_lists_every_audio_file_and_rewrites_only_on_change(tmp_path):
+    from hcr_sync.local_files import PLAYLIST_NAME, write_playlist
+    music = tmp_path / "music"
+    music.mkdir()
+    assert write_playlist(music) is False and not (music / PLAYLIST_NAME).exists()
+    for name in ("b Song [abcdefghijk].mp3", "A Song.m4a", "#1 Hit.mp3", "cover.jpg"):
+        (music / name).write_bytes(b"x")
+    (music / ".hcr-youtube-work").mkdir()
+    (music / ".hcr-youtube-work" / "output.mp3").write_bytes(b"x")
+    assert write_playlist(music) is True
+    playlist = music / PLAYLIST_NAME
+    assert playlist.read_text(encoding="utf-8") == "#EXTM3U\n./#1 Hit.mp3\nA Song.m4a\nb Song [abcdefghijk].mp3\n"
+    assert write_playlist(music) is False
+    (music / "A Song.m4a").unlink()
+    assert write_playlist(music) is True
+    assert "A Song" not in playlist.read_text(encoding="utf-8")
+    assert sorted(path.name for path in music.iterdir() if path.name.startswith(".") and path.is_file()) == []

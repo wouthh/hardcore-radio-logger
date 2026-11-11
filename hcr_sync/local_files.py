@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,7 @@ from .identity import compact_text, parse_artist_title
 
 AUDIO_EXTENSIONS = {".mp3", ".m4a", ".flac", ".opus", ".ogg", ".wav", ".aac"}
 VIDEO_ID_RE = re.compile(r"\[([A-Za-z0-9_-]{6,})\](?:\.[^.]+)?$")
+PLAYLIST_NAME = "All tracks.m3u8"
 
 
 @dataclass
@@ -39,6 +41,23 @@ def audio_paths(music_dir: Path) -> list[Path]:
         for path in music_dir.iterdir()
         if path.is_file() and path.suffix.casefold() in AUDIO_EXTENSIONS
     )
+
+
+def write_playlist(music_dir: Path) -> bool:
+    """Keep a playlist of every audio file so phone players need no library scan."""
+    names = sorted((path.name for path in audio_paths(music_dir)), key=str.casefold)
+    if not names:
+        # An unmounted or unreadable folder must not blank a synced playlist.
+        return False
+    # Relative entries resolve next to the playlist on every synced device; "#" would start a comment.
+    text = "".join(["#EXTM3U\n", *(f"{'./' if name.startswith('#') else ''}{name}\n" for name in names)])
+    target = music_dir / PLAYLIST_NAME
+    if target.is_file() and target.read_text(encoding="utf-8", errors="replace") == text:
+        return False
+    partial = music_dir / f".{PLAYLIST_NAME}.partial"
+    partial.write_text(text, encoding="utf-8")
+    os.replace(partial, target)
+    return True
 
 
 def youtube_id_from_path(path: Path) -> str:

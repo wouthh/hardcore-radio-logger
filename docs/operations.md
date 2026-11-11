@@ -61,6 +61,8 @@ python -m hcr_sync scan-local --dry-run
 python -m hcr_sync scan-local --apply
 ```
 
+Each `run-once --apply` also keeps `All tracks.m3u8` in the music folder: a UTF-8 playlist of every top-level audio file with paths relative to the folder, so a synced phone can open the whole library without a media scan. It is rewritten only when the file list changes and never blanked when the folder is empty or unreadable.
+
 ## Spotify Setup
 
 Spotify uses Spotipy Authorization Code Flow with these scopes:

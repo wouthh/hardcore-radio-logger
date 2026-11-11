@@ -49,8 +49,9 @@ def write_playlist(music_dir: Path) -> bool:
     if not names:
         # An unmounted or unreadable folder must not blank a synced playlist.
         return False
-    # Relative entries resolve next to the playlist on every synced device; "#" would start a comment.
-    text = "".join(["#EXTM3U\n", *(f"{'./' if name.startswith('#') else ''}{name}\n" for name in names)])
+    # Relative entries resolve next to the playlist on every synced device. "./" keeps a leading
+    # "#" from starting a comment and leading spaces from being trimmed by players.
+    text = "".join(["#EXTM3U\n", *(f"./{name}\n" for name in names)])
     target = music_dir / PLAYLIST_NAME
     if target.is_file() and target.read_text(encoding="utf-8", errors="replace") == text:
         return False

@@ -671,3 +671,17 @@ def test_recovery_removes_finished_stages_only_while_the_music_folder_keeps_the_
     set_state('cancelled')
     recover_youtube_pending(config)
     assert not cancelled.exists() and published.is_file()
+
+
+def test_recovery_survives_an_unlistable_stage_folder(setup, monkeypatch):
+    from pathlib import Path
+    from hcr_sync.youtube_sync import recover_youtube_pending
+    config, audio = setup
+    stage(config, audio)
+    real = Path.iterdir
+    def refuse(self):
+        if self.name == '.hcr-youtube-work':
+            raise PermissionError(13, 'denied')
+        return real(self)
+    monkeypatch.setattr(Path, 'iterdir', refuse)
+    recover_youtube_pending(config)

@@ -105,12 +105,16 @@ def cmd_import_logger(args: argparse.Namespace, config: Config) -> int:
 
 
 def cmd_backfill_local(args: argparse.Namespace, config: Config) -> int:
+    if is_apply(args):
+        assert_legacy_downloader_safe(config)
     summary = import_local_files(config, apply=is_apply(args), establish_baseline=True)
     print_kv("backfill_local", summary)
     return 0
 
 
 def cmd_scan_local(args: argparse.Namespace, config: Config) -> int:
+    if is_apply(args):
+        assert_legacy_downloader_safe(config)
     summary = import_local_files(config, apply=is_apply(args), establish_baseline=False)
     print_kv("scan_local", summary)
     return 0

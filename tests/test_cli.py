@@ -412,3 +412,20 @@ def test_youtube_sync_preflights_legacy_downloader_before_recovery(monkeypatch, 
     with pytest.raises(LegacyDownloaderActive):
         cmd_youtube(args, config)
     assert calls == []
+
+
+@pytest.mark.parametrize("handler", ["cmd_scan_local", "cmd_backfill_local"])
+def test_local_scans_preflight_legacy_downloader_before_sweeping(monkeypatch, tmp_path, handler):
+    import hcr_sync.cli as cli
+    config = make_config(tmp_path)
+    calls = []
+
+    def fail_preflight(_config):
+        raise LegacyDownloaderActive("legacy downloader active")
+
+    monkeypatch.setattr("hcr_sync.cli.assert_legacy_downloader_safe", fail_preflight)
+    monkeypatch.setattr("hcr_sync.cli.import_local_files", lambda *_a, **_k: calls.append("import"))
+
+    with pytest.raises(LegacyDownloaderActive):
+        getattr(cli, handler)(SimpleNamespace(apply=True), config)
+    assert calls == []

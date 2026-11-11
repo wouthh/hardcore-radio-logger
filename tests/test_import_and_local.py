@@ -346,13 +346,14 @@ def test_playlist_lists_every_audio_file_and_rewrites_only_on_change(tmp_path):
     music = tmp_path / "music"
     music.mkdir()
     assert write_playlist(music) is False and not (music / PLAYLIST_NAME).exists()
-    for name in ("b Song [abcdefghijk].mp3", "A Song.m4a", "#1 Hit.mp3", "cover.jpg"):
+    for name in ("b Song [abcdefghijk].mp3", "A Song.m4a", "#1 Hit.mp3", " Leading space.mp3", "cover.jpg"):
         (music / name).write_bytes(b"x")
     (music / ".hcr-youtube-work").mkdir()
     (music / ".hcr-youtube-work" / "output.mp3").write_bytes(b"x")
     assert write_playlist(music) is True
     playlist = music / PLAYLIST_NAME
-    assert playlist.read_text(encoding="utf-8") == "#EXTM3U\n./#1 Hit.mp3\nA Song.m4a\nb Song [abcdefghijk].mp3\n"
+    assert playlist.read_text(encoding="utf-8") == (
+        "#EXTM3U\n./ Leading space.mp3\n./#1 Hit.mp3\n./A Song.m4a\n./b Song [abcdefghijk].mp3\n")
     assert write_playlist(music) is False
     (music / "A Song.m4a").unlink()
     assert write_playlist(music) is True

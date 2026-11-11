@@ -74,6 +74,30 @@ def _stage(config, work) -> Path:
     return expected
 
 
+def discard_stage(config, work) -> bool:
+    """Remove a finished job's stage so synced devices never see its output.mp3.
+
+    A completed stage is removed only while the published file is the same inode,
+    so the music folder always keeps its own link to the audio.
+    """
+    work = dict(work)
+    try:
+        stage = _stage(config, work)
+        if work["state"] not in {"completed", "cancelled"} or not stage.is_dir():
+            return False
+        staged = stage / "output.mp3"
+        if work["state"] == "completed" and staged.exists():
+            target = _inside(config, Path(work["output_path"] or staged))
+            if target == staged or not target.is_file() or not os.path.samefile(staged, target):
+                return False
+        shutil.rmtree(stage)
+        shutil.rmtree(Path(config.path("HCR_DOWNLOAD_TMP_DIR")) / ".hcr-youtube-work" / work["work_id"], ignore_errors=True)
+    except (OSError, UnsafeDownloadOutput):
+        # Cleanup only; the next recovery pass retries it.
+        return False
+    return True
+
+
 def read_receipt(config, work) -> dict | None:
     path = _inside(config, _stage(config, work) / "receipt.jsonl")
     if not path.exists():

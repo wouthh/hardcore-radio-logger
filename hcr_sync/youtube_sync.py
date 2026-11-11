@@ -36,7 +36,7 @@ from .youtube_matching import evaluate_candidate
 from .youtube_local import local_satisfaction, association_is_different
 from .youtube_queue import (TOOL_HOLDS, LANES, advance, choose, decision_json, failed, pause_active,
     pause_state, save_schedule, source_fingerprint, stamp, succeeded)
-from .youtube_download import publish_output, process_is_alive, read_receipt, UnsafeDownloadOutput
+from .youtube_download import discard_stage, publish_output, process_is_alive, read_receipt, UnsafeDownloadOutput
 from .db import get_state, set_state
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -373,6 +373,7 @@ def _complete_download(config,con,work,now):
         advance(con,2)
         succeeded(con)
         add_event(con,work['track_id'],'youtube_downloaded','youtube_sync',{'youtube_video_id':candidate.video_id,'file_path':str(output)})
+    discard_stage(config,{**dict(work),'state':'completed','output_path':str(output)})
     return True
 
 
@@ -383,6 +384,12 @@ def recover_youtube_pending(config, *, apply=True):
         return summary
     now=datetime.now(timezone.utc)
     with connect(config) as con:
+        # Finished stages left by earlier versions would otherwise sync as stray output.mp3 copies.
+        stages=config.music_dir/'.hcr-youtube-work'
+        for stage in (stages.iterdir() if stages.is_dir() else ()):
+            finished=con.execute("SELECT * FROM youtube_pending_work WHERE work_id=? AND state IN ('completed','cancelled')",(stage.name,)).fetchone()
+            if finished:
+                discard_stage(config,finished)
         for row in con.execute("SELECT * FROM youtube_schedule WHERE phase IN ('first_search','search_retry')").fetchall():
             evidence=json.loads(row['decision_json'] or '{}')
             if evidence.get('outcome')=='search_inflight':
